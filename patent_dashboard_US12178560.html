@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Patent Dashboard — US:12178560</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #eef0f4; color: #111827; line-height: 1.55; padding: 1.5rem;
+    }
+    a { color: #2563eb; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* ── Hero header ── */
+    .hero {
+      background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 60%, #1d4ed8 100%);
+      color: #fff; border-radius: 14px; padding: 2rem 2.5rem; margin-bottom: 1.25rem;
+    }
+    .hero-eyebrow {
+      font-size: .75rem; font-weight: 600; letter-spacing: .1em;
+      text-transform: uppercase; opacity: .6; margin-bottom: .4rem;
+    }
+    .hero-title { font-size: 1.45rem; font-weight: 700; line-height: 1.3; }
+    .hero-sub {
+      margin-top: .9rem; display: flex; gap: 1rem; flex-wrap: wrap; font-size: .85rem;
+    }
+    .hero-chip {
+      background: rgba(255,255,255,.12); border-radius: 6px;
+      padding: .2rem .75rem; white-space: nowrap;
+    }
+
+    /* ── Stats bar ── */
+    .stats-bar {
+      display: flex; gap: .75rem; flex-wrap: wrap; margin-bottom: 1.25rem;
+    }
+    .stat-card {
+      background: #fff; border-radius: 10px; padding: .85rem 1.25rem;
+      box-shadow: 0 1px 3px rgba(0,0,0,.07); flex: 1; min-width: 130px;
+    }
+    .stat-label { font-size: .7rem; font-weight: 600; text-transform: uppercase;
+                   letter-spacing: .08em; color: #6b7280; }
+    .stat-value { font-size: 1.6rem; font-weight: 700; color: #111827; margin-top: .15rem; }
+
+    /* ── Info sections (abstract / prior art) ── */
+    .info-section {
+      background: #fff; border-radius: 12px; padding: 1.25rem 1.75rem;
+      margin-bottom: 1.25rem; box-shadow: 0 1px 3px rgba(0,0,0,.06);
+    }
+    .section-h {
+      font-size: .8rem; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .09em; color: #1e40af; margin-bottom: .85rem;
+      display: flex; align-items: center; gap: .5rem;
+    }
+    .cnt-badge {
+      background: #dbeafe; color: #1e40af; border-radius: 20px;
+      padding: .05rem .55rem; font-size: .75rem; font-weight: 700;
+    }
+    .abstract {
+      background: #f8fafc; border-left: 3px solid #2563eb;
+      border-radius: 0 8px 8px 0; padding: .9rem 1.1rem;
+      font-size: .92rem; color: #374151; line-height: 1.7;
+    }
+    .prior-table { width: 100%; border-collapse: collapse; font-size: .88rem; }
+    .prior-table td { padding: .35rem .5rem; border-bottom: 1px solid #f0f0f0; }
+    .prior-table tr:last-child td { border-bottom: none; }
+
+    /* ── Country sections ── */
+    .country-section { margin-bottom: 2rem; }
+    .country-h {
+      font-size: 1rem; font-weight: 700; color: #0f172a;
+      margin-bottom: .75rem; display: flex; align-items: center; gap: .5rem;
+    }
+    .country-count {
+      background: #e0e7ff; color: #3730a3; border-radius: 20px;
+      padding: .05rem .55rem; font-size: .75rem; font-weight: 700;
+    }
+
+    /* ── Cards grid ── */
+    .cards-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 1rem;
+    }
+    .card {
+      background: #fff; border-radius: 10px;
+      box-shadow: 0 1px 4px rgba(0,0,0,.07);
+      padding: 1.1rem 1.25rem; display: flex; flex-direction: column; gap: .6rem;
+    }
+    .card-head {
+      display: flex; justify-content: space-between; align-items: flex-start;
+    }
+    .card-pnum { font-size: 1rem; font-weight: 700; }
+    .status-badge {
+      font-size: .7rem; font-weight: 700; border-radius: 20px;
+      padding: .2rem .65rem; white-space: nowrap; flex-shrink: 0;
+    }
+    .card-title { font-size: .85rem; color: #374151; line-height: 1.4; }
+    .card-dates {
+      display: flex; gap: 1rem; flex-wrap: wrap;
+      font-size: .8rem; color: #6b7280;
+    }
+    .card-dates b { color: #111827; }
+
+    /* ── Latest event ── */
+    .latest-event {
+      display: flex; align-items: baseline; gap: .4rem;
+      font-size: .8rem; flex-wrap: wrap;
+    }
+    .ev-chip {
+      background: #f0f9ff; color: #0369a1; border: 1px solid #bae6fd;
+      border-radius: 4px; padding: .05rem .4rem; font-size: .68rem; font-weight: 700;
+      white-space: nowrap;
+    }
+    .ev-date { color: #6b7280; white-space: nowrap; }
+    .ev-title { color: #111827; }
+
+    /* ── Rejections ── */
+    .rejections { font-size: .8rem; }
+    .rej-label {
+      font-size: .68rem; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .07em; color: #991b1b; margin-bottom: .3rem;
+    }
+    .rej-pill {
+      display: inline-block; background: #fee2e2; color: #991b1b;
+      border-radius: 4px; padding: .15rem .5rem;
+      margin: .15rem .2rem .15rem 0; font-size: .75rem;
+    }
+
+    /* ── Prosecution history ── */
+    .history {
+      margin-top: .2rem; border-top: 1px solid #f3f4f6; padding-top: .6rem;
+    }
+    .history summary {
+      cursor: pointer; font-size: .8rem; font-weight: 600; color: #4b5563;
+      user-select: none; list-style: none; display: flex; align-items: center; gap: .4rem;
+    }
+    .history summary::-webkit-details-marker { display: none; }
+    .history summary::before {
+      content: "▶"; font-size: .6rem; transition: transform .15s;
+      display: inline-block;
+    }
+    details[open] > summary::before { transform: rotate(90deg); }
+    .ev-count {
+      background: #f3f4f6; color: #6b7280; border-radius: 20px;
+      padding: .05rem .45rem; font-size: .7rem; font-weight: 600;
+    }
+    .hist-table {
+      width: 100%; border-collapse: collapse; font-size: .78rem;
+      margin-top: .6rem;
+    }
+    .hist-table th {
+      background: #f8f9fa; text-align: left; padding: .35rem .5rem;
+      font-size: .7rem; text-transform: uppercase; letter-spacing: .05em;
+      color: #6b7280; border-bottom: 1px solid #e5e7eb;
+    }
+    .hist-table td { padding: .35rem .5rem; border-bottom: 1px solid #f3f4f6; vertical-align: top; }
+    .hist-table tr:last-child td { border-bottom: none; }
+    .hist-table tr:hover td { background: #fafbff; }
+    .hist-table code {
+      background: #f1f5f9; border-radius: 3px; padding: .05rem .3rem;
+      font-size: .75rem; color: #0f172a;
+    }
+    .no-hist { font-size: .8rem; color: #9ca3af; padding: .5rem 0; }
+    .fetch-error { font-size: .75rem; color: #b45309; background: #fef3c7;
+                    border-radius: 4px; padding: .3rem .6rem; }
+
+    footer { text-align: center; font-size: .75rem; color: #9ca3af; margin-top: 2rem; }
+  </style>
+</head>
+<body>
+
+  <div class="hero">
+    <div class="hero-eyebrow">Patent Family Dashboard</div>
+    <div class="hero-title">Efficient artificial intelligence analysis of radiographic images with combined predictive modeling</div>
+    <div class="hero-sub">
+      <span class="hero-chip">&#128196; US:12178560</span>
+      <span class="hero-chip">&#128197; Filed 2020-12-28</span>
+      <span class="hero-chip">&#9989; Granted 2024-12-31</span>
+      <span class="hero-chip">&#127970; Ariel Ayaviri Omonte; Pratheev Sabaratnam Sreetharan; Yuan-Ching Spencer Teng; Vetology Innovations LLC</span>
+      <span class="hero-chip"><a href="https://patents.google.com/patent/US12178560B2/en" target="_blank" style="color:#93c5fd">Google Patents &#8599;</a></span>
+    </div>
+  </div>
+
+  <div class="stats-bar">
+    <div class="stat-card">
+      <div class="stat-label">Family Size</div>
+      <div class="stat-value">19</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Jurisdictions</div>
+      <div class="stat-value">5</div>
+    </div>
+    <div class="stat-card" style="border-top:3px solid #34d399">
+      <div class="stat-label">Granted</div>
+      <div class="stat-value" style="color:#065f46">5</div>
+    </div>
+    <div class="stat-card" style="border-top:3px solid #60a5fa">
+      <div class="stat-label">Pending</div>
+      <div class="stat-value" style="color:#1e40af">13</div>
+    </div>
+    <div class="stat-card" style="border-top:3px solid #d1d5db">
+      <div class="stat-label">Other</div>
+      <div class="stat-value" style="color:#374151">1</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Prior Art Citations</div>
+      <div class="stat-value">9</div>
+    </div>
+  </div>
+
+  <section class="info-section">  <h2 class="section-h">Abstract</h2>  <div class="abstract">A system, an image analyzer and a method for diagnosing a presence of a disease or a condition in an image of a subject, for example, a veterinary patient, are provided including: classifying the image to a body region, and obtaining a classified, labeled, cropped, and oriented sub-image; directing the sub-image to artificial intelligence processor for obtaining an evaluation result, and comparing the evaluation result to a database library of evaluation results and matched written templates or a dataset cluster to obtain at least one cluster result; measuring the distance between the cluster result and the evaluation result to obtain at least one cluster diagnosis; and assembling the cluster diagnosis and the matched written templates to obtain a report to display the report to a radiologist. These system, analyzer and method are achieved in greatly reduced lengths of time and are useful for cost and time savings.</div></section>
+
+  <section class="country-section">  <h2 class="country-h">🇺🇸 United States    <span class="country-count">10</span>  </h2>  <div class="cards-grid"><div class="card" style="border-top:4px solid #9ca3af">  <div class="card-head">    <span class="card-pnum"><a href="https://patents.google.com/patent/US20170011185A1/en" target="_blank">US20170011185A1</a></span>    <span class="status-badge" style="background:#f3f4f6;color:#374151;border:1.5px solid #9ca3af">Abandoned</span>  </div>  <div class="card-title">Artificial neural network and a method for the classification of medical image data records</div>  <div class="card-dates"><span>Filed: <b>2016-07-08</b></span><span>Granted: <b>2017-01-12</b></span></div><details class="history"><summary>Prosecution history</summary><p class="no-hist">No events found in page source. Check USPTO PAIR / EPO Register / J-PlatPat for full history.</p></details></div><div class="card" style="border-top:4px solid #34d399">  <div class="card-head">    <span class="card-pnum"><a href="https://patents.google.com/patent/US11508065B2/en" target="_blank">US11508065B2</a></span>    <span class="status-badge" style="background:#d1fae5;color:#065f46;border:1.5px solid #34d399">Granted</span>  </div>  <div class="card-title">Methods and systems for detecting acquisition errors in medical images</div>  <div class="card-dates"><span>Filed: <b>2021-03-19</b></span><span>Granted: <b>2022-11-22</b></span></div><details class="history"><summary>Prosecution history</summary><p class="no-hist">No events found in page source. Check USPTO PAIR / EPO Register / J-PlatPat for full history.</p></details></div><div class="card" style="border-top:4px solid #60a5fa">  <div class="card-head">    <span class="card-pnum"><a href="https://patents.google.com/patent/US20230245430A1/en" target="_blank">US20230245430A1</a></span>    <span class="status-badge" style="background:#dbeafe;color:#1e40af;border:1.5px solid #60a5fa">Pending</span>  </div>  <div class="card-title">Systems and methods for processing electronic images for auto-labeling for computational pathology</div>  <div class="card-dates"><span>Filed: <b>2023-01-30</b></span><span>Granted: <b>2023-08-03</b></span></div><div class="rejections"><div class="rej-label">Rejections</div><span class="rej-pill">NON-FINAL OFFICE ACTION</span></div><details class="history"><summary>Prosecution history</summary><p class="no-hist">No events found in page source. Check USPTO PAIR / EPO Register / J-PlatPat for full history.</p></details></div><div class="card" style="border-top:4px solid #60a5fa">  <div class="card-head">    <span class="card-pnum"><a href="https://patents.google.com/patent/US20230316143A1/en" target="_blank">US20230316143A1</a></span>    <span class="status-badge" style="background:#dbeafe;color:#1e40af;border:1.5px solid #60a5fa">Pending</span>  </div>  <div class="card-title">Methods and systems for creating training libraries and training AI processors</div>  <div class="card-dates"><span>Filed: <b>2023-04-06</b></span><span>Granted: <b>2023-10-05</b></span></div><details class="history"><summary>Prosecution history</summary><p class="no-hist">No events found in page source. Check USPTO PAIR / EPO Register / J-PlatPat for full history.</p></details></div><div class="card" style="border-top:4px solid #60a5fa">  <div class="card-head">    <span class="card-pnum"><a href="https://patents.google.com/patent/US20230325714A1/en" target="_blank">US20230325714A1</a></span>    <span class="status-badge" style="background:#dbeafe;color:#1e40af;border:1.5px solid #60a5fa">Pending</span>  </div>  <div class="card-title">Machine learning for artificial intelligence processors with transformed digital data</div>  <div class="card-dates"><span>Filed: <b>2023-04-06</b></span><span>Granted: <b>2023-10-12</b></span></div><details class="history"><summary>Prosecution history</summary><p class="no-hist">No events found in page source. Check USPTO PAIR / EPO Register / J-PlatPat for full history.</p></details></div><div class="card" style="border-top:4px solid #60a5fa">  <div class="card-head">    <span class="card-pnum"><a href="https://patents.google.com/patent/US20230359649A1/en" target="_blank">US20230359649A1</a></span>    <span class="status-badge" style="background:#dbeafe;color:#1e40af;border:1.5px solid #60a5fa">Pending</span>  </div>  <div class="card-title">Methods and Systems with Additive AI Models</div>  <div class="card-dates"><span>Filed: <b>2023-04-06</b></span><span>Granted: <b>2023-11-09</b></span></div><div class="rejections"><div class="rej-label">Rejections</div><span class="rej-pill">NON-FINAL OFFICE ACTION</span></div><details class="history"><summary>Prosecution history</summary><p class="no-hist">No events found in page source. Check USPTO PAIR / EPO Register / J-PlatPat for full history.</p></details></div><div class="card" style="border-top:4px solid #34d399">  <div class="card-head">    <span class="card-pnum"><a href="https://patents.google.com/patent/US11918401B2/en" target="_blank">US11918401B2</a></span>    <span class="status-badge" style="background:#d1fae5;color:#065f46;border:1.5px solid #34d399">Granted</span>  </div>  <div class="card-title">Methods and systems for x-ray imaging and labeling</div>  <div class="card-dates"><span>Filed: <b>2021-01-05</b></span><span>Granted: <b>2024-03-05</b></span></div><details class="history"><summary>Prosecution history</summary><p class="no-hist">No events found in page source. Check USPTO PAIR / EPO Register / J-PlatPat for full history.</p></details></div><div class="card" style="border-top:4px solid #60a5fa">  <div class="card-head">    <span class="card-pnum"><a href="https://patents.google.com/patent/US20240087697A1/en" target="_blank">US20240087697A1</a></span>    <span class="status-badge" style="background:#dbeafe;color:#1e40af;border:1.5px solid #60a5fa">Pending</span>  </div>  <div class="card-title">Methods and systems for providing a template data structure for a medical report</div>  <div class="card-dates"><span>Filed: <b>2023-09-13</b></span><span>Granted: <b>2024-03-14</b></span></div><div class="rejections"><div class="rej-label">Rejections</div><span class="rej-pill">NON-FINAL OFFICE ACTION</span><span class="rej-pill">FINAL REJECTION</span></div><details class="history"><summary>Prosecution history</summary><p class="no-hist">No events found in page source. Check USPTO PAIR / EPO Register / J-PlatPat for full history.</p></details></div><div class="card" style="border-top:4px solid #34d399">  <div class="card-head">    <span class="card-pnum"><a href="https://patents.google.com/patent/US12178560B2/en" target="_blank">US12178560B2</a></span>    <span class="status-badge" style="background:#d1fae5;color:#065f46;border:1.5px solid #34d399">Granted</span>  </div>  <div class="card-title">Efficient artificial intelligence analysis of radiographic images with combined predictive modeling</div>  <div class="card-dates"><span>Filed: <b>2020-12-28</b></span><span>Granted: <b>2024-12-31</b></span></div><details class="history"><summary>Prosecution history</summary><p class="no-hist">No events found in page source. Check USPTO PAIR / EPO Register / J-PlatPat for full history.</p></details></div><div class="card" style="border-top:4px solid #60a5fa">  <div class="card-head">    <span class="card-pnum"><a href="https://patents.google.com/patent/US20250061566A1/en" target="_blank">US20250061566A1</a></span>    <span class="status-badge" style="background:#dbeafe;color:#1e40af;border:1.5px solid #60a5fa">Pending</span>  </div>  <div class="card-title">Medical record-guided computer-aided detection</div>  <div class="card-dates"><span>Filed: <b>2023-08-17</b></span><span>Granted: <b>2025-02-20</b></span></div><div class="rejections"><div class="rej-label">Rejections</div><span class="rej-pill">NON-FINAL OFFICE ACTION</span><span class="rej-pill">FINAL REJECTION</span></div><details class="history"><summary>Prosecution history</summary><p class="no-hist">No events found in page source. Check USPTO PAIR / EPO Register / J-PlatPat for full history.</p></details></div></div></section><section class="country-section">  <h2 class="country-h">🌍 Int'l (PCT)    <span class="country-count">1</span>  </h2>  <div class="cards-grid"><div class="card" style="border-top:4px solid #60a5fa">  <div class="card-head">    <span class="card-pnum"><a href="https://patents.google.com/patent/WO2021133786A1/en" target="_blank">WO2021133786A1</a></span>    <span class="status-badge" style="background:#dbeafe;color:#1e40af;border:1.5px solid #60a5fa">Pending</span>  </div>  <div class="card-title">Efficient artificial intelligence analysis of images with combined predictive modeling</div>  <div class="card-dates"><span>Filed: <b>2020-12-22</b></span><span>Granted: <b>2021-07-01</b></span></div><details class="history"><summary>Prosecution history</summary><p class="no-hist">No events found in page source. Check USPTO PAIR / EPO Register / J-PlatPat for full history.</p></details></div></div></section><section class="country-section">  <h2 class="country-h">🇪🇺 Europe (EPO)    <span class="country-count">2</span>  </h2>  <div class="cards-grid"><div class="card" style="border-top:4px solid #60a5fa">  <div class="card-head">    <span class="card-pnum"><a href="https://patents.google.com/patent/EP4565997A1/en" target="_blank">EP4565997A1</a></span>    <span class="status-badge" style="background:#dbeafe;color:#1e40af;border:1.5px solid #60a5fa">Pending</span>  </div>  <div class="card-title">Methods and systems with additive ai models</div>  <div class="card-dates"><span>Filed: <b>2023-07-27</b></span><span>Granted: <b>2025-06-11</b></span></div><details class="history"><summary>Prosecution history</summary><p class="no-hist">No events found in page source. Check USPTO PAIR / EPO Register / J-PlatPat for full history.</p></details></div><div class="card" style="border-top:4px solid #34d399">  <div class="card-head">    <span class="card-pnum"><a href="https://patents.google.com/patent/EP4445329B1/en" target="_blank">EP4445329B1</a></span>    <span class="status-badge" style="background:#d1fae5;color:#065f46;border:1.5px solid #34d399">Granted</span>  </div>  <div class="card-title">Selecting training data for annotation</div>  <div class="card-dates"><span>Filed: <b>2022-11-17</b></span><span>Granted: <b>2025-06-25</b></span></div><details class="history"><summary>Prosecution history</summary><p class="no-hist">No events found in page source. Check USPTO PAIR / EPO Register / J-PlatPat for full history.</p></details></div></div></section><section class="country-section">  <h2 class="country-h">🇯🇵 Japan    <span class="country-count">2</span>  </h2>  <div class="cards-grid"><div class="card" style="border-top:4px solid #34d399">  <div class="card-head">    <span class="card-pnum"><a href="https://patents.google.com/patent/JP7503213B2/en" target="_blank">JP7503213B2</a></span>    <span class="status-badge" style="background:#d1fae5;color:#065f46;border:1.5px solid #34d399">Granted</span>  </div>  <div class="card-title">Systems and methods for evaluating pet radiological images</div>  <div class="card-dates"><span>Filed: <b>2021-12-15</b></span><span>Granted: <b>2024-06-19</b></span></div><details class="history"><summary>Prosecution history</summary><p class="no-hist">No events found in page source. Check USPTO PAIR / EPO Register / J-PlatPat for full history.</p></details></div><div class="card" style="border-top:4px solid #60a5fa">  <div class="card-head">    <span class="card-pnum"><a href="https://patents.google.com/patent/JP2025517107A/en" target="_blank">JP2025517107A</a></span>    <span class="status-badge" style="background:#dbeafe;color:#1e40af;border:1.5px solid #60a5fa">Pending</span>  </div>  <div class="card-title">Identifying medical imaging protocols based on radiology data and metadata</div>  <div class="card-dates"><span>Filed: <b>2023-05-03</b></span><span>Granted: <b>2025-06-03</b></span></div><details class="history"><summary>Prosecution history</summary><p class="no-hist">No events found in page source. Check USPTO PAIR / EPO Register / J-PlatPat for full history.</p></details></div></div></section><section class="country-section">  <h2 class="country-h">🇨🇳 China    <span class="country-count">4</span>  </h2>  <div class="cards-grid"><div class="card" style="border-top:4px solid #60a5fa">  <div class="card-head">    <span class="card-pnum"><a href="https://patents.google.com/patent/CN116762133A/en" target="_blank">CN116762133A</a></span>    <span class="status-badge" style="background:#dbeafe;color:#1e40af;border:1.5px solid #60a5fa">Pending</span>  </div>  <div class="card-title">Decomposed feature representation for analyzing the content and style of radiology reports</div>  <div class="card-dates"><span>Filed: <b>2022-01-28</b></span><span>Granted: <b>2023-09-15</b></span></div><details class="history"><summary>Prosecution history</summary><p class="no-hist">No events found in page source. Check USPTO PAIR / EPO Register / J-PlatPat for full history.</p></details></div><div class="card" style="border-top:4px solid #60a5fa">  <div class="card-head">    <span class="card-pnum"><a href="https://patents.google.com/patent/CN116801795A/en" target="_blank">CN116801795A</a></span>    <span class="status-badge" style="background:#dbeafe;color:#1e40af;border:1.5px solid #60a5fa">Pending</span>  </div>  <div class="card-title">Systems and methods for evaluating pet radiology images</div>  <div class="card-dates"><span>Filed: <b>2021-12-15</b></span><span>Granted: <b>2023-09-22</b></span></div><details class="history"><summary>Prosecution history</summary><p class="no-hist">No events found in page source. Check USPTO PAIR / EPO Register / J-PlatPat for full history.</p></details></div><div class="card" style="border-top:4px solid #60a5fa">  <div class="card-head">    <span class="card-pnum"><a href="https://patents.google.com/patent/CN117015800A/en" target="_blank">CN117015800A</a></span>    <span class="status-badge" style="background:#dbeafe;color:#1e40af;border:1.5px solid #60a5fa">Pending</span>  </div>  <div class="card-title">Attention-based multi-instance learning for full-slice images</div>  <div class="card-dates"><span>Filed: <b>2022-03-11</b></span><span>Granted: <b>2023-11-07</b></span></div><details class="history"><summary>Prosecution history</summary><p class="no-hist">No events found in page source. Check USPTO PAIR / EPO Register / J-PlatPat for full history.</p></details></div><div class="card" style="border-top:4px solid #60a5fa">  <div class="card-head">    <span class="card-pnum"><a href="https://patents.google.com/patent/CN118172645A/en" target="_blank">CN118172645A</a></span>    <span class="status-badge" style="background:#dbeafe;color:#1e40af;border:1.5px solid #60a5fa">Pending</span>  </div>  <div class="card-title">Artificial intelligence image recognition method and device and electronic equipment</div>  <div class="card-dates"><span>Filed: <b>2024-04-11</b></span><span>Granted: <b>2024-06-11</b></span></div><details class="history"><summary>Prosecution history</summary><p class="no-hist">No events found in page source. Check USPTO PAIR / EPO Register / J-PlatPat for full history.</p></details></div></div></section>
+
+  <section class="info-section">  <h2 class="section-h">Cited Prior Art <span class="cnt-badge">9</span></h2>  <table class="prior-table"><tbody><tr><td><a href="https://patents.google.com/patent/US20080267471A1/en" target="_blank">US:20080267471:A1</a></td></tr><tr><td><a href="https://patents.google.com/patent/US20090076853A1/en" target="_blank">US:20090076853:A1</a></td></tr><tr><td><a href="https://patents.google.com/patent/US9721340/en" target="_blank">US:9721340</a></td></tr><tr><td><a href="https://patents.google.com/patent/US11756655/en" target="_blank">US:11756655</a></td></tr><tr><td><a href="https://patents.google.com/patent/US11842810/en" target="_blank">US:11842810</a></td></tr><tr><td><a href="https://patents.google.com/patent/US20200160032A1/en" target="_blank">US:20200160032:A1</a></td></tr><tr><td><a href="https://patents.google.com/patent/US11718322/en" target="_blank">US:11718322</a></td></tr><tr><td><a href="https://patents.google.com/patent/US11494669/en" target="_blank">US:11494669</a></td></tr><tr><td><a href="https://patents.google.com/patent/US20200143279A1/en" target="_blank">US:20200143279:A1</a></td></tr></tbody></table></section>
+
+  <footer>Generated by patent-research-tool &mdash; US 12,178,560</footer>
+</body>
+</html>
