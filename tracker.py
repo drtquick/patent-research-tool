@@ -1,0 +1,1824 @@
+#!/usr/bin/env python3
+"""
+Patent Family Tracker
+
+Fetches patent details and family members from Google Patents.
+No API key required.
+
+Usage:
+    python tracker.py "US 12,178,560"
+    python tracker.py US12178560B2
+"""
+
+import sys
+import re
+import os
+import json as _json
+import time as _time
+import calendar
+import webbrowser
+import requests
+from datetime import date as _date
+from typing import Optional
+
+W = 72  # output width
+
+UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+# ── Normalization ────────────────────────────────────────────────────────────
+
+def normalize(raw: str) -> str:
+    """Strip spaces/commas/periods; keep letters and digits."""
+    return re.sub(r"[^A-Z0-9]", "", raw.upper())
+
+
+def build_url(patent_id: str) -> str:
+    """
+    Build a Google Patents URL from a raw patent string.
+    Tries to handle numbers given without a kind code (B1/B2).
+    """
+    clean = normalize(patent_id)
+    # Already has a kind code?
+    if re.search(r"[A-Z]\d$", clean):
+        pub_num = clean
+    elif clean.startswith("US") and clean[2:].isdigit():
+        # Try B2 first (most common for utility grants), then B1
+        pub_num = clean + "B2"
+    else:
+        pub_num = clean
+    return f"https://patents.google.com/patent/{pub_num}/en"
+
+
+# ── Fetching + Parsing ───────────────────────────────────────────────────────
+
+def fetch_page(url: str) -> str:
+    resp = requests.get(url, headers={"User-Agent": UA}, timeout=20)
+    resp.raise_for_status()
+    return resp.text
+
+
+def get_metas(html: str) -> dict[str, list[str]]:
+    """Return all <meta name="..." content="..."> values grouped by name."""
+    result: dict[str, list[str]] = {}
+    for name, val in re.findall(
+        r'<meta\s+name="([^"]+)"\s+content="([^"]*)"', html
+    ):
+        result.setdefault(name, []).append(val.strip())
+    return result
+
+
+def parse_family(html: str) -> list[dict]:
+    """
+    Parse the 'Similar Documents' (patent family) table.
+    Returns list of {pub_num, date, title, lang, href}.
+    """
+    family_match = re.search(
+        r"Similar Documents(.*?)(?:<h2|<section)", html, re.DOTALL
+    )
+    if not family_match:
+        return []
+
+    section = family_match.group(1)
+    members = []
+
+    for row in re.split(r'itemprop="similarDocuments"', section)[1:]:
+        pub_num = _first(re.findall(r'itemprop="publicationNumber">(.*?)</span>', row))
+        lang    = _first(re.findall(r'itemprop="primaryLanguage">(.*?)</span>', row))
+        href    = _first(re.findall(r'href="(/patent/[^"]+)"', row))
+        date    = _first(re.findall(r'<time[^>]+datetime="([^"]+)"', row))
+        title   = _first(re.findall(r'<td itemprop="title">(.*?)</td>', row, re.DOTALL))
+
+        if pub_num:
+            members.append({
+                "pub_num": pub_num,
+                "lang": lang or "",
+                "href": ("https://patents.google.com" + href) if href else "",
+                "date": date or "",
+                "title": title.strip() if title else "",
+            })
+
+    return members
+
+
+_DEP_PAT = re.compile(
+    r'^The\s+\S[\S\s]{0,60}?\s+(?:of|according\s+to)\s+claim\s+\d+',
+    re.IGNORECASE,
+)
+
+
+def parse_claims(html: str) -> list[dict]:
+    """
+    Parse patent claims from Google Patents HTML.
+    Returns list of {num, text, independent}.
+    """
+    cm = re.search(r'itemprop="claims"[^>]*>(.*?)</section', html, re.DOTALL)
+    if not cm:
+        return []
+    raw_blocks = re.findall(
+        r'<div[^>]+class="claim"[^>]*>(.*?)(?=<div[^>]+class="claim"|$)',
+        cm.group(1), re.DOTALL,
+    )
+
+    def _clean(s: str) -> str:
+        s = re.sub(r'<[^>]+>', ' ', s)
+        return re.sub(r'\s+', ' ', s).strip()
+
+    claims = []
+    for block in raw_blocks:
+        text = _clean(block)
+        m = re.match(r'^(\d+)\.\s+(.*)', text, re.DOTALL)
+        if not m:
+            continue
+        body = m.group(2).strip()
+        claims.append({
+            "num": int(m.group(1)),
+            "text": body,
+            "independent": not _DEP_PAT.match(body),
+        })
+    return claims
+
+
+def _first(lst: list) -> Optional[str]:
+    return lst[0] if lst else None
+
+
+# ── Display ──────────────────────────────────────────────────────────────────
+
+def bar(char="═"):
+    print(char * W)
+
+def rule():
+    print("─" * W)
+
+def display(metas: dict, family: list, url: str):
+    bar()
+    print("  PATENT FAMILY TRACKER".center(W))
+    bar()
+
+    # ── Core fields ──
+    number   = _first(metas.get("citation_patent_number", []))
+    app_num  = _first(metas.get("citation_patent_application_number", []))
+    title    = _first(metas.get("DC.title", []))
+    abstract = _first(metas.get("DC.description", []))
+    pdf      = _first(metas.get("citation_pdf_url", []))
+
+    dates        = metas.get("DC.date", [])
+    filing_date  = dates[0] if len(dates) > 0 else "N/A"
+    grant_date   = dates[1] if len(dates) > 1 else "N/A"
+
+    contributors = metas.get("DC.contributor", [])
+
+    # Heuristic: last contributor entry is typically the assignee (org name)
+    # Inventors tend to be "First Last"; assignees look like multi-word org names.
+    inventors  = []
+    assignees  = []
+    for c in contributors:
+        # Simple heuristic: if it contains common corp words or no comma → org
+        words = c.strip().split()
+        if len(words) >= 3 or any(
+            kw in c for kw in ("LLC", "Inc", "Corp", "Ltd", "Company", "Institute", "University")
+        ):
+            assignees.append(c.strip())
+        else:
+            inventors.append(c.strip())
+
+    print(f"\n  Patent   : {number or 'N/A'}")
+    if title:
+        print(f"  Title    : {title.strip()}")
+    print(f"  Filed    : {filing_date}")
+    print(f"  Granted  : {grant_date}")
+    if app_num:
+        print(f"  App No   : {app_num}")
+    if assignees:
+        print(f"  Assignee : {'; '.join(assignees)}")
+    if inventors:
+        inv_str = "; ".join(inventors[:6])
+        if len(inventors) > 6:
+            inv_str += f" (+{len(inventors)-6} more)"
+        print(f"  Inventors: {inv_str}")
+    if pdf:
+        print(f"  PDF      : {pdf}")
+    print(f"  Source   : {url}")
+
+    if abstract:
+        short = abstract.strip()[:500]
+        if len(abstract.strip()) > 500:
+            short = short.rsplit(" ", 1)[0] + " …"
+        print(f"\n  Abstract :\n  {short}")
+
+    # ── Citations / relations ──
+    relations = metas.get("DC.relation", [])
+    if relations:
+        rule()
+        print(f"  Cited Prior Art / Related Publications  ({len(relations)})")
+        rule()
+        for r in relations:
+            print(f"    {r}")
+
+    # ── Patent family ──
+    rule()
+    if family:
+        print(f"  Patent Family  ({len(family)} members)")
+        rule()
+        # Group by language/jurisdiction
+        for m in sorted(family, key=lambda x: x["date"] or ""):
+            lang  = f" ({m['lang']})" if m['lang'] else ""
+            date  = m['date']
+            pnum  = m['pub_num']
+            mtitle = (m['title'] or "—")[:60]
+            print(f"  {pnum:<22} {date:<12}{lang}")
+            print(f"    └─ {mtitle}")
+    else:
+        print("  No family members found in Similar Documents table.")
+
+    bar()
+    print(f"  {len(family)} family member(s)  |  {len(relations)} prior art citation(s)")
+    bar()
+    print()
+
+
+# ── HTML Dashboard ───────────────────────────────────────────────────────────
+
+def generate_html(metas: dict, family: list, url: str, patent_input: str) -> str:
+    number   = _first(metas.get("citation_patent_number", [])) or "N/A"
+    app_num  = _first(metas.get("citation_patent_application_number", []))
+    title    = (_first(metas.get("DC.title", [])) or "").strip()
+    abstract = (_first(metas.get("DC.description", [])) or "").strip()
+    pdf      = _first(metas.get("citation_pdf_url", []))
+    relations = metas.get("DC.relation", [])
+
+    dates       = metas.get("DC.date", [])
+    filing_date = dates[0] if len(dates) > 0 else "N/A"
+    grant_date  = dates[1] if len(dates) > 1 else "N/A"
+
+    contributors = metas.get("DC.contributor", [])
+    inventors, assignees = [], []
+    for c in contributors:
+        words = c.strip().split()
+        if len(words) >= 3 or any(
+            kw in c for kw in ("LLC", "Inc", "Corp", "Ltd", "Company", "Institute", "University")
+        ):
+            assignees.append(c.strip())
+        else:
+            inventors.append(c.strip())
+
+    def tag(label, value, href=None):
+        if not value:
+            return ""
+        val_html = f'<a href="{href}" target="_blank">{value}</a>' if href else value
+        return f'<tr><th>{label}</th><td>{val_html}</td></tr>\n'
+
+    core_rows = (
+        tag("Patent", number)
+        + tag("Application", app_num)
+        + tag("Filed", filing_date)
+        + tag("Granted", grant_date)
+        + tag("Assignee", "; ".join(assignees) if assignees else None)
+        + tag("Inventors", "; ".join(inventors) if inventors else None)
+        + tag("PDF", "Download PDF", href=pdf)
+        + tag("Google Patents", url, href=url)
+    )
+
+    family_rows = ""
+    for m in sorted(family, key=lambda x: x["date"] or ""):
+        lang  = f" <span class='lang'>({m['lang']})</span>" if m['lang'] else ""
+        mtitle = m['title'] or "—"
+        link  = f'<a href="{m["href"]}" target="_blank">{m["pub_num"]}</a>' if m["href"] else m["pub_num"]
+        family_rows += (
+            f"<tr>"
+            f"<td>{link}{lang}</td>"
+            f"<td>{m['date']}</td>"
+            f"<td>{mtitle}</td>"
+            f"</tr>\n"
+        )
+
+    prior_art_rows = "".join(
+        '<tr><td><a href="https://patents.google.com/patent/{}/en" target="_blank">{}</a></td></tr>\n'.format(
+            r.replace(":", ""), r
+        )
+        for r in relations
+    )
+
+    family_section = f"""
+    <section>
+      <h2>Patent Family <span class="badge">{len(family)}</span></h2>
+      <table>
+        <thead><tr><th>Publication</th><th>Date</th><th>Title</th></tr></thead>
+        <tbody>{family_rows or "<tr><td colspan='3'>No family members found.</td></tr>"}</tbody>
+      </table>
+    </section>""" if True else ""
+
+    prior_art_section = f"""
+    <section>
+      <h2>Cited Prior Art <span class="badge">{len(relations)}</span></h2>
+      <table>
+        <thead><tr><th>Publication Number</th></tr></thead>
+        <tbody>{prior_art_rows}</tbody>
+      </table>
+    </section>""" if relations else ""
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Patent {number}</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: #f0f2f5; color: #1a1a2e; line-height: 1.6; padding: 2rem; }}
+    header {{ background: linear-gradient(135deg, #1a1a2e 0%, #16213e 60%, #0f3460 100%);
+              color: #fff; border-radius: 12px; padding: 2rem 2.5rem; margin-bottom: 1.5rem; }}
+    header h1 {{ font-size: 1.1rem; font-weight: 500; opacity: .7; letter-spacing: .05em; text-transform: uppercase; }}
+    header h2 {{ font-size: 1.6rem; font-weight: 700; margin-top: .4rem; }}
+    header .meta {{ margin-top: 1rem; display: flex; gap: 1.5rem; flex-wrap: wrap; font-size: .9rem; opacity: .85; }}
+    header .meta span {{ background: rgba(255,255,255,.1); border-radius: 6px; padding: .2rem .7rem; }}
+    section {{ background: #fff; border-radius: 12px; padding: 1.5rem 2rem;
+               margin-bottom: 1.5rem; box-shadow: 0 1px 4px rgba(0,0,0,.06); }}
+    section h2 {{ font-size: 1rem; font-weight: 600; text-transform: uppercase;
+                  letter-spacing: .07em; color: #0f3460; margin-bottom: 1rem;
+                  display: flex; align-items: center; gap: .6rem; }}
+    .badge {{ background: #e8f0fe; color: #1a73e8; border-radius: 20px;
+              padding: .1rem .6rem; font-size: .8rem; font-weight: 700; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: .92rem; }}
+    th, td {{ padding: .55rem .75rem; text-align: left; border-bottom: 1px solid #f0f0f0; }}
+    thead th {{ background: #f8f9fa; font-weight: 600; color: #555; font-size: .8rem;
+                text-transform: uppercase; letter-spacing: .05em; }}
+    tbody tr:last-child td {{ border-bottom: none; }}
+    tbody tr:hover td {{ background: #fafbff; }}
+    table.core th {{ width: 130px; color: #666; font-weight: 500; }}
+    a {{ color: #1a73e8; text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+    .lang {{ color: #888; font-size: .85em; }}
+    .abstract {{ background: #f8f9fa; border-left: 3px solid #0f3460;
+                 border-radius: 0 8px 8px 0; padding: 1rem 1.25rem;
+                 font-size: .93rem; color: #333; line-height: 1.7; }}
+    footer {{ text-align: center; font-size: .8rem; color: #999; margin-top: 1rem; }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Patent Family Tracker</h1>
+    <h2>{title or number}</h2>
+    <div class="meta">
+      <span>&#128196; {number}</span>
+      <span>&#128197; Filed {filing_date}</span>
+      <span>&#9989; Granted {grant_date}</span>
+      {f'<span>&#127970; {"; ".join(assignees)}</span>' if assignees else ""}
+    </div>
+  </header>
+
+  <section>
+    <h2>Core Details</h2>
+    <table class="core"><tbody>{core_rows}</tbody></table>
+  </section>
+
+  {f'''<section>
+    <h2>Abstract</h2>
+    <div class="abstract">{abstract}</div>
+  </section>''' if abstract else ""}
+
+  {family_section}
+
+  {prior_art_section}
+
+  <footer>Generated by patent-research-tool &mdash; {patent_input}</footer>
+</body>
+</html>"""
+
+
+def save_and_open_html(html: str, number: str) -> str:
+    safe = re.sub(r"[^A-Z0-9]", "", number.upper()) or "patent"
+    out_dir = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(out_dir, f"patent_{safe}.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return path
+
+
+# ── Prosecution Dashboard ────────────────────────────────────────────────────
+
+COUNTRY_NAMES = {
+    "US": "United States", "WO": "Int'l (PCT)", "EP": "Europe (EPO)",
+    "CN": "China", "JP": "Japan", "KR": "South Korea", "AU": "Australia",
+    "CA": "Canada", "GB": "United Kingdom", "DE": "Germany", "FR": "France",
+}
+COUNTRY_FLAGS = {
+    "US": "🇺🇸", "WO": "🌍", "EP": "🇪🇺", "CN": "🇨🇳",
+    "JP": "🇯🇵", "KR": "🇰🇷", "AU": "🇦🇺", "CA": "🇨🇦",
+    "GB": "🇬🇧", "DE": "🇩🇪", "FR": "🇫🇷",
+}
+STATUS_META = {
+    "granted":   {"label": "Granted",   "bg": "#d1fae5", "fg": "#065f46", "border": "#34d399"},
+    "pending":   {"label": "Pending",   "bg": "#dbeafe", "fg": "#1e40af", "border": "#60a5fa"},
+    "abandoned": {"label": "Abandoned", "bg": "#f3f4f6", "fg": "#374151", "border": "#9ca3af"},
+    "rejected":  {"label": "Rejected",  "bg": "#fee2e2", "fg": "#991b1b", "border": "#f87171"},
+    "expired":   {"label": "Expired",   "bg": "#fef3c7", "fg": "#92400e", "border": "#fbbf24"},
+    "unknown":   {"label": "Unknown",   "bg": "#f9fafb", "fg": "#6b7280", "border": "#d1d5db"},
+}
+_PREFERRED_COUNTRIES = ["US", "WO", "EP", "JP", "CN", "KR", "AU", "CA", "GB", "DE", "FR"]
+
+
+def country_code(pub_num: str) -> str:
+    m = re.match(r"^([A-Z]{2})", re.sub(r"[^A-Z0-9]", "", pub_num.upper()))
+    return m.group(1) if m else "??"
+
+
+def infer_status(pub_num: str, html: str = "") -> str:
+    clean = re.sub(r"[^A-Z0-9]", "", pub_num.upper())
+    m = re.search(r"([A-Z])(\d?)$", clean)
+    base = "unknown"
+    if m:
+        letter = m.group(1)
+        base = "granted" if letter == "B" else ("pending" if letter == "A" else "unknown")
+    if html:
+        if re.search(r"(?:status|legal)[^<]{0,60}(?:Abandoned|Lapsed)", html[:20000], re.IGNORECASE):
+            return "abandoned"
+        if re.search(r"(?:status|legal)[^<]{0,60}Expired", html[:20000], re.IGNORECASE):
+            return "expired"
+    return base
+
+
+def parse_legal_events(html: str) -> list[dict]:
+    events: list[dict] = []
+
+    # Strategy 1: itemprop="legalEvents" table rows (primary Google Patents structure)
+    for row in re.findall(
+        r'<tr[^>]*itemprop="legalEvents"[^>]*>(.*?)</tr>', html, re.DOTALL
+    ):
+        date  = _first(re.findall(r'datetime="([^"]+)"', row))
+        code  = _first(re.findall(r'itemprop="code"[^>]*>([^<]+)', row))
+        title = _first(re.findall(r'itemprop="title"[^>]*>([^<]+)', row))
+        value = _first(re.findall(r'itemprop="value"[^>]*>([^<]+)', row))
+        if date or title:
+            events.append({
+                "date":  (date  or "").strip(),
+                "code":  (code  or "").strip(),
+                "title": (title or "").strip(),
+                "value": (value or "").strip(),
+            })
+
+    if events:
+        return sorted(events, key=lambda x: x.get("date") or "")
+
+    # Strategy 2: JSON-LD embedded data
+    for jtext in re.findall(
+        r'<script[^>]*application/ld\+json[^>]*>\s*(.*?)\s*</script>', html, re.DOTALL
+    ):
+        try:
+            data = _json.loads(jtext)
+            if not isinstance(data, dict):
+                continue
+            for key in ("events", "legalEvents", "prosecutionHistory", "applicationEvents"):
+                for e in data.get(key, []):
+                    if isinstance(e, dict):
+                        events.append({
+                            "date":  e.get("date", e.get("datePublished", "")),
+                            "code":  e.get("eventCode", e.get("code", e.get("type", ""))),
+                            "title": e.get("title", e.get("name", e.get("description", ""))),
+                            "value": "",
+                        })
+        except Exception:
+            pass
+
+    if events:
+        return sorted(events, key=lambda x: x.get("date") or "")
+
+    # Strategy 3: itemprop="event" blocks (older schema)
+    for bm in re.finditer(
+        r'itemprop="event"[^>]*>(.*?)(?=itemprop="event"|</(?:section|div)>)',
+        html, re.DOTALL
+    ):
+        seg = bm.group(1)
+        date  = _first(re.findall(r'datetime="([^"]+)"', seg))
+        code  = _first(re.findall(r'itemprop="(?:code|eventCode)"[^>]*>([^<]+)', seg))
+        title = _first(re.findall(r'itemprop="(?:title|name)"[^>]*>([^<]+)', seg))
+        if date or title:
+            events.append({"date": date or "", "code": code or "", "title": title or "", "value": ""})
+
+    if events:
+        return sorted(events, key=lambda x: x.get("date") or "")
+
+    # Strategy 4: table inside id="legal" / id="events" section
+    lm = re.search(
+        r'id="(?:legal|legalEvents|events)"[^>]*>(.*?)(?:</section>|<h[123])',
+        html, re.DOTALL
+    )
+    if lm:
+        for row in re.findall(r"<tr[^>]*>(.*?)</tr>", lm.group(1), re.DOTALL):
+            cells = [
+                re.sub(r"<[^>]+>", "", c).strip()
+                for c in re.findall(r"<td[^>]*>(.*?)</td>", row, re.DOTALL)
+            ]
+            if len(cells) >= 2:
+                dm = re.search(r"(\d{4}[-/]\d{2}[-/]\d{2})", cells[0])
+                if dm:
+                    events.append({
+                        "date":  dm.group(1),
+                        "code":  cells[1] if len(cells) > 1 else "",
+                        "title": cells[2] if len(cells) > 2 else "",
+                        "value": "",
+                    })
+
+    return sorted(events, key=lambda x: x.get("date") or "")
+
+
+def parse_rejections(html: str) -> list[str]:
+    seen: set[str] = set()
+    results: list[str] = []
+    for m in re.finditer(
+        r"(?:35 U\.S\.C\.?\s*[§Ss]?\s*\d+[\w()]*"
+        r"|rejection under\s+[§Ss]?\s*\d+"
+        r"|(?:final|non-final)\s+(?:office action|rejection))",
+        html, re.IGNORECASE
+    ):
+        text = re.sub(r"\s+", " ", m.group()).strip()
+        key = text.lower()
+        if key not in seen:
+            seen.add(key)
+            results.append(text)
+        if len(results) >= 5:
+            break
+    return results
+
+
+def parse_backward_refs(html: str) -> list[dict]:
+    """Parse examiner-cited prior art from Google Patents HTML."""
+    refs = []
+    for row in re.findall(
+        r'<tr[^>]*itemprop="backwardReferences"[^>]*>(.*?)</tr>', html, re.DOTALL
+    ):
+        pub      = _first(re.findall(r'itemprop="publicationNumber"[^>]*>\s*([^<]+)', row))
+        date     = _first(re.findall(r'itemprop="publicationDate"[^>]*>\s*([^<]+)', row))
+        assignee = _first(re.findall(r'itemprop="assignee"[^>]*>\s*([^<]+)', row))
+        title    = _first(re.findall(r'itemprop="title"[^>]*>\s*([^<]+)', row))
+        href     = _first(re.findall(r'href="(/patent/[^"]+)"', row))
+        # "Cited by examiner" marker — appears as ✱ or a superscript asterisk in the cell
+        is_examiner = bool(re.search(r'Cited by examiner|✱|\*\s*$', row, re.IGNORECASE))
+        if pub:
+            refs.append({
+                "pub":      pub.strip(),
+                "date":     (date     or "").strip(),
+                "assignee": (assignee or "").strip(),
+                "title":    (title    or "").strip(),
+                "href":     ("https://patents.google.com" + href if href else ""),
+                "examiner": is_examiner,
+            })
+    return refs
+
+
+# ── Rejection summary constants ───────────────────────────────────────────────
+
+# USPTO STPP free-format text → human-readable action
+_US_OA_EVENTS: dict[str, str] = {
+    "NON FINAL ACTION MAILED":        "Non-Final Rejection issued",
+    "NON-FINAL ACTION MAILED":        "Non-Final Rejection issued",
+    "FINAL ACTION MAILED":            "Final Rejection issued",
+    "FINAL REJECTION MAILED":         "Final Rejection issued",
+    "ADVISORY ACTION MAILED":         "Advisory Action issued",
+    "NOTICE OF ALLOWANCE MAILED":     "Notice of Allowance issued",
+    "NOTICE OF ALLOWANCE":            "Notice of Allowance issued",
+    "ISSUE FEE PAYMENT VERIFIED":     "Issue fee paid — patent pending issuance",
+    "RESPONSE TO NON-FINAL":          "Response to Non-Final Rejection filed",
+    "RESPONSE TO FINAL":              "Response to Final Rejection filed",
+    "APPEAL BRIEF":                   "Appeal Brief filed",
+    "EXAMINER'S ANSWER":              "Examiner's Answer to Appeal",
+    "RESTRICTION REQUIREMENT MAILED": "Restriction / Election Requirement issued",
+    "ELECTION":                       "Restriction / Election response filed",
+}
+
+# §35 U.S.C. section → rejection ground info
+_REJECTION_GROUNDS: dict[str, dict] = {
+    "101": {
+        "title":   "§101 Subject Matter Eligibility",
+        "summary": "Claims are directed to patent-ineligible subject matter "
+                   "(abstract ideas, laws of nature, or natural phenomena) "
+                   "without a meaningful inventive concept beyond the judicial exception.",
+    },
+    "102": {
+        "title":   "§102 Anticipation",
+        "summary": "Each claim element is disclosed in a single prior art reference, "
+                   "which anticipates the claimed invention.",
+    },
+    "103": {
+        "title":   "§103 Obviousness",
+        "summary": "A combination of prior art references renders the claimed invention "
+                   "obvious to a person of ordinary skill in the art at the time of filing.",
+    },
+    "112a": {
+        "title":   "§112(a) Written Description",
+        "summary": "The specification does not reasonably convey that the inventor "
+                   "possessed the full scope of the claimed invention as of the filing date.",
+    },
+    "112b": {
+        "title":   "§112(b) Indefiniteness",
+        "summary": "One or more claim terms fail to inform those skilled in the art "
+                   "with reasonable certainty about the scope of the invention.",
+    },
+    "112f": {
+        "title":   "§112(f) Means-Plus-Function",
+        "summary": "A means-plus-function limitation lacks adequate corresponding "
+                   "structure, material, or acts in the specification.",
+    },
+    "116":  {
+        "title":   "§116 Oath or Declaration",
+        "summary": "The oath or declaration of inventorship is deficient or missing.",
+    },
+}
+
+# Foreign office systems for linking
+_FOREIGN_SYSTEMS: dict[str, tuple[str, str]] = {
+    "EP": ("EPO Register",  "https://register.epo.org/application?number="),
+    "JP": ("J-PlatPat",     "https://www.j-platpat.inpit.go.jp/"),
+    "CN": ("CNIPA CPQUERY", "https://cpquery.cponline.cnipa.gov.cn/"),
+    "KR": ("KIPRIS",        "https://www.kipris.or.kr/"),
+    "AU": ("AusPat",        "https://www.ipaustralia.gov.au/tools-resources/search-patent"),
+    "CA": ("CIPO",          "https://ised-isde.canada.ca/site/canadian-intellectual-property-office/en/patents"),
+    "GB": ("IPO",           "https://www.ipo.gov.uk/p-ipsum.htm"),
+}
+
+
+def _classify_oa_event(value: str, title: str) -> Optional[str]:
+    """Map a legal event free-format text or title to a human-readable OA label."""
+    combined = (value + " " + title).upper()
+    for key, label in _US_OA_EVENTS.items():
+        if key in combined:
+            return label
+    return None
+
+
+def extract_rejection_summary(m: dict) -> Optional[dict]:
+    """
+    Build a rejection summary dict from a member's fetched data.
+    Returns None if no rejection evidence is found.
+    """
+    cc      = country_code(m["pub_num"])
+    events  = m.get("events", [])
+    raw_rej = m.get("rejections", [])
+    b_refs  = m.get("backward_refs", [])
+    app_num = (m.get("app_num") or "").strip()
+
+    if cc == "US":
+        # Find office-action events
+        oa_events: list[dict] = []
+        for e in events:
+            label = _classify_oa_event(e.get("value", ""), e.get("title", ""))
+            if label:
+                oa_events.append({"date": e["date"], "label": label,
+                                   "code": e.get("code", ""), "raw": e.get("value", "")})
+
+        has_rejection = any(
+            "rejection" in ev["label"].lower() or "action" in ev["label"].lower()
+            for ev in oa_events
+        ) or bool(raw_rej)
+
+        if not has_rejection:
+            return None
+
+        # Map §35 U.S.C. citations to grounds
+        grounds: list[dict] = []
+        seen_sec: set[str] = set()
+        for r in raw_rej:
+            sm = re.search(r'(\d+)\(([a-z])\)', r, re.IGNORECASE)
+            sec  = re.search(r'(\d+)', r).group(1) if re.search(r'(\d+)', r) else ""
+            sub  = sm.group(2).lower() if sm else ""
+            key  = f"{sec}{sub}" if sub else sec
+            info = _REJECTION_GROUNDS.get(key) or _REJECTION_GROUNDS.get(sec)
+            if info and key not in seen_sec:
+                seen_sec.add(key)
+                grounds.append(info)
+
+        # Examiner-cited references
+        examiner_refs = [r for r in b_refs if r.get("examiner")]
+        all_refs      = b_refs  # show all; examiner-cited flagged separately
+
+        # Patent Center link
+        clean_app = re.sub(r"[^0-9]", "", app_num)
+        pc_url = (
+            f"https://patentcenter.uspto.gov/applications/{clean_app}"
+            if clean_app else "https://patentcenter.uspto.gov"
+        )
+
+        return {
+            "cc":          "US",
+            "oa_events":   oa_events,
+            "grounds":     grounds,
+            "refs":        all_refs,
+            "examiner_refs": examiner_refs,
+            "has_grounds_in_html": bool(grounds),
+            "pc_url":      pc_url,
+            "app_num":     app_num,
+        }
+
+    else:
+        # Non-US: show available events and link to foreign office
+        oa_events = [
+            e for e in events
+            if re.search(r'reject|office.?action|refusal|examiner',
+                         e.get("title","") + e.get("value",""), re.IGNORECASE)
+        ]
+        if not oa_events and not raw_rej:
+            return None
+
+        system_name, system_base = _FOREIGN_SYSTEMS.get(cc, ("foreign patent office", ""))
+        return {
+            "cc":          cc,
+            "oa_events":   oa_events,
+            "grounds":     [],
+            "refs":        b_refs,
+            "examiner_refs": [],
+            "system_name": system_name,
+            "system_url":  system_base,
+        }
+
+
+def fetch_member_details(member: dict, idx: int, total: int) -> dict:
+    result = {
+        **member,
+        "status":        infer_status(member["pub_num"]),
+        "events":        [],
+        "rejections":    [],
+        "backward_refs": [],
+        "filing_date":   "",
+        "grant_date":    "",
+        "member_title":  member.get("title", ""),
+        "fetch_error":   None,
+    }
+    if not member.get("href"):
+        return result
+
+    print(f"  [{idx:>2}/{total}] {member['pub_num']:<22} … ", end="", flush=True)
+    try:
+        page  = fetch_page(member["href"])
+        metas = get_metas(page)
+        dates = metas.get("DC.date", [])
+        result["filing_date"]   = dates[0] if dates else ""
+        result["grant_date"]    = dates[1] if len(dates) > 1 else ""
+        result["app_num"]       = _first(metas.get("citation_patent_application_number", [])) or ""
+        result["member_title"]  = (metas.get("DC.title", [""])[0] or member.get("title", "")).strip()
+        result["status"]        = infer_status(member["pub_num"], page)
+        result["events"]        = parse_legal_events(page)
+        result["backward_refs"] = parse_backward_refs(page)
+        result["rejections"]    = (
+            parse_rejections(page) if result["status"] in ("pending", "unknown") else []
+        )
+        print("ok")
+    except requests.HTTPError as e:
+        result["fetch_error"] = f"HTTP {e.response.status_code}"
+        if e.response.status_code == 404:
+            result["status"] = "unknown"
+        print(f"HTTP {e.response.status_code}")
+    except Exception as e:
+        result["fetch_error"] = str(e)[:60]
+        print("error")
+
+    _time.sleep(0.5)
+    return result
+
+
+# ── Rejection summary renderer ───────────────────────────────────────────────
+
+def _render_rejection_summary(summary: dict) -> str:
+    if not summary:
+        return ""
+
+    cc = summary["cc"]
+
+    # ── Office action timeline ──
+    oa_rows = ""
+    for ev in summary.get("oa_events", []):
+        oa_rows += (
+            f'<tr>'
+            f'<td class="rej-date">{ev["date"]}</td>'
+            f'<td><span class="rej-code">{ev.get("code","")}</span></td>'
+            f'<td>{ev.get("label") or ev.get("title") or ev.get("value", "")}</td>'
+            f'</tr>'
+        )
+    oa_table = (
+        f'<table class="rej-table">'
+        f'<thead><tr><th>Date</th><th>Code</th><th>Event</th></tr></thead>'
+        f'<tbody>{oa_rows}</tbody>'
+        f'</table>'
+    ) if oa_rows else '<p class="rej-none">No office action events found in page source.</p>'
+
+    # ── Rejection grounds (US only, from HTML patterns) ──
+    grounds_html = ""
+    if summary.get("grounds"):
+        items = "".join(
+            f'<div class="rej-ground">'
+            f'  <div class="rej-ground-title">{g["title"]}</div>'
+            f'  <div class="rej-ground-summary">{g["summary"]}</div>'
+            f'</div>'
+            for g in summary["grounds"]
+        )
+        grounds_html = (
+            f'<div class="rej-grounds-section">'
+            f'  <div class="rej-sub-label">Rejection Grounds (inferred from page text)</div>'
+            f'  {items}'
+            f'</div>'
+        )
+    elif cc == "US":
+        pc_url = summary.get("pc_url", "https://patentcenter.uspto.gov")
+        grounds_html = (
+            f'<p class="rej-grounds-note">'
+            f'  Specific grounds (§101 / §102 / §103 / §112) are in the office action '
+            f'  document. '
+            f'  <a href="{pc_url}" target="_blank">View full prosecution history in USPTO Patent Center ↗</a>'
+            f'</p>'
+        )
+    else:
+        sys_name = summary.get("system_name", "the foreign patent office")
+        sys_url  = summary.get("system_url", "")
+        sys_link = f'<a href="{sys_url}" target="_blank">{sys_name} ↗</a>' if sys_url else sys_name
+        grounds_html = (
+            f'<p class="rej-grounds-note">'
+            f'  Detailed rejection reasons require access to {sys_link}.'
+            f'</p>'
+        )
+
+    # ── Prior art references ──
+    refs_html = ""
+    if summary.get("refs"):
+        ref_rows = ""
+        for r in summary["refs"]:
+            examiner_badge = '<span class="examiner-badge">Examiner</span>' if r.get("examiner") else ""
+            pub_link = (
+                f'<a href="{r["href"]}" target="_blank">{r["pub"]}</a>'
+                if r.get("href") else r["pub"]
+            )
+            ref_rows += (
+                f'<tr>'
+                f'<td>{pub_link} {examiner_badge}</td>'
+                f'<td>{r.get("date","")}</td>'
+                f'<td>{r.get("assignee","")}</td>'
+                f'<td class="ref-title">{r.get("title","")}</td>'
+                f'</tr>'
+            )
+        refs_html = (
+            f'<details class="history rej-refs-details">'
+            f'<summary>Prior Art References <span class="ev-count">{len(summary["refs"])}</span></summary>'
+            f'<table class="hist-table">'
+            f'<thead><tr><th>Publication</th><th>Date</th><th>Assignee</th><th>Title</th></tr></thead>'
+            f'<tbody>{ref_rows}</tbody>'
+            f'</table>'
+            f'</details>'
+        )
+
+    return (
+        f'<div class="rej-summary">'
+        f'  <div class="rej-summary-label">Rejection Summary</div>'
+        f'  {oa_table}'
+        f'  {grounds_html}'
+        f'  {refs_html}'
+        f'</div>'
+    )
+
+
+# ── Maintenance fee calculations ─────────────────────────────────────────────
+
+# USPTO small entity maintenance fees (months-from-grant, label, amount)
+_MAINT_MILESTONES = [
+    (42,  "3.5-year",  800),
+    (90,  "7.5-year",  1_800),
+    (138, "11.5-year", 3_700),
+]
+
+
+def _add_months(d: _date, months: int) -> _date:
+    m = d.month - 1 + months
+    year  = d.year + m // 12
+    month = m % 12 + 1
+    day   = min(d.day, calendar.monthrange(year, month)[1])
+    return _date(year, month, day)
+
+
+def calc_maintenance_fees(grant_date_str: str) -> list[dict]:
+    """Return USPTO small-entity maintenance fee milestones for a grant date."""
+    try:
+        gd = _date.fromisoformat(grant_date_str)
+    except (ValueError, TypeError):
+        return []
+    today = _date.today()
+    rows = []
+    for months, label, amount in _MAINT_MILESTONES:
+        due        = _add_months(gd, months)
+        grace_end  = _add_months(due, 6)
+        days_until = (due - today).days
+        if today > grace_end:
+            status = "paid"          # past grace window; assume paid if patent active
+        elif today > due:
+            status = "grace"         # past due, still in 6-month grace period
+        elif days_until <= 180:
+            status = "due_soon"      # within 6 months
+        else:
+            status = "upcoming"
+        rows.append({
+            "label":     label,
+            "due":       due.isoformat(),
+            "grace_end": grace_end.isoformat(),
+            "amount":    amount,
+            "status":    status,
+        })
+    return rows
+
+
+# ── Annuity schedules ────────────────────────────────────────────────────────
+
+_ANNUITY_SCHEDULES: dict[str, dict] = {
+    "EP": {
+        "currency": "EUR", "symbol": "€", "rate": 1.08,
+        "fees": {
+            3: 520, 4: 620, 5: 760, 6: 980, 7: 1_100, 8: 1_250,
+            9: 1_450, 10: 1_610, 11: 1_840, 12: 2_060, 13: 2_280,
+            14: 2_420, 15: 2_560, 16: 2_660, 17: 2_760, 18: 2_870,
+            19: 2_960, 20: 3_060,
+        },
+        "note": (
+            "EPO official renewal fees. "
+            "After grant, national validation fees also apply per country."
+        ),
+    },
+    "JP": {
+        "currency": "JPY", "symbol": "¥", "rate": 0.0067,
+        "fees": (
+            {yr: 6_600  for yr in range(1,  4)} |
+            {yr: 16_500 for yr in range(4,  7)} |
+            {yr: 33_000 for yr in range(7, 10)} |
+            {yr: 66_000 for yr in range(10, 21)}
+        ),
+        "note": "Japan Patent Office annual fees (approximate official fees only).",
+    },
+    "CN": {
+        "currency": "CNY", "symbol": "¥", "rate": 0.14,
+        "fees": (
+            {yr: 900   for yr in range(1,  4)} |
+            {yr: 1_200 for yr in range(4,  7)} |
+            {yr: 2_000 for yr in range(7, 10)} |
+            {yr: 4_000 for yr in range(10, 16)} |
+            {yr: 6_000 for yr in range(16, 21)}
+        ),
+        "note": "CNIPA official annual fees (approximate official fees only).",
+    },
+}
+
+
+def calc_annuities(filing_date_str: str, cc: str) -> Optional[dict]:
+    """
+    Return remaining annuity data for EP/JP/CN, or a WO expiry stub.
+    Returns None for US or unknown jurisdictions.
+    """
+    if cc == "WO":
+        try:
+            fd = _date.fromisoformat(filing_date_str)
+            return {"wo": True, "expiry": _add_months(fd, 240).isoformat()}
+        except (ValueError, TypeError):
+            return None
+
+    sched = _ANNUITY_SCHEDULES.get(cc)
+    if not sched or not filing_date_str:
+        return None
+    try:
+        fd = _date.fromisoformat(filing_date_str)
+    except (ValueError, TypeError):
+        return None
+
+    today  = _date.today()
+    expiry = _add_months(fd, 240)
+
+    if today >= expiry:
+        return {
+            "cc": cc, "expired": True, "expiry": expiry.isoformat(),
+            "currency": sched["currency"], "symbol": sched["symbol"],
+        }
+
+    current_year = max(1, int((today - fd).days / 365.25) + 1)
+    rows: list[dict] = []
+    total_local = total_usd = 0
+    for yr in range(current_year, 21):
+        fee_local = sched["fees"].get(yr, 0)
+        if not fee_local:
+            continue
+        fee_usd     = round(fee_local * sched["rate"])
+        total_local += fee_local
+        total_usd   += fee_usd
+        rows.append({
+            "year": yr, "fee_local": fee_local,
+            "fee_usd": fee_usd, "is_current": yr == current_year,
+        })
+
+    return {
+        "cc": cc, "expired": False, "wo": False,
+        "expiry": expiry.isoformat(),
+        "currency": sched["currency"], "symbol": sched["symbol"],
+        "rate": sched["rate"], "rows": rows,
+        "total_local": total_local, "total_usd": total_usd,
+        "note": sched["note"],
+    }
+
+
+# ── Portfolio fee schedule ────────────────────────────────────────────────────
+
+def calc_portfolio_schedule(family_details: list) -> list[dict]:
+    """Build a year-by-year fee schedule across the entire patent portfolio."""
+    by_year: dict[int, dict] = {}
+
+    def _ensure(yr: int) -> dict:
+        if yr not in by_year:
+            by_year[yr] = {
+                "events": [], "EUR": 0, "JPY": 0, "CNY": 0,
+                "USD_maint": 0, "total_usd": 0,
+            }
+        return by_year[yr]
+
+    for m in family_details:
+        cc  = country_code(m["pub_num"])
+        idn = (m.get("app_num") or "").strip() or m["pub_num"]
+
+        if cc == "US" and m.get("status") == "granted" and m.get("grant_date"):
+            for fee in calc_maintenance_fees(m["grant_date"]):
+                if fee["status"] == "paid":
+                    continue
+                yr  = int(fee["due"][:4])
+                row = _ensure(yr)
+                row["events"].append({
+                    "id": idn, "pub": m["pub_num"], "cc": "US",
+                    "cur": "USD", "sym": "$",
+                    "local": fee["amount"], "usd": fee["amount"],
+                    "label": fee["label"] + " maint.",
+                })
+                row["USD_maint"] += fee["amount"]
+                row["total_usd"] += fee["amount"]
+
+        elif cc in _ANNUITY_SCHEDULES:
+            filing = m.get("filing_date") or m.get("date") or ""
+            ann    = calc_annuities(filing, cc)
+            if not ann or ann.get("wo") or ann.get("expired"):
+                continue
+            sched = _ANNUITY_SCHEDULES[cc]
+            try:
+                fd = _date.fromisoformat(filing)
+            except (ValueError, TypeError):
+                continue
+            for r in ann.get("rows", []):
+                yr  = _add_months(fd, r["year"] * 12).year
+                row = _ensure(yr)
+                row["events"].append({
+                    "id": idn, "pub": m["pub_num"], "cc": cc,
+                    "cur": sched["currency"], "sym": sched["symbol"],
+                    "local": r["fee_local"], "usd": r["fee_usd"],
+                    "label": f"Yr {r['year']}",
+                })
+                row[sched["currency"]] += r["fee_local"]
+                row["total_usd"]       += r["fee_usd"]
+
+    return [{"year": yr, **by_year[yr]} for yr in sorted(by_year)]
+
+
+def _render_portfolio_summary(schedule: list) -> str:
+    if not schedule:
+        return ""
+
+    grand_usd   = sum(r["total_usd"]  for r in schedule)
+    grand_eur   = sum(r["EUR"]        for r in schedule)
+    grand_jpy   = sum(r["JPY"]        for r in schedule)
+    grand_cny   = sum(r["CNY"]        for r in schedule)
+    grand_maint = sum(r["USD_maint"]  for r in schedule)
+
+    def _fmt(sym: str, val: int) -> str:
+        return f"{sym}{val:,}" if val else "—"
+
+    rows_html = ""
+    for row in schedule:
+        apps: dict[str, list[str]] = {}
+        for ev in row["events"]:
+            apps.setdefault(ev["id"], []).append(f"{ev['label']} ({ev['cc']})")
+        apps_html = " &nbsp;·&nbsp; ".join(
+            f'<span class="ps-app" title="{", ".join(labels)}">{pid}</span>'
+            for pid, labels in apps.items()
+        )
+        rows_html += (
+            f'<tr>'
+            f'<td class="ps-year">{row["year"]}</td>'
+            f'<td class="ps-apps">{apps_html}</td>'
+            f'<td class="ps-cur">{_fmt("€", row["EUR"])}</td>'
+            f'<td class="ps-cur">{_fmt("¥", row["JPY"])}</td>'
+            f'<td class="ps-cur">{_fmt("¥", row["CNY"])}</td>'
+            f'<td class="ps-cur">{_fmt("$", row["USD_maint"])}</td>'
+            f'<td class="ps-total">~${row["total_usd"]:,}</td>'
+            f'</tr>'
+        )
+    rows_html += (
+        f'<tr class="ps-grand-row">'
+        f'<td colspan="2"><strong>Grand Total</strong></td>'
+        f'<td class="ps-cur">{_fmt("€", grand_eur)}</td>'
+        f'<td class="ps-cur">{_fmt("¥", grand_jpy)}</td>'
+        f'<td class="ps-cur">{_fmt("¥", grand_cny)}</td>'
+        f'<td class="ps-cur">{_fmt("$", grand_maint)}</td>'
+        f'<td class="ps-total"><strong>~${grand_usd:,}</strong></td>'
+        f'</tr>'
+    )
+
+    return (
+        f'<section class="info-section ps-section">'
+        f'  <h2 class="section-h">Portfolio Fee Schedule</h2>'
+        f'  <p class="ps-disclaimer">'
+        f'    &#9888;&nbsp; Official fees only &mdash; does not include professional fees. '
+        f'    USD equivalents are approximate'
+        f'    (EUR&times;1.08 &nbsp;|&nbsp; JPY&times;0.0067 &nbsp;|&nbsp; CNY&times;0.14).'
+        f'  </p>'
+        f'  <div class="ps-scroll">'
+        f'  <table class="ps-table">'
+        f'  <thead><tr>'
+        f'    <th>Year</th><th>Applications</th>'
+        f'    <th>EUR (EPO)</th><th>JPY (JP)</th><th>CNY (CN)</th>'
+        f'    <th>USD (US&nbsp;maint.)</th><th>~USD Total</th>'
+        f'  </tr></thead>'
+        f'  <tbody>{rows_html}</tbody>'
+        f'  </table></div>'
+        f'</section>'
+    )
+
+
+# ── Dashboard HTML rendering ──────────────────────────────────────────────────
+
+def _status_badge(status: str) -> str:
+    s = STATUS_META.get(status, STATUS_META["unknown"])
+    return (
+        f'<span class="status-badge" '
+        f'style="background:{s["bg"]};color:{s["fg"]};'
+        f'border:1.5px solid {s["border"]}">'
+        f'{s["label"]}</span>'
+    )
+
+
+def _render_card(m: dict) -> str:
+    code   = country_code(m["pub_num"])
+    status = m.get("status", "unknown")
+    border = STATUS_META.get(status, STATUS_META["unknown"])["border"]
+    href    = m.get("href", "")
+    app_num = m.get("app_num", "").strip()
+    display = app_num if app_num else m["pub_num"]
+    pnum    = (
+        f'<a href="{href}" target="_blank">{display}</a>'
+        if href else display
+    )
+    title = (m.get("member_title") or m.get("title") or "").strip()
+    filing = m.get("filing_date") or m.get("date") or "—"
+    grant  = m.get("grant_date", "")
+
+    # Dates row — label second date as "Granted" only when actually granted
+    date_items = f'<span>Filed: <b>{filing}</b></span>'
+    if grant:
+        second_label = "Granted" if status == "granted" else "Published"
+        date_items += f'<span>{second_label}: <b>{grant}</b></span>'
+
+    # Maintenance fees (granted patents only)
+    maint_html = ""
+    if status == "granted" and grant:
+        fees = calc_maintenance_fees(grant)
+        if fees:
+            _status_styles = {
+                "paid":     ("✓ Paid",        "#6b7280", "#f3f4f6"),
+                "grace":    ("⚠ Grace Period", "#92400e", "#fef3c7"),
+                "due_soon": ("⚠ Due Soon",     "#92400e", "#fef3c7"),
+                "upcoming": ("Upcoming",        "#1e40af", "#dbeafe"),
+            }
+            fee_rows = ""
+            for f in fees:
+                lbl, fg, bg = _status_styles.get(f["status"], ("—", "#6b7280", "#f9fafb"))
+                fee_rows += (
+                    f'<tr>'
+                    f'<td>{f["label"]}</td>'
+                    f'<td>{f["due"]}</td>'
+                    f'<td>${f["amount"]:,}</td>'
+                    f'<td><span class="mf-status" style="color:{fg};background:{bg}">{lbl}</span></td>'
+                    f'</tr>'
+                )
+            maint_html = (
+                f'<details class="history maint-fees">'
+                f'<summary>Maintenance fees <span class="ev-count">Small Entity</span></summary>'
+                f'<table class="hist-table">'
+                f'<thead><tr><th>Window</th><th>Due</th><th>Fee</th><th>Status</th></tr></thead>'
+                f'<tbody>{fee_rows}</tbody>'
+                f'</table>'
+                f'</details>'
+            )
+
+    # Expiry date + annuity schedule (non-US foreign patents)
+    annuity_html = ""
+    filing_raw = m.get("filing_date") or m.get("date") or ""
+    if code == "WO" and filing_raw:
+        ann = calc_annuities(filing_raw, "WO")
+        if ann:
+            annuity_html = (
+                f'<div class="ann-expiry">Expires (est.): <b>{ann["expiry"]}</b></div>'
+                f'<div class="wo-note">PCT/WO: No annuities at WO stage &mdash; '
+                f'fees are paid during national phase entry per country.</div>'
+            )
+    elif code in _ANNUITY_SCHEDULES and filing_raw:
+        ann = calc_annuities(filing_raw, code)
+        if ann and ann.get("expired"):
+            annuity_html = f'<div class="ann-expiry">Expired: <b>{ann["expiry"]}</b></div>'
+        elif ann and not ann.get("expired"):
+            sym = ann["symbol"]
+            cur = ann["currency"]
+            fee_rows = ""
+            for r in ann["rows"]:
+                cls = ' class="ann-cur-row"' if r["is_current"] else ""
+                fee_rows += (
+                    f'<tr{cls}>'
+                    f'<td>Yr {r["year"]}</td>'
+                    f'<td>{sym}{r["fee_local"]:,}</td>'
+                    f'<td>(~${r["fee_usd"]:,})</td>'
+                    f'</tr>'
+                )
+            annuity_html = (
+                f'<div class="ann-expiry">Expires (est.): <b>{ann["expiry"]}</b></div>'
+                f'<details class="history">'
+                f'<summary>Annual renewal fees '
+                f'<span class="ev-count">{cur} &nbsp;·&nbsp; ~${ann["total_usd"]:,} remaining</span>'
+                f'</summary>'
+                f'<table class="hist-table">'
+                f'<thead><tr><th>Year</th><th>Fee</th><th>USD equiv.</th></tr></thead>'
+                f'<tbody>{fee_rows}</tbody>'
+                f'<tfoot><tr><td colspan="2"><strong>Remaining total</strong></td>'
+                f'<td><strong>~${ann["total_usd"]:,}</strong></td></tr></tfoot>'
+                f'</table>'
+                f'<p class="ann-note">&#9888; {ann["note"]} Does not include professional fees.</p>'
+                f'</details>'
+            )
+
+    # Latest prosecution event
+    events = m.get("events", [])
+    latest_html = ""
+    if events:
+        ev = events[-1]
+        ev_title = ev.get("title") or ev.get("code") or ""
+        latest_html = (
+            f'<div class="latest-event">'
+            f'<span class="ev-chip">Latest</span>'
+            f'<span class="ev-date">{ev.get("date","")}</span>'
+            f'<span class="ev-title">{ev_title}</span>'
+            f'</div>'
+        )
+
+    # Rejection reasons (pills) + full rejection summary section
+    rejections = m.get("rejections", [])
+    rej_html = ""
+    if rejections:
+        pills = "".join(f'<span class="rej-pill">{r}</span>' for r in rejections)
+        rej_html = f'<div class="rejections"><div class="rej-label">Rejections</div>{pills}</div>'
+
+    rej_summary_html = ""
+    rej_summary = extract_rejection_summary(m)
+    if rej_summary:
+        rej_summary_html = _render_rejection_summary(rej_summary)
+
+    # Fetch error notice
+    err_html = ""
+    if m.get("fetch_error"):
+        err_html = (
+            f'<div class="fetch-error">'
+            f'Could not fetch details: {m["fetch_error"]}'
+            f'</div>'
+        )
+
+    # Collapsible prosecution history
+    if events:
+        rows = "".join(
+            f'<tr>'
+            f'<td>{e.get("date","")}</td>'
+            f'<td><code>{e.get("code","")}</code></td>'
+            f'<td>{e.get("title","")}</td>'
+            f'</tr>'
+            for e in events
+        )
+        history_html = (
+            f'<details class="history">'
+            f'<summary>Prosecution history <span class="ev-count">{len(events)} events</span></summary>'
+            f'<table class="hist-table">'
+            f'<thead><tr><th>Date</th><th>Code</th><th>Event</th></tr></thead>'
+            f'<tbody>{rows}</tbody>'
+            f'</table>'
+            f'</details>'
+        )
+    else:
+        history_html = (
+            '<details class="history">'
+            '<summary>Prosecution history</summary>'
+            '<p class="no-hist">No events found in page source. '
+            'Check USPTO PAIR / EPO Register / J-PlatPat for full history.</p>'
+            '</details>'
+        )
+
+    return (
+        f'<div class="card" style="border-top:4px solid {border}">'
+        f'  <div class="card-head">'
+        f'    <span class="card-pnum">{pnum}</span>'
+        f'    {_status_badge(status)}'
+        f'  </div>'
+        + (f'  <div class="card-title">{title}</div>' if title else '')
+        + f'  <div class="card-dates">{date_items}</div>'
+        + maint_html + annuity_html + latest_html + rej_html + rej_summary_html + err_html + history_html
+        + '</div>'
+    )
+
+
+def generate_dashboard_html(
+    main_metas: dict, family_details: list, url: str, patent_input: str,
+    claims: list | None = None,
+) -> str:
+    number   = _first(main_metas.get("citation_patent_number", [])) or "N/A"
+    title    = (_first(main_metas.get("DC.title", [])) or "").strip()
+    abstract = (_first(main_metas.get("DC.description", [])) or "").strip()
+    relations = main_metas.get("DC.relation", [])
+    dates       = main_metas.get("DC.date", [])
+    filing_date = dates[0] if dates else "N/A"
+    grant_date  = dates[1] if len(dates) > 1 else "N/A"
+
+    contributors = main_metas.get("DC.contributor", [])
+    assignees = [
+        c.strip() for c in contributors
+        if len(c.strip().split()) >= 3
+        or any(kw in c for kw in ("LLC", "Inc", "Corp", "Ltd", "Company", "Institute", "University"))
+    ]
+
+    # Group by country, sorted by preference
+    by_country: dict[str, list] = {}
+    for m in family_details:
+        by_country.setdefault(country_code(m["pub_num"]), []).append(m)
+
+    sorted_codes = sorted(
+        by_country.keys(),
+        key=lambda c: (_PREFERRED_COUNTRIES.index(c) if c in _PREFERRED_COUNTRIES else 99, c)
+    )
+
+    # Portfolio fee schedule
+    portfolio_html = _render_portfolio_summary(calc_portfolio_schedule(family_details))
+
+    # Summary counts
+    granted = sum(1 for m in family_details if m["status"] == "granted")
+    pending = sum(1 for m in family_details if m["status"] == "pending")
+    other   = len(family_details) - granted - pending
+
+    # Country sections
+    country_html = ""
+    for code in sorted_codes:
+        members = sorted(by_country[code], key=lambda m: m.get("date") or "")
+        flag  = COUNTRY_FLAGS.get(code, "")
+        cname = COUNTRY_NAMES.get(code, code)
+        cards = "".join(_render_card(m) for m in members)
+        country_html += (
+            f'<section class="country-section">'
+            f'  <h2 class="country-h">{flag} {cname}'
+            f'    <span class="country-count">{len(members)}</span>'
+            f'  </h2>'
+            f'  <div class="cards-grid">{cards}</div>'
+            f'</section>'
+        )
+
+    # Granted US Claims section (replaces abstract)
+    indep_claims = [c for c in (claims or []) if c["independent"]]
+    if indep_claims:
+        def _render_claim(c: dict) -> str:
+            return (
+                f'<div class="claim-block">'
+                f'<span class="claim-num">Claim {c["num"]}</span>'
+                f'<p class="claim-body">{c["text"]}</p>'
+                f'</div>'
+            )
+        shown   = indep_claims[:3]
+        hidden  = indep_claims[3:]
+        shown_html = "".join(_render_claim(c) for c in shown)
+        more_html  = ""
+        if hidden:
+            more_html = (
+                f'<details class="claims-more">'
+                f'<summary>Show {len(hidden)} more independent claim{"s" if len(hidden) != 1 else ""}</summary>'
+                + "".join(_render_claim(c) for c in hidden)
+                + '</details>'
+            )
+        claims_html = (
+            f'<section class="info-section">'
+            f'  <h2 class="section-h">Granted US Claims '
+            f'<span class="cnt-badge">{len(indep_claims)} independent</span></h2>'
+            + shown_html + more_html
+            + '</section>'
+        )
+    else:
+        claims_html = ""
+
+    prior_rows = "".join(
+        '<tr><td><a href="https://patents.google.com/patent/{}/en" target="_blank">{}</a></td></tr>'.format(
+            r.replace(":", ""), r
+        )
+        for r in relations
+    )
+    prior_html = (
+        f'<section class="info-section">'
+        f'  <h2 class="section-h">Cited Prior Art <span class="cnt-badge">{len(relations)}</span></h2>'
+        f'  <table class="prior-table"><tbody>{prior_rows}</tbody></table>'
+        f'</section>'
+    ) if relations else ""
+
+    assignee_str = "; ".join(assignees) if assignees else "N/A"
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Patent Dashboard — {number}</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #eef0f4; color: #111827; line-height: 1.55; padding: 1.5rem;
+    }}
+    a {{ color: #2563eb; text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+
+    /* ── Hero header ── */
+    .hero {{
+      background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 60%, #1d4ed8 100%);
+      color: #fff; border-radius: 14px; padding: 2rem 2.5rem; margin-bottom: 1.25rem;
+    }}
+    .hero-eyebrow {{
+      font-size: .75rem; font-weight: 600; letter-spacing: .1em;
+      text-transform: uppercase; opacity: .6; margin-bottom: .4rem;
+    }}
+    .hero-title {{ font-size: 1.45rem; font-weight: 700; line-height: 1.3; }}
+    .hero-sub {{
+      margin-top: .9rem; display: flex; gap: 1rem; flex-wrap: wrap; font-size: .85rem;
+    }}
+    .hero-chip {{
+      background: rgba(255,255,255,.12); border-radius: 6px;
+      padding: .2rem .75rem; white-space: nowrap;
+    }}
+
+    /* ── Stats bar ── */
+    .stats-bar {{
+      display: flex; gap: .75rem; flex-wrap: wrap; margin-bottom: 1.25rem;
+    }}
+    .stat-card {{
+      background: #fff; border-radius: 10px; padding: .85rem 1.25rem;
+      box-shadow: 0 1px 3px rgba(0,0,0,.07); flex: 1; min-width: 130px;
+    }}
+    .stat-label {{ font-size: .7rem; font-weight: 600; text-transform: uppercase;
+                   letter-spacing: .08em; color: #6b7280; }}
+    .stat-value {{ font-size: 1.6rem; font-weight: 700; color: #111827; margin-top: .15rem; }}
+
+    /* ── Info sections (abstract / prior art) ── */
+    .info-section {{
+      background: #fff; border-radius: 12px; padding: 1.25rem 1.75rem;
+      margin-bottom: 1.25rem; box-shadow: 0 1px 3px rgba(0,0,0,.06);
+    }}
+    .section-h {{
+      font-size: .8rem; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .09em; color: #1e40af; margin-bottom: .85rem;
+      display: flex; align-items: center; gap: .5rem;
+    }}
+    .cnt-badge {{
+      background: #dbeafe; color: #1e40af; border-radius: 20px;
+      padding: .05rem .55rem; font-size: .75rem; font-weight: 700;
+    }}
+    .abstract {{
+      background: #f8fafc; border-left: 3px solid #2563eb;
+      border-radius: 0 8px 8px 0; padding: .9rem 1.1rem;
+      font-size: .92rem; color: #374151; line-height: 1.7;
+    }}
+    .prior-table {{ width: 100%; border-collapse: collapse; font-size: .88rem; }}
+    .prior-table td {{ padding: .35rem .5rem; border-bottom: 1px solid #f0f0f0; }}
+    .prior-table tr:last-child td {{ border-bottom: none; }}
+
+    /* ── Country sections ── */
+    .country-section {{ margin-bottom: 2rem; }}
+    .country-h {{
+      font-size: 1rem; font-weight: 700; color: #0f172a;
+      margin-bottom: .75rem; display: flex; align-items: center; gap: .5rem;
+    }}
+    .country-count {{
+      background: #e0e7ff; color: #3730a3; border-radius: 20px;
+      padding: .05rem .55rem; font-size: .75rem; font-weight: 700;
+    }}
+
+    /* ── Cards grid ── */
+    .cards-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 1rem;
+    }}
+    .card {{
+      background: #fff; border-radius: 10px;
+      box-shadow: 0 1px 4px rgba(0,0,0,.07);
+      padding: 1.1rem 1.25rem; display: flex; flex-direction: column; gap: .6rem;
+    }}
+    .card-head {{
+      display: flex; justify-content: space-between; align-items: flex-start;
+    }}
+    .card-pnum {{ font-size: 1rem; font-weight: 700; }}
+    .status-badge {{
+      font-size: .7rem; font-weight: 700; border-radius: 20px;
+      padding: .2rem .65rem; white-space: nowrap; flex-shrink: 0;
+    }}
+    .card-title {{ font-size: .85rem; color: #374151; line-height: 1.4; }}
+    .card-dates {{
+      display: flex; gap: 1rem; flex-wrap: wrap;
+      font-size: .8rem; color: #6b7280;
+    }}
+    .card-dates b {{ color: #111827; }}
+
+    /* ── Latest event ── */
+    .latest-event {{
+      display: flex; align-items: baseline; gap: .4rem;
+      font-size: .8rem; flex-wrap: wrap;
+    }}
+    .ev-chip {{
+      background: #f0f9ff; color: #0369a1; border: 1px solid #bae6fd;
+      border-radius: 4px; padding: .05rem .4rem; font-size: .68rem; font-weight: 700;
+      white-space: nowrap;
+    }}
+    .ev-date {{ color: #6b7280; white-space: nowrap; }}
+    .ev-title {{ color: #111827; }}
+
+    /* ── Rejections ── */
+    .rejections {{ font-size: .8rem; }}
+    .rej-label {{
+      font-size: .68rem; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .07em; color: #991b1b; margin-bottom: .3rem;
+    }}
+    .rej-pill {{
+      display: inline-block; background: #fee2e2; color: #991b1b;
+      border-radius: 4px; padding: .15rem .5rem;
+      margin: .15rem .2rem .15rem 0; font-size: .75rem;
+    }}
+
+    /* ── Prosecution history ── */
+    .history {{
+      margin-top: .2rem; border-top: 1px solid #f3f4f6; padding-top: .6rem;
+    }}
+    .history summary {{
+      cursor: pointer; font-size: .8rem; font-weight: 600; color: #4b5563;
+      user-select: none; list-style: none; display: flex; align-items: center; gap: .4rem;
+    }}
+    .history summary::-webkit-details-marker {{ display: none; }}
+    .history summary::before {{
+      content: "▶"; font-size: .6rem; transition: transform .15s;
+      display: inline-block;
+    }}
+    details[open] > summary::before {{ transform: rotate(90deg); }}
+    .ev-count {{
+      background: #f3f4f6; color: #6b7280; border-radius: 20px;
+      padding: .05rem .45rem; font-size: .7rem; font-weight: 600;
+    }}
+    .hist-table {{
+      width: 100%; border-collapse: collapse; font-size: .78rem;
+      margin-top: .6rem;
+    }}
+    .hist-table th {{
+      background: #f8f9fa; text-align: left; padding: .35rem .5rem;
+      font-size: .7rem; text-transform: uppercase; letter-spacing: .05em;
+      color: #6b7280; border-bottom: 1px solid #e5e7eb;
+    }}
+    .hist-table td {{ padding: .35rem .5rem; border-bottom: 1px solid #f3f4f6; vertical-align: top; }}
+    .hist-table tr:last-child td {{ border-bottom: none; }}
+    .hist-table tr:hover td {{ background: #fafbff; }}
+    .hist-table code {{
+      background: #f1f5f9; border-radius: 3px; padding: .05rem .3rem;
+      font-size: .75rem; color: #0f172a;
+    }}
+    .no-hist {{ font-size: .8rem; color: #9ca3af; padding: .5rem 0; }}
+    .mf-status {{
+      font-size: .7rem; font-weight: 700; border-radius: 4px;
+      padding: .15rem .45rem; white-space: nowrap;
+    }}
+    .ann-expiry {{ font-size: .82rem; color: #374151; }}
+    .ann-expiry b {{ color: #111827; }}
+    .wo-note {{ font-size: .74rem; color: #6b7280; font-style: italic; margin-top: .1rem; }}
+    .ann-cur-row td {{ background: #fefce8 !important; font-weight: 600; }}
+    .hist-table tfoot td {{
+      border-top: 2px solid #e5e7eb; font-weight: 600;
+      background: #f8f9fa; padding: .35rem .5rem;
+    }}
+    .ann-note {{ font-size: .72rem; color: #9ca3af; padding: .4rem 0 0; font-style: italic; }}
+    .ps-section {{ }}
+    .ps-disclaimer {{
+      font-size: .78rem; color: #92400e; background: #fef3c7;
+      border-radius: 6px; padding: .5rem .75rem; margin-bottom: .85rem;
+    }}
+    .ps-scroll {{ overflow-x: auto; }}
+    .ps-table {{
+      width: 100%; border-collapse: collapse; font-size: .82rem; min-width: 680px;
+    }}
+    .ps-table th {{
+      background: #f8f9fa; text-align: left; padding: .4rem .6rem;
+      font-size: .72rem; text-transform: uppercase; letter-spacing: .05em;
+      color: #6b7280; border-bottom: 2px solid #e5e7eb; white-space: nowrap;
+    }}
+    .ps-table td {{ padding: .4rem .6rem; border-bottom: 1px solid #f3f4f6; vertical-align: top; }}
+    .ps-table tr:hover td {{ background: #fafbff; }}
+    .ps-year {{ font-weight: 700; white-space: nowrap; color: #0f172a; }}
+    .ps-apps {{ font-size: .8rem; line-height: 1.8; }}
+    .ps-app {{
+      display: inline-block; background: #e0e7ff; color: #3730a3;
+      border-radius: 4px; padding: .1rem .4rem; margin: .1rem .15rem .1rem 0;
+      font-size: .73rem; white-space: nowrap; cursor: default;
+    }}
+    .ps-cur {{ text-align: right; white-space: nowrap; color: #374151; font-size: .8rem; }}
+    .ps-total {{ text-align: right; white-space: nowrap; font-weight: 600; color: #0f172a; }}
+    .ps-grand-row td {{
+      background: #f8f9fa; border-top: 2px solid #e5e7eb; font-size: .85rem;
+    }}
+    .rej-summary {{
+      border: 1.5px solid #fca5a5; border-radius: 8px;
+      padding: .75rem 1rem; background: #fff5f5; margin-top: .2rem;
+    }}
+    .rej-summary-label {{
+      font-size: .7rem; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .08em; color: #991b1b; margin-bottom: .5rem;
+    }}
+    .rej-table {{ width: 100%; border-collapse: collapse; font-size: .78rem; margin-bottom: .5rem; }}
+    .rej-table th {{
+      background: #fee2e2; text-align: left; padding: .3rem .45rem;
+      font-size: .68rem; text-transform: uppercase; letter-spacing: .05em;
+      color: #991b1b; border-bottom: 1px solid #fca5a5;
+    }}
+    .rej-table td {{ padding: .3rem .45rem; border-bottom: 1px solid #fef2f2; vertical-align: top; }}
+    .rej-table tr:last-child td {{ border-bottom: none; }}
+    .rej-date {{ white-space: nowrap; color: #6b7280; }}
+    .rej-code {{
+      background: #fee2e2; color: #991b1b; border-radius: 3px;
+      padding: .05rem .3rem; font-size: .7rem; font-family: monospace;
+    }}
+    .rej-none {{ font-size: .78rem; color: #9ca3af; font-style: italic; }}
+    .rej-grounds-section {{ margin: .5rem 0; }}
+    .rej-sub-label {{
+      font-size: .68rem; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .06em; color: #374151; margin-bottom: .35rem;
+    }}
+    .rej-ground {{ margin-bottom: .45rem; padding-bottom: .45rem; border-bottom: 1px solid #fef2f2; }}
+    .rej-ground:last-child {{ border-bottom: none; margin-bottom: 0; }}
+    .rej-ground-title {{ font-size: .78rem; font-weight: 700; color: #7f1d1d; }}
+    .rej-ground-summary {{ font-size: .75rem; color: #374151; line-height: 1.5; margin-top: .1rem; }}
+    .rej-grounds-note {{
+      font-size: .75rem; color: #6b7280; font-style: italic; margin: .4rem 0;
+    }}
+    .rej-refs-details {{ margin-top: .4rem; }}
+    .ref-title {{ max-width: 180px; font-size: .75rem; color: #374151; }}
+    .examiner-badge {{
+      background: #fef3c7; color: #92400e; border-radius: 3px;
+      padding: .05rem .3rem; font-size: .65rem; font-weight: 700; margin-left: .2rem;
+    }}
+    .fetch-error {{ font-size: .75rem; color: #b45309; background: #fef3c7;
+                    border-radius: 4px; padding: .3rem .6rem; }}
+
+    .claim-block {{ margin-bottom: .9rem; padding-bottom: .9rem; border-bottom: 1px solid #f3f4f6; }}
+    .claim-block:last-child {{ border-bottom: none; margin-bottom: 0; }}
+    .claim-num {{
+      display: inline-block; background: #e0e7ff; color: #3730a3;
+      border-radius: 4px; padding: .1rem .5rem; font-size: .72rem;
+      font-weight: 700; margin-bottom: .35rem;
+    }}
+    .claim-body {{ font-size: .88rem; color: #374151; line-height: 1.65; }}
+    .claims-more summary {{
+      cursor: pointer; font-size: .82rem; font-weight: 600; color: #2563eb;
+      user-select: none; list-style: none; padding: .4rem 0;
+    }}
+    .claims-more summary::-webkit-details-marker {{ display: none; }}
+    .claims-more[open] summary {{ margin-bottom: .6rem; }}
+    footer {{ text-align: center; font-size: .75rem; color: #9ca3af; margin-top: 2rem; }}
+  </style>
+</head>
+<body>
+
+  <div class="hero">
+    <div class="hero-eyebrow">Patent Family Dashboard</div>
+    <div class="hero-title">{title or number}</div>
+    <div class="hero-sub">
+      <span class="hero-chip">&#128196; {number}</span>
+      <span class="hero-chip">&#128197; Filed {filing_date}</span>
+      <span class="hero-chip">&#9989; Granted {grant_date}</span>
+      {'<span class="hero-chip">&#127970; ' + assignee_str + '</span>' if assignees else ''}
+      <span class="hero-chip"><a href="{url}" target="_blank" style="color:#93c5fd">Google Patents &#8599;</a></span>
+    </div>
+  </div>
+
+  <div class="stats-bar">
+    <div class="stat-card">
+      <div class="stat-label">Family Size</div>
+      <div class="stat-value">{len(family_details)}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Jurisdictions</div>
+      <div class="stat-value">{len(by_country)}</div>
+    </div>
+    <div class="stat-card" style="border-top:3px solid #34d399">
+      <div class="stat-label">Granted</div>
+      <div class="stat-value" style="color:#065f46">{granted}</div>
+    </div>
+    <div class="stat-card" style="border-top:3px solid #60a5fa">
+      <div class="stat-label">Pending</div>
+      <div class="stat-value" style="color:#1e40af">{pending}</div>
+    </div>
+    <div class="stat-card" style="border-top:3px solid #d1d5db">
+      <div class="stat-label">Other</div>
+      <div class="stat-value" style="color:#374151">{other}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Prior Art Citations</div>
+      <div class="stat-value">{len(relations)}</div>
+    </div>
+  </div>
+
+  {portfolio_html}
+
+  {claims_html}
+
+  {country_html}
+
+  {prior_html}
+
+  <footer>Generated by patent-research-tool &mdash; {patent_input}</footer>
+</body>
+</html>"""
+
+
+def save_dashboard(html: str, number: str) -> str:
+    safe = re.sub(r"[^A-Z0-9]", "", number.upper()) or "patent"
+    out_dir = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(out_dir, f"patent_dashboard_{safe}.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return path
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python tracker.py <patent_number>")
+        print("  e.g. python tracker.py 'US 12,178,560'")
+        sys.exit(1)
+
+    patent_input = " ".join(sys.argv[1:])
+    url = build_url(patent_input)
+
+    print(f"\nLooking up: {patent_input}")
+    print(f"URL: {url}")
+    print("Fetching … ", end="", flush=True)
+
+    try:
+        html = fetch_page(url)
+    except requests.HTTPError as e:
+        if e.response.status_code == 404:
+            # Try B1 kind code
+            alt_url = url.replace("B2/en", "B1/en")
+            print(f"not found (B2). Trying B1 …", end="", flush=True)
+            try:
+                html = fetch_page(alt_url)
+                url = alt_url
+            except requests.HTTPError:
+                print("not found.")
+                print(f"\n  Patent '{patent_input}' not found on Google Patents.")
+                sys.exit(1)
+        else:
+            raise
+
+    print("done.")
+
+    metas  = get_metas(html)
+    family = parse_family(html)
+    claims = parse_claims(html)
+
+    if not metas.get("citation_patent_number"):
+        print(f"\n  No patent data found for '{patent_input}'.")
+        print(f"  Check manually: {url}")
+        sys.exit(1)
+
+    display(metas, family, url)
+
+    html_simple = generate_html(metas, family, url, patent_input)
+    simple_path = save_and_open_html(html_simple, metas.get("citation_patent_number", [patent_input])[0])
+    print(f"  Summary HTML : {simple_path}")
+
+    # ── Prosecution dashboard ──
+    number = metas.get("citation_patent_number", [patent_input])[0]
+    total  = len(family)
+    print(f"\nFetching prosecution data for {total} family members …")
+    family_details = [
+        fetch_member_details(m, i + 1, total)
+        for i, m in enumerate(family)
+    ]
+
+    dash_html = generate_dashboard_html(metas, family_details, url, patent_input, claims)
+    dash_path = save_dashboard(dash_html, number)
+    print(f"\n  Dashboard HTML: {dash_path}")
+    webbrowser.open(f"file://{dash_path}")
+
+
+if __name__ == "__main__":
+    main()
