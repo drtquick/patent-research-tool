@@ -13,6 +13,7 @@ Usage:
 import sys
 import re
 import os
+import base64
 import json as _json
 import time as _time
 import calendar
@@ -878,6 +879,316 @@ def _render_rejection_summary(summary: dict) -> str:
     )
 
 
+# ── EPO OPS Integration ───────────────────────────────────────────────────────
+
+def _load_dotenv() -> None:
+    """Load .env file from script directory into os.environ (no external deps)."""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip())
+
+
+def patent_to_docdb(patent_id: str) -> Optional[str]:
+    """
+    Convert a raw patent ID to EPO OPS docdb format CC.NNNNNNNN.KK.
+    e.g. 'US 12,178,560 B2' → 'US.12178560.B2'
+         'US12178560'       → 'US.12178560.B2'  (assumes B2)
+    """
+    clean = normalize(patent_id)
+    m = re.match(r'^([A-Z]{2})(\d+)([A-Z]\d?)$', clean)
+    if m:
+        return f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
+    m = re.match(r'^([A-Z]{2})(\d+)$', clean)
+    if m:
+        default_kind = "B2" if m.group(1) == "US" else "B1"
+        return f"{m.group(1)}.{m.group(2)}.{default_kind}"
+    return None
+
+
+def epo_get_token(consumer_key: str, consumer_secret: str) -> Optional[str]:
+    """Obtain an OAuth2 access token from EPO OPS."""
+    creds = base64.b64encode(f"{consumer_key}:{consumer_secret}".encode()).decode()
+    try:
+        resp = requests.post(
+            "https://ops.epo.org/3.2/auth/accesstoken",
+            headers={
+                "Authorization": f"Basic {creds}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data={"grant_type": "client_credentials"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json().get("access_token")
+    except Exception as exc:
+        print(f"  EPO auth error: {exc}")
+        return None
+
+
+def _fmt_epo_date(d: str) -> str:
+    """Convert YYYYMMDD → YYYY-MM-DD; pass through anything else."""
+    d = (d or "").strip()
+    if len(d) == 8 and d.isdigit():
+        return f"{d[:4]}-{d[4:6]}-{d[6:]}"
+    return d
+
+
+def fetch_epo_family(docdb: str, token: str) -> Optional[str]:
+    """GET the INPADOC family XML from EPO OPS for a docdb publication number."""
+    url = f"https://ops.epo.org/3.2/rest-services/family/publication/docdb/{docdb}"
+    try:
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/xml"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        return resp.text
+    except requests.HTTPError as exc:
+        print(f"  EPO family HTTP {exc.response.status_code}")
+        return None
+    except Exception as exc:
+        print(f"  EPO family error: {exc}")
+        return None
+
+
+def parse_epo_family(xml: str) -> list[dict]:
+    """
+    Parse EPO OPS INPADOC family XML.
+    Returns list of dicts: country, pub_num, app_num, pub_date, app_date, kind.
+    """
+    members: list[dict] = []
+    for member_xml in re.findall(
+        r'<ops:family-member[^>]*>(.*?)</ops:family-member>', xml, re.DOTALL
+    ):
+        # ── Publication references ──
+        pub_docs: list[dict] = []
+        for pub_ref in re.findall(
+            r'<publication-reference[^>]*>(.*?)</publication-reference>',
+            member_xml, re.DOTALL,
+        ):
+            for doc_id in re.findall(
+                r'<document-id[^>]*>(.*?)</document-id>', pub_ref, re.DOTALL
+            ):
+                cc  = _first(re.findall(r'<country>\s*([^<]+?)\s*</country>', doc_id))
+                num = _first(re.findall(r'<doc-number>\s*([^<]+?)\s*</doc-number>', doc_id))
+                knd = _first(re.findall(r'<kind>\s*([^<]+?)\s*</kind>', doc_id))
+                dt  = _first(re.findall(r'<date>\s*([^<]+?)\s*</date>', doc_id))
+                if cc and num:
+                    pub_docs.append({"cc": cc, "num": num.strip(), "kind": knd or "", "date": dt or ""})
+
+        # ── Application references ──
+        app_docs: list[dict] = []
+        for app_ref in re.findall(
+            r'<application-reference[^>]*>(.*?)</application-reference>',
+            member_xml, re.DOTALL,
+        ):
+            for doc_id in re.findall(
+                r'<document-id[^>]*>(.*?)</document-id>', app_ref, re.DOTALL
+            ):
+                cc  = _first(re.findall(r'<country>\s*([^<]+?)\s*</country>', doc_id))
+                num = _first(re.findall(r'<doc-number>\s*([^<]+?)\s*</doc-number>', doc_id))
+                dt  = _first(re.findall(r'<date>\s*([^<]+?)\s*</date>', doc_id))
+                if cc and num:
+                    app_docs.append({"cc": cc, "num": num.strip(), "date": dt or ""})
+
+        if not pub_docs:
+            continue
+
+        pub = pub_docs[0]
+        app = app_docs[0] if app_docs else {}
+        pub_num = f"{pub['cc']}{pub['num']}{pub['kind']}" if pub['kind'] else f"{pub['cc']}{pub['num']}"
+        app_num = f"{app.get('cc','')}{app.get('num','')}" if app else ""
+
+        members.append({
+            "country":  pub["cc"],
+            "pub_num":  pub_num,
+            "app_num":  app_num,
+            "pub_date": _fmt_epo_date(pub["date"]),
+            "app_date": _fmt_epo_date(app.get("date", "")),
+            "kind":     pub["kind"],
+        })
+    return members
+
+
+def merge_epo_with_google(
+    google_details: list[dict], epo_members: list[dict]
+) -> tuple[list[dict], list[dict]]:
+    """
+    Compare EPO INPADOC family with Google Patents family members.
+    Returns:
+        epo_only      — EPO members whose country is absent from Google data
+        discrepancies — same country in both sources with differing pub numbers
+    """
+    google_countries  = {country_code(m["pub_num"]) for m in google_details}
+    google_pub_norms  = {normalize(m["pub_num"]) for m in google_details}
+    epo_only:      list[dict] = []
+    discrepancies: list[dict] = []
+    seen_epo_countries: set[str] = set()
+
+    for em in epo_members:
+        cc       = em["country"]
+        norm_pub = normalize(em["pub_num"])
+        if cc in seen_epo_countries:
+            continue
+        if cc not in google_countries:
+            epo_only.append(em)
+        elif norm_pub not in google_pub_norms:
+            for gm in google_details:
+                if country_code(gm["pub_num"]) == cc and normalize(gm["pub_num"]) != norm_pub:
+                    discrepancies.append({
+                        "country":    cc,
+                        "epo_pub":    em["pub_num"],
+                        "epo_app":    em["app_num"],
+                        "google_pub": gm["pub_num"],
+                        "google_app": gm.get("app_num", ""),
+                        "note": (
+                            f"{COUNTRY_NAMES.get(cc, cc)}: EPO lists {em['pub_num']} "
+                            f"but Google Patents shows {gm['pub_num']}"
+                        ),
+                    })
+        seen_epo_countries.add(cc)
+
+    return epo_only, discrepancies
+
+
+def _epo_member_status(kind: str) -> str:
+    """Infer patent status from EPO kind code."""
+    if not kind:
+        return "unknown"
+    if kind.startswith("B"):
+        return "granted"
+    if kind.startswith("A"):
+        return "pending"
+    return "unknown"
+
+
+def _render_epo_section(
+    epo_only: Optional[list], discrepancies: Optional[list]
+) -> str:
+    """
+    Render EPO-only family members and consistency check sections.
+    Pass None for both args if EPO integration was not configured/run.
+    """
+    if epo_only is None:
+        return ""
+
+    # ── EPO-only cards ──
+    cards_html = ""
+    for em in sorted(epo_only, key=lambda x: x["country"]):
+        cc     = em["country"]
+        status = _epo_member_status(em["kind"])
+        s      = STATUS_META.get(status, STATUS_META["unknown"])
+        badge  = (
+            f'<span class="status-badge" style="background:{s["bg"]};color:{s["fg"]};'
+            f'border:1.5px solid {s["border"]}">{s["label"]}</span>'
+        )
+        norm_pub = normalize(em["pub_num"])
+        gp_url   = f"https://patents.google.com/patent/{norm_pub}/en"
+        pub_link = f'<a href="{gp_url}" target="_blank">{em["pub_num"]}</a>'
+
+        expiry_html = ""
+        if em.get("app_date"):
+            try:
+                fd     = _date.fromisoformat(em["app_date"])
+                expiry = _add_months(fd, 240)
+                expiry_html = (
+                    f'<div class="ann-expiry">Est. expiry: <b>{expiry.isoformat()}</b></div>'
+                )
+            except (ValueError, TypeError):
+                pass
+
+        dates_html = ""
+        if em.get("app_date"):
+            dates_html += f'<span>Filed: <b>{em["app_date"]}</b></span>'
+        if em.get("pub_date"):
+            second_label = "Granted" if status == "granted" else "Published"
+            dates_html += f'<span>{second_label}: <b>{em["pub_date"]}</b></span>'
+
+        cards_html += (
+            f'<div class="card epo-card" style="border-top:4px solid {s["border"]}">'
+            f'  <div class="card-head">'
+            f'    <span class="card-pnum">{pub_link}</span>'
+            f'    {badge}'
+            f'  </div>'
+            f'  <div class="card-dates epo-meta">'
+            f'    <span class="epo-source-badge">EPO OPS</span>'
+            + (f'    <span>App: <b>{em["app_num"]}</b></span>' if em.get("app_num") else '')
+            + f'  </div>'
+            + (f'  <div class="card-dates">{dates_html}</div>' if dates_html else '')
+            + expiry_html
+            + '</div>'
+        )
+
+    epo_section = ""
+    if epo_only:
+        epo_section = (
+            f'<section class="country-section epo-only-section">'
+            f'  <h2 class="country-h epo-section-h">'
+            f'    &#127760; EPO-Only Family Members'
+            f'    <span class="country-count">{len(epo_only)}</span>'
+            f'    <span class="epo-source-label">via INPADOC</span>'
+            f'  </h2>'
+            f'  <p class="epo-note">These jurisdictions appear in the EPO INPADOC family '
+            f'but are not reflected in Google Patents\' Similar Documents table.</p>'
+            f'  <div class="cards-grid">{cards_html}</div>'
+            f'</section>'
+        )
+
+    # ── Consistency check ──
+    check_html = ""
+    if discrepancies:
+        rows = ""
+        for d in discrepancies:
+            flag  = COUNTRY_FLAGS.get(d["country"], "")
+            cname = COUNTRY_NAMES.get(d["country"], d["country"])
+            rows += (
+                f'<tr>'
+                f'<td>{flag} {cname}</td>'
+                f'<td>{d["epo_pub"]}</td>'
+                f'<td>{d["epo_app"] or "—"}</td>'
+                f'<td>{d["google_pub"]}</td>'
+                f'<td>{d["google_app"] or "—"}</td>'
+                f'<td class="disc-note">{d["note"]}</td>'
+                f'</tr>'
+            )
+        check_html = (
+            f'<section class="info-section consistency-section">'
+            f'  <h2 class="section-h">&#9888; Consistency Check'
+            f'    <span class="cnt-badge">{len(discrepancies)} '
+            f'flag{"s" if len(discrepancies) != 1 else ""}</span>'
+            f'  </h2>'
+            f'  <p class="cons-note">Discrepancies found between EPO INPADOC and '
+            f'Google Patents data for the same jurisdiction.</p>'
+            f'  <div class="ps-scroll">'
+            f'  <table class="prior-table cons-table">'
+            f'  <thead><tr>'
+            f'    <th>Country</th><th>EPO Pub</th><th>EPO App</th>'
+            f'    <th>Google Pub</th><th>Google App</th><th>Note</th>'
+            f'  </tr></thead>'
+            f'  <tbody>{rows}</tbody>'
+            f'  </table></div>'
+            f'</section>'
+        )
+    else:
+        # EPO ran successfully, no discrepancies
+        check_html = (
+            f'<section class="info-section consistency-section">'
+            f'  <h2 class="section-h">&#10003; Consistency Check</h2>'
+            f'  <p class="cons-note cons-ok">No discrepancies found between EPO INPADOC '
+            f'and Google Patents family data for overlapping jurisdictions.</p>'
+            f'</section>'
+        )
+
+    return epo_section + check_html
+
+
 # ── Maintenance fee calculations ─────────────────────────────────────────────
 
 # USPTO small entity maintenance fees (months-from-grant, label, amount)
@@ -1331,6 +1642,8 @@ def _render_card(m: dict) -> str:
 def generate_dashboard_html(
     main_metas: dict, family_details: list, url: str, patent_input: str,
     claims: list | None = None,
+    epo_only: list | None = None,
+    discrepancies: list | None = None,
 ) -> str:
     number   = _first(main_metas.get("citation_patent_number", [])) or "N/A"
     title    = (_first(main_metas.get("DC.title", [])) or "").strip()
@@ -1426,6 +1739,8 @@ def generate_dashboard_html(
     ) if relations else ""
 
     assignee_str = "; ".join(assignees) if assignees else "N/A"
+
+    epo_section_html = _render_epo_section(epo_only, discrepancies)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1691,6 +2006,38 @@ def generate_dashboard_html(
     .claims-more summary::-webkit-details-marker {{ display: none; }}
     .claims-more[open] summary {{ margin-bottom: .6rem; }}
     footer {{ text-align: center; font-size: .75rem; color: #9ca3af; margin-top: 2rem; }}
+
+    /* ── EPO OPS section ── */
+    .epo-only-section {{
+      border: 1.5px dashed #93c5fd; border-radius: 12px;
+      padding: 1rem 1.25rem; background: #f0f9ff; margin-bottom: 2rem;
+    }}
+    .epo-section-h {{ color: #1e40af; }}
+    .epo-source-label {{
+      font-size: .65rem; background: #dbeafe; color: #1e40af;
+      border-radius: 4px; padding: .1rem .4rem; margin-left: .5rem; font-weight: 700;
+    }}
+    .epo-note {{ font-size: .8rem; color: #4b5563; margin-bottom: .75rem; font-style: italic; }}
+    .epo-source-badge {{
+      background: #dbeafe; color: #1e40af; border-radius: 4px;
+      padding: .1rem .4rem; font-size: .68rem; font-weight: 700;
+    }}
+    .epo-meta {{ flex-wrap: wrap; gap: .5rem; }}
+    .epo-card {{ border: 1px solid #bae6fd; }}
+
+    /* ── Consistency check ── */
+    .consistency-section {{ }}
+    .cons-note {{ font-size: .82rem; color: #4b5563; margin-bottom: .6rem; }}
+    .cons-ok {{ color: #065f46; font-weight: 500; }}
+    .cons-table {{ width: 100%; border-collapse: collapse; font-size: .82rem; min-width: 600px; }}
+    .cons-table th {{
+      background: #f8f9fa; text-align: left; padding: .35rem .5rem;
+      font-size: .72rem; text-transform: uppercase; letter-spacing: .05em;
+      color: #6b7280; border-bottom: 1px solid #e5e7eb;
+    }}
+    .cons-table td {{ padding: .35rem .5rem; border-bottom: 1px solid #f3f4f6; vertical-align: top; }}
+    .cons-table tr:last-child td {{ border-bottom: none; }}
+    .disc-note {{ font-size: .78rem; color: #92400e; font-style: italic; }}
   </style>
 </head>
 <body>
@@ -1739,6 +2086,8 @@ def generate_dashboard_html(
   {claims_html}
 
   {country_html}
+
+  {epo_section_html}
 
   {prior_html}
 
@@ -1814,7 +2163,44 @@ def main():
         for i, m in enumerate(family)
     ]
 
-    dash_html = generate_dashboard_html(metas, family_details, url, patent_input, claims)
+    # ── EPO OPS Integration ──
+    _load_dotenv()
+    epo_key    = os.environ.get("EPO_CONSUMER_KEY", "").strip()
+    epo_secret = os.environ.get("EPO_CONSUMER_SECRET", "").strip()
+    epo_only:      Optional[list] = None
+    discrepancies: Optional[list] = None
+
+    if epo_key and epo_secret:
+        docdb = patent_to_docdb(patent_input)
+        if docdb:
+            print(f"\nEPO OPS: fetching INPADOC family for {docdb} … ", end="", flush=True)
+            token = epo_get_token(epo_key, epo_secret)
+            if token:
+                xml = fetch_epo_family(docdb, token)
+                if xml:
+                    epo_members = parse_epo_family(xml)
+                    print(f"{len(epo_members)} family members.")
+                    epo_only, discrepancies = merge_epo_with_google(family_details, epo_members)
+                    print(
+                        f"  EPO-only jurisdictions : {len(epo_only)}"
+                        + (f"\n  Consistency flags      : {len(discrepancies)}" if discrepancies else "")
+                    )
+                else:
+                    print("no data returned.")
+                    epo_only, discrepancies = [], []
+            else:
+                print("token request failed.")
+                epo_only, discrepancies = [], []
+        else:
+            print("\nEPO OPS: could not parse patent number into docdb format — skipping.")
+            epo_only, discrepancies = [], []
+    else:
+        print("\nEPO OPS credentials not set — skipping EPO integration.")
+
+    dash_html = generate_dashboard_html(
+        metas, family_details, url, patent_input, claims,
+        epo_only=epo_only, discrepancies=discrepancies,
+    )
     dash_path = save_dashboard(dash_html, number)
     print(f"\n  Dashboard HTML: {dash_path}")
     webbrowser.open(f"file://{dash_path}")
