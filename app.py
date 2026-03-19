@@ -116,6 +116,45 @@ def _run_search(patent_input: str) -> dict:
         for i, m in enumerate(family)
     ]
 
+    # ── DeepL batch translation ───────────────────────────────────────────────
+    # Collect all texts that need translation in a single API call:
+    #   slot 0: primary patent title
+    #   slot 1: primary patent abstract
+    #   slots 2+: non-English family member titles
+    primary_title    = (tracker._first(metas.get("DC.title", [])) or "").strip()
+    primary_abstract = (tracker._first(metas.get("DC.description", [])) or "").strip()
+
+    # Determine which family members need translation (non-English lang tag)
+    nonen_indices = [
+        i for i, m in enumerate(family_details)
+        if tracker.needs_translation(m.get("lang", ""))
+    ]
+
+    deepl_key = os.environ.get("DEEPL_API_KEY", "").strip()
+    translated_title    = None
+    translated_abstract = None
+    if deepl_key:
+        texts_to_translate = [primary_title, primary_abstract] + [
+            family_details[i].get("member_title", "") for i in nonen_indices
+        ]
+        translations = tracker.deepl_translate(texts_to_translate)
+        if translations:
+            def _tr(idx: int) -> str:
+                if idx >= len(translations):
+                    return ""
+                t = translations[idx]
+                src = t.get("detected_source_language", "").upper()
+                txt = t.get("text", "").strip()
+                # Only keep if source was actually non-English
+                return txt if src not in ("EN",) else ""
+
+            translated_title    = _tr(0)
+            translated_abstract = _tr(1)
+            for list_pos, family_idx in enumerate(nonen_indices):
+                tr = _tr(2 + list_pos)
+                if tr:
+                    family_details[family_idx]["translated_title"] = tr
+
     # EPO OPS enrichment
     epo_only:      list | None = None
     discrepancies: list | None = None
@@ -139,6 +178,8 @@ def _run_search(patent_input: str) -> dict:
         metas, family_details, url, patent_input, claims,
         epo_only=epo_only or None,
         discrepancies=discrepancies or None,
+        translated_title=translated_title or None,
+        translated_abstract=translated_abstract or None,
     )
 
     # Split contributors into inventors vs assignees (same heuristic as tracker.py)
@@ -166,21 +207,22 @@ def _run_search(patent_input: str) -> dict:
     ]
 
     return {
-        "patent_number":     number,
-        "title":             (tracker._first(metas.get("DC.title", [])) or "").strip(),
-        "filing_date":       dates[0] if dates else "",
-        "grant_date":        dates[1] if len(dates) > 1 else "",
-        "assignees":         assignees,
-        "inventors":         inventors,
-        "family_size":       len(family_details),
-        "jurisdictions":     len({tracker.country_code(m["pub_num"]) for m in family_details}),
-        "granted_count":     sum(1 for m in family_details if m["status"] == "granted"),
-        "pending_count":     sum(1 for m in family_details if m["status"] == "pending"),
-        "family":            family_summary,
-        "epo_only":          epo_only,
-        "discrepancies":     discrepancies,
-        "dashboard_html":    dashboard_html,
-        "google_patents_url":url,
+        "patent_number":      number,
+        "title":              (tracker._first(metas.get("DC.title", [])) or "").strip(),
+        "translated_title":   translated_title or "",
+        "filing_date":        dates[0] if dates else "",
+        "grant_date":         dates[1] if len(dates) > 1 else "",
+        "assignees":          assignees,
+        "inventors":          inventors,
+        "family_size":        len(family_details),
+        "jurisdictions":      len({tracker.country_code(m["pub_num"]) for m in family_details}),
+        "granted_count":      sum(1 for m in family_details if m["status"] == "granted"),
+        "pending_count":      sum(1 for m in family_details if m["status"] == "pending"),
+        "family":             family_summary,
+        "epo_only":           epo_only,
+        "discrepancies":      discrepancies,
+        "dashboard_html":     dashboard_html,
+        "google_patents_url": url,
     }
 
 

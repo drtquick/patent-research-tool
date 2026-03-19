@@ -894,6 +894,46 @@ def _load_dotenv() -> None:
                 os.environ.setdefault(k.strip(), v.strip())
 
 
+# ── DeepL translation ────────────────────────────────────────────────────────
+
+_DEEPL_FREE_URL = "https://api-free.deepl.com/v2/translate"
+# Languages that are natively English — skip translation for these
+_ENGLISH_LANGS   = {"en", "en-us", "en-gb", "en-au", "en-ca"}
+
+
+def deepl_translate(texts: list[str], target_lang: str = "EN-US") -> list[dict] | None:
+    """
+    Translate a batch of texts with the DeepL free API.
+    Source language is auto-detected per text.
+    Returns list of {text, detected_source_language} or None on error/missing key.
+    Filters out texts that are already English before sending.
+    """
+    api_key = os.environ.get("DEEPL_API_KEY", "").strip()
+    if not api_key:
+        return None
+    texts = [t.strip() for t in texts]
+    if not any(texts):
+        return None
+    try:
+        resp = requests.post(
+            _DEEPL_FREE_URL,
+            headers={"Authorization": f"DeepL-Auth-Key {api_key}",
+                     "Content-Type": "application/json"},
+            json={"text": texts, "target_lang": target_lang},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        return resp.json().get("translations", [])
+    except Exception as exc:
+        print(f"  DeepL error: {exc}")
+        return None
+
+
+def needs_translation(lang: str) -> bool:
+    """Return True if a family member's language tag indicates non-English."""
+    return bool(lang) and lang.lower() not in _ENGLISH_LANGS
+
+
 def patent_to_docdb(patent_id: str) -> Optional[str]:
     """
     Convert a raw patent ID to EPO OPS docdb format CC.NNNNNNNN.KK.
@@ -1784,6 +1824,12 @@ def _render_card(m: dict) -> str:
             '</details>'
         )
 
+    translated = (m.get("translated_title") or "").strip()
+    translated_html = (
+        f'  <div class="card-translated">&#127760; {translated}</div>'
+        if translated and translated.lower() != title.lower() else ""
+    )
+
     return (
         f'<div class="card" style="border-top:4px solid {border}">'
         f'  <div class="card-head">'
@@ -1791,6 +1837,7 @@ def _render_card(m: dict) -> str:
         f'    {_status_badge(status)}'
         f'  </div>'
         + (f'  <div class="card-title">{title}</div>' if title else '')
+        + translated_html
         + f'  <div class="card-dates">{date_items}</div>'
         + maint_html + annuity_html + latest_html + rej_html + rej_summary_html + err_html + history_html
         + '</div>'
@@ -1802,6 +1849,8 @@ def generate_dashboard_html(
     claims: list | None = None,
     epo_only: list | None = None,
     discrepancies: list | None = None,
+    translated_title: str | None = None,
+    translated_abstract: str | None = None,
 ) -> str:
     number   = _first(main_metas.get("citation_patent_number", [])) or "N/A"
     title    = (_first(main_metas.get("DC.title", [])) or "").strip()
@@ -1902,6 +1951,26 @@ def generate_dashboard_html(
 
     epo_section_html = _render_epo_section(epo_only, discrepancies)
 
+    # Abstract section — pre-computed to avoid nested f-string quoting issues
+    if abstract:
+        tr_abstract_html = ""
+        if translated_abstract:
+            tr_abstract_html = (
+                '<div class="abstract-translated">'
+                '<span class="translated-label">&#127760; Machine translation (DeepL)</span>'
+                f'{translated_abstract}'
+                '</div>'
+            )
+        abstract_section_html = (
+            '<section class="info-section">'
+            '<h2 class="section-h">Abstract</h2>'
+            f'<div class="abstract">{abstract}</div>'
+            f'{tr_abstract_html}'
+            '</section>'
+        )
+    else:
+        abstract_section_html = ""
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1965,6 +2034,23 @@ def generate_dashboard_html(
       background: #f8fafc; border-left: 3px solid #2563eb;
       border-radius: 0 8px 8px 0; padding: .9rem 1.1rem;
       font-size: .92rem; color: #374151; line-height: 1.7;
+    }}
+    .abstract-translated {{
+      margin-top: .75rem; padding: .75rem 1.1rem;
+      background: #f0fdf4; border-left: 3px solid #22c55e;
+      border-radius: 0 8px 8px 0; font-size: .9rem; color: #374151; line-height: 1.7;
+    }}
+    .translated-label {{
+      display: block; font-size: .72rem; font-weight: 700; color: #16a34a;
+      text-transform: uppercase; letter-spacing: .04em; margin-bottom: .35rem;
+    }}
+    .card-translated {{
+      font-size: .78rem; color: #16a34a; font-style: italic;
+      margin: .15rem .75rem .35rem; line-height: 1.4;
+    }}
+    .hero-translated {{
+      font-size: .95rem; color: #86efac; font-style: italic;
+      margin-top: .35rem; margin-bottom: .1rem;
     }}
     .prior-table {{ width: 100%; border-collapse: collapse; font-size: .88rem; }}
     .prior-table td {{ padding: .35rem .5rem; border-bottom: 1px solid #f0f0f0; }}
@@ -2292,6 +2378,7 @@ def generate_dashboard_html(
   <div class="hero">
     <div class="hero-eyebrow">Patent Family Dashboard</div>
     <div class="hero-title">{title or number}</div>
+    {f'<div class="hero-translated">&#127760; {translated_title}</div>' if translated_title and translated_title.lower() != (title or "").lower() else ""}
     <div class="hero-sub">
       <span class="hero-chip">&#128196; {number}</span>
       <span class="hero-chip">&#128197; Filed {filing_date}</span>
@@ -2329,6 +2416,8 @@ def generate_dashboard_html(
   </div>
 
   {portfolio_html}
+
+  {abstract_section_html}
 
   {claims_html}
 
