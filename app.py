@@ -124,20 +124,33 @@ def _run_search(patent_input: str) -> dict:
     primary_title    = (tracker._first(metas.get("DC.title", [])) or "").strip()
     primary_abstract = (tracker._first(metas.get("DC.description", [])) or "").strip()
 
-    # Determine which family members need translation (non-English lang tag)
+    # Determine which family members need translation (non-English lang tag or country code)
     nonen_indices = [
         i for i, m in enumerate(family_details)
-        if tracker.needs_translation(m.get("lang", ""))
+        if tracker.needs_translation(
+            m.get("lang", ""),
+            tracker.country_code(m.get("pub_num", "")),
+        )
     ]
 
-    deepl_key = os.environ.get("DEEPL_API_KEY", "").strip()
+    primary_cc  = tracker.country_code(number)
+    deepl_key   = os.environ.get("DEEPL_API_KEY", "").strip()
     translated_title    = None
     translated_abstract = None
+    # Only translate the primary patent's title/abstract if it's from a non-English jurisdiction
+    translate_primary = tracker.needs_translation("", primary_cc)
     if deepl_key:
-        texts_to_translate = [primary_title, primary_abstract] + [
-            family_details[i].get("member_title", "") for i in nonen_indices
-        ]
-        translations = tracker.deepl_translate(texts_to_translate)
+        # Build text list: primary title+abstract first (if non-English jurisdiction),
+        # then non-English family member titles
+        primary_texts  = [primary_title, primary_abstract] if translate_primary else []
+        member_texts   = [family_details[i].get("member_title", "") for i in nonen_indices]
+        texts_to_translate = primary_texts + member_texts
+
+        if texts_to_translate:
+            translations = tracker.deepl_translate(texts_to_translate)
+        else:
+            translations = None
+
         if translations:
             def _tr(idx: int) -> str:
                 if idx >= len(translations):
@@ -145,13 +158,15 @@ def _run_search(patent_input: str) -> dict:
                 t = translations[idx]
                 src = t.get("detected_source_language", "").upper()
                 txt = t.get("text", "").strip()
-                # Only keep if source was actually non-English
                 return txt if src not in ("EN",) else ""
 
-            translated_title    = _tr(0)
-            translated_abstract = _tr(1)
+            offset = 0
+            if translate_primary:
+                translated_title    = _tr(0)
+                translated_abstract = _tr(1)
+                offset = 2
             for list_pos, family_idx in enumerate(nonen_indices):
-                tr = _tr(2 + list_pos)
+                tr = _tr(offset + list_pos)
                 if tr:
                     family_details[family_idx]["translated_title"] = tr
 

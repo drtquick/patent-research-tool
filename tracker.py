@@ -929,9 +929,25 @@ def deepl_translate(texts: list[str], target_lang: str = "EN-US") -> list[dict] 
         return None
 
 
-def needs_translation(lang: str) -> bool:
-    """Return True if a family member's language tag indicates non-English."""
-    return bool(lang) and lang.lower() not in _ENGLISH_LANGS
+# Country codes whose primary official language is not English
+_NON_ENGLISH_COUNTRIES = {
+    "CN", "JP", "KR", "DE", "FR", "IT", "ES", "RU", "NL", "PT",
+    "PL", "SE", "FI", "NO", "DK", "CZ", "SK", "HU", "RO", "BG",
+    "HR", "SI", "LT", "LV", "EE", "TR", "UA", "TW", "BR", "MX",
+    "AR", "CL", "CO",
+}
+
+
+def needs_translation(lang: str, cc: str = "") -> bool:
+    """
+    Return True if text likely needs translating to English.
+    Uses explicit lang tag when set, falls back to country code.
+    """
+    if lang and lang.lower() not in _ENGLISH_LANGS:
+        return True
+    if not lang and cc.upper() in _NON_ENGLISH_COUNTRIES:
+        return True
+    return False
 
 
 def patent_to_docdb(patent_id: str) -> Optional[str]:
