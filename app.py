@@ -41,12 +41,18 @@ CORS(app)                       # allow React dev server (and Firebase Hosting)
 def _init_firebase() -> None:
     if firebase_admin._apps:
         return
-    key_path = os.environ.get("FIREBASE_SERVICE_ACCOUNT_KEY", "").strip()
-    if key_path and os.path.exists(key_path):
-        cred = credentials.Certificate(key_path)
+    # Cloud Run: pass entire JSON as env var FIREBASE_SERVICE_ACCOUNT_JSON
+    sa_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
+    if sa_json:
+        import json as _json
+        cred = credentials.Certificate(_json.loads(sa_json))
     else:
-        # Fall back to GOOGLE_APPLICATION_CREDENTIALS (set in environment)
-        cred = credentials.ApplicationDefault()
+        # Local dev: path to the JSON file
+        key_path = os.environ.get("FIREBASE_SERVICE_ACCOUNT_KEY", "").strip()
+        if key_path and os.path.exists(key_path):
+            cred = credentials.Certificate(key_path)
+        else:
+            cred = credentials.ApplicationDefault()
     firebase_admin.initialize_app(cred)
 
 

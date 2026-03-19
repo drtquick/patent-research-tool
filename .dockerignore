@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+frontend/
+*.html
+.env
+.git/
+.gitignore
+node_modules/
+README.md
