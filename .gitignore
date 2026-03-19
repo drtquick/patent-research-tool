@@ -1,11 +1,27 @@
+# Environment variables
 .env
-venv/
+.env.*
+
+# Firebase service account (private key — never commit)
+firebase-service-account.json
+*-adminsdk-*.json
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
-firebase-service-account.json
-*.html
+venv/
+.venv/
+
+# Node / React
 node_modules/
-.firebase/
-dist/
 build/
+dist/
+.env.local
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
