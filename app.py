@@ -254,6 +254,32 @@ def health():
     return jsonify({"status": "ok"})
 
 
+@app.route("/api/search/local", methods=["POST"])
+def search_local():
+    """
+    Unauthenticated search endpoint for the dashboard's built-in search bar.
+    Only accepts requests from localhost — not exposed to authenticated users.
+    """
+    remote = request.remote_addr or ""
+    if remote not in ("127.0.0.1", "::1", "localhost"):
+        return jsonify({"error": "Local endpoint only"}), 403
+
+    body         = request.get_json(silent=True) or {}
+    patent_input = (body.get("patent_number") or "").strip()
+    if not patent_input:
+        return jsonify({"error": "patent_number is required"}), 400
+
+    try:
+        result = _run_search(patent_input)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"error": f"Search failed: {exc}"}), 500
+
+    return jsonify(result)
+
+
 @app.route("/api/search", methods=["POST"])
 @require_auth
 def search():

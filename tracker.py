@@ -1331,6 +1331,133 @@ def calc_annuities(filing_date_str: str, cc: str) -> Optional[dict]:
     }
 
 
+# ── Professional fee estimates ───────────────────────────────────────────────
+# Approximate professional/agent fees (USD) — used in portfolio fee schedule.
+# These are estimates only; actual fees vary by firm and jurisdiction.
+_PRO_FEES: dict[str, dict] = {
+    "EP": {"annuity_agent": 300,  "oa_response": 3_500,
+           "note": "EP annuity agent ~$300/yr; OA response ~$3,500"},
+    "JP": {"annuity_agent": 350,  "oa_response": 3_000,
+           "note": "JP annuity agent ~$350/yr; OA response ~$3,000"},
+    "CN": {"annuity_agent": 200,  "oa_response": 2_000,
+           "note": "CN annuity agent ~$200/yr; OA response ~$2,000"},
+}
+
+
+# ── IDS disclosure check ──────────────────────────────────────────────────────
+
+_IDS_CODES = frozenset({"IDS", "IDSMAIN", "IDS.IDS", "ISS.IDS"})
+
+
+def _has_ids_event(events: list[dict]) -> tuple[bool, list[dict]]:
+    """Return (found, matching_events) for IDS events in prosecution history."""
+    matches = []
+    for e in events:
+        code  = (e.get("code")  or "").upper().replace("-", "").replace(" ", "")
+        title = (e.get("title") or "").upper()
+        value = (e.get("value") or "").upper()
+        if (any(c in code for c in _IDS_CODES) or
+                "INFORMATION DISCLOSURE" in title or
+                "INFORMATION DISCLOSURE" in value):
+            matches.append(e)
+    return bool(matches), matches
+
+
+def check_ids_disclosure(
+    family_details: list[dict], granted_refs: list[dict]
+) -> list[dict]:
+    """
+    For each co-pending / unknown US application in the family, check whether
+    an IDS was filed based on prosecution history events.
+
+    Returns a list of result dicts — one per qualifying application.
+    """
+    results: list[dict] = []
+    ref_count = len(granted_refs)
+
+    for m in family_details:
+        cc     = country_code(m["pub_num"])
+        status = m.get("status", "unknown")
+        if cc != "US" or status not in ("pending", "unknown"):
+            continue
+
+        has_ids, ids_events = _has_ids_event(m.get("events", []))
+        latest_ids = ids_events[-1] if ids_events else None
+
+        if has_ids:
+            note = (
+                f"IDS filed ({latest_ids['date']}) — "
+                f"verify that all {ref_count} cited reference{'s' if ref_count != 1 else ''} "
+                f"are disclosed"
+            ) if latest_ids else "IDS event found — verify reference disclosure"
+            flag = False
+        else:
+            note = (
+                f"No IDS event found in page source — review recommended. "
+                f"({ref_count} reference{'s' if ref_count != 1 else ''} cited in granted patent)"
+            )
+            flag = True
+
+        results.append({
+            "pub_num":    m["pub_num"],
+            "app_num":    m.get("app_num", ""),
+            "href":       m.get("href", ""),
+            "has_ids":    has_ids,
+            "ids_events": ids_events,
+            "flag":       flag,
+            "note":       note,
+        })
+
+    return results
+
+
+def _render_ids_check(ids_results: list[dict]) -> str:
+    if not ids_results:
+        return ""
+
+    rows = ""
+    for r in ids_results:
+        icon  = "&#9888;" if r["flag"] else "&#10003;"
+        color = "#991b1b" if r["flag"] else "#065f46"
+        bg    = "#fee2e2" if r["flag"] else "#d1fae5"
+        label = "Review recommended" if r["flag"] else "IDS found"
+        pub_link = (
+            f'<a href="{r["href"]}" target="_blank">{r["pub_num"]}</a>'
+            if r["href"] else r["pub_num"]
+        )
+        app_display = r["app_num"] or "—"
+        rows += (
+            f'<tr>'
+            f'<td>{pub_link}</td>'
+            f'<td>{app_display}</td>'
+            f'<td style="background:{bg};color:{color};font-weight:600;white-space:nowrap">'
+            f'  {icon} {label}'
+            f'</td>'
+            f'<td class="ids-note">{r["note"]}</td>'
+            f'</tr>'
+        )
+
+    return (
+        f'<section class="info-section ids-section">'
+        f'  <h2 class="section-h">Prior Art IDS Disclosure Check'
+        f'    <span class="cnt-badge">{len(ids_results)} co-pending</span>'
+        f'  </h2>'
+        f'  <p class="ids-disclaimer">'
+        f'    &#9432;&nbsp; Automated check based on prosecution history events in page source. '
+        f'    Absence of an IDS event does not confirm non-disclosure. '
+        f'    <strong>Results must be verified by qualified patent counsel.</strong>'
+        f'  </p>'
+        f'  <div class="ps-scroll">'
+        f'  <table class="prior-table ids-table">'
+        f'  <thead><tr>'
+        f'    <th>Application</th><th>App No</th><th>IDS Status</th><th>Note</th>'
+        f'  </tr></thead>'
+        f'  <tbody>{rows}</tbody>'
+        f'  </table></div>'
+        f'</section>'
+    )
+
+
 # ── Portfolio fee schedule ────────────────────────────────────────────────────
 
 def calc_portfolio_schedule(family_details: list) -> list[dict]:
@@ -1399,6 +1526,17 @@ def _render_portfolio_summary(schedule: list) -> str:
     grand_cny   = sum(r["CNY"]        for r in schedule)
     grand_maint = sum(r["USD_maint"]  for r in schedule)
 
+    # Estimate professional fees per year based on jurisdictions active that year
+    def _pro_fee_for_year(row: dict) -> int:
+        ccs = {ev["cc"] for ev in row["events"]}
+        total = 0
+        for cc, pf in _PRO_FEES.items():
+            if cc in ccs:
+                total += pf["annuity_agent"]
+        return total
+
+    grand_pro = sum(_pro_fee_for_year(r) for r in schedule)
+
     def _fmt(sym: str, val: int) -> str:
         return f"{sym}{val:,}" if val else "—"
 
@@ -1411,46 +1549,66 @@ def _render_portfolio_summary(schedule: list) -> str:
             f'<span class="ps-app" title="{", ".join(labels)}">{pid}</span>'
             for pid, labels in apps.items()
         )
+        pro_est = _pro_fee_for_year(row)
+        total_with_pro = row["total_usd"] + pro_est
+        # data- attributes for live FX JS update
         rows_html += (
             f'<tr>'
             f'<td class="ps-year">{row["year"]}</td>'
             f'<td class="ps-apps">{apps_html}</td>'
-            f'<td class="ps-cur">{_fmt("€", row["EUR"])}</td>'
-            f'<td class="ps-cur">{_fmt("¥", row["JPY"])}</td>'
-            f'<td class="ps-cur">{_fmt("¥", row["CNY"])}</td>'
+            f'<td class="ps-cur" data-eur="{row["EUR"]}">{_fmt("€", row["EUR"])}</td>'
+            f'<td class="ps-cur" data-jpy="{row["JPY"]}">{_fmt("¥", row["JPY"])}</td>'
+            f'<td class="ps-cur" data-cny="{row["CNY"]}">{_fmt("¥", row["CNY"])}</td>'
             f'<td class="ps-cur">{_fmt("$", row["USD_maint"])}</td>'
-            f'<td class="ps-total">~${row["total_usd"]:,}</td>'
+            f'<td class="ps-cur ps-official">~${row["total_usd"]:,}</td>'
+            f'<td class="ps-cur ps-pro">~${pro_est:,}</td>'
+            f'<td class="ps-total">~${total_with_pro:,}</td>'
             f'</tr>'
         )
     rows_html += (
         f'<tr class="ps-grand-row">'
         f'<td colspan="2"><strong>Grand Total</strong></td>'
-        f'<td class="ps-cur">{_fmt("€", grand_eur)}</td>'
-        f'<td class="ps-cur">{_fmt("¥", grand_jpy)}</td>'
-        f'<td class="ps-cur">{_fmt("¥", grand_cny)}</td>'
+        f'<td class="ps-cur" data-eur="{grand_eur}">{_fmt("€", grand_eur)}</td>'
+        f'<td class="ps-cur" data-jpy="{grand_jpy}">{_fmt("¥", grand_jpy)}</td>'
+        f'<td class="ps-cur" data-cny="{grand_cny}">{_fmt("¥", grand_cny)}</td>'
         f'<td class="ps-cur">{_fmt("$", grand_maint)}</td>'
-        f'<td class="ps-total"><strong>~${grand_usd:,}</strong></td>'
+        f'<td class="ps-cur ps-official"><strong>~${grand_usd:,}</strong></td>'
+        f'<td class="ps-cur ps-pro"><strong>~${grand_pro:,}</strong></td>'
+        f'<td class="ps-total"><strong>~${grand_usd + grand_pro:,}</strong></td>'
         f'</tr>'
     )
 
+    pro_notes = " &nbsp;|&nbsp; ".join(pf["note"] for pf in _PRO_FEES.values())
+
     return (
-        f'<section class="info-section ps-section">'
-        f'  <h2 class="section-h">Portfolio Fee Schedule</h2>'
+        f'<details class="info-section ps-section" id="fee-schedule-tab">'
+        f'  <summary class="section-h ps-summary">'
+        f'    &#128197; Portfolio Fee Schedule'
+        f'    <span class="cnt-badge">click to expand</span>'
+        f'    <span id="fx-rate-badge" class="fx-badge" style="display:none"></span>'
+        f'  </summary>'
         f'  <p class="ps-disclaimer">'
-        f'    &#9888;&nbsp; Official fees only &mdash; does not include professional fees. '
-        f'    USD equivalents are approximate'
-        f'    (EUR&times;1.08 &nbsp;|&nbsp; JPY&times;0.0067 &nbsp;|&nbsp; CNY&times;0.14).'
+        f'    &#9888;&nbsp; Official fees shown at static rates'
+        f'    (EUR&times;1.08 &nbsp;|&nbsp; JPY&times;0.0067 &nbsp;|&nbsp; CNY&times;0.14). '
+        f'    Live exchange rates update USD columns when available.'
+        f'  </p>'
+        f'  <p class="ps-pro-note">'
+        f'    &#9432;&nbsp; Est. professional fees: {pro_notes}. '
+        f'    <em>All figures are estimates — verify with counsel.</em>'
         f'  </p>'
         f'  <div class="ps-scroll">'
-        f'  <table class="ps-table">'
+        f'  <table class="ps-table" id="fee-table">'
         f'  <thead><tr>'
         f'    <th>Year</th><th>Applications</th>'
         f'    <th>EUR (EPO)</th><th>JPY (JP)</th><th>CNY (CN)</th>'
-        f'    <th>USD (US&nbsp;maint.)</th><th>~USD Total</th>'
+        f'    <th>USD (US&nbsp;maint.)</th>'
+        f'    <th>Official ~USD</th>'
+        f'    <th>Est. Prof. Fees</th>'
+        f'    <th>Total ~USD</th>'
         f'  </tr></thead>'
         f'  <tbody>{rows_html}</tbody>'
         f'  </table></div>'
-        f'</section>'
+        f'</details>'
     )
 
 
@@ -1694,7 +1852,17 @@ def generate_dashboard_html(
             f'</section>'
         )
 
-    # Granted US Claims section (replaces abstract)
+    # IDS disclosure check
+    granted_us = next(
+        (m for m in family_details
+         if country_code(m["pub_num"]) == "US" and m.get("status") == "granted"),
+        None,
+    )
+    granted_refs = granted_us.get("backward_refs", []) if granted_us else []
+    ids_results  = check_ids_disclosure(family_details, granted_refs)
+    ids_html     = _render_ids_check(ids_results)
+
+    # Granted US Claims — collapsible tab
     indep_claims = [c for c in (claims or []) if c["independent"]]
     if indep_claims:
         def _render_claim(c: dict) -> str:
@@ -1704,23 +1872,15 @@ def generate_dashboard_html(
                 f'<p class="claim-body">{c["text"]}</p>'
                 f'</div>'
             )
-        shown   = indep_claims[:3]
-        hidden  = indep_claims[3:]
-        shown_html = "".join(_render_claim(c) for c in shown)
-        more_html  = ""
-        if hidden:
-            more_html = (
-                f'<details class="claims-more">'
-                f'<summary>Show {len(hidden)} more independent claim{"s" if len(hidden) != 1 else ""}</summary>'
-                + "".join(_render_claim(c) for c in hidden)
-                + '</details>'
-            )
+        all_claims_html = "".join(_render_claim(c) for c in indep_claims)
         claims_html = (
-            f'<section class="info-section">'
-            f'  <h2 class="section-h">Granted US Claims '
-            f'<span class="cnt-badge">{len(indep_claims)} independent</span></h2>'
-            + shown_html + more_html
-            + '</section>'
+            f'<details class="info-section claims-tab">'
+            f'  <summary class="section-h">'
+            f'    &#128196; Granted US Claims'
+            f'    <span class="cnt-badge">{len(indep_claims)} independent — click to expand</span>'
+            f'  </summary>'
+            + all_claims_html
+            + '</details>'
         )
     else:
         claims_html = ""
@@ -2038,9 +2198,96 @@ def generate_dashboard_html(
     .cons-table td {{ padding: .35rem .5rem; border-bottom: 1px solid #f3f4f6; vertical-align: top; }}
     .cons-table tr:last-child td {{ border-bottom: none; }}
     .disc-note {{ font-size: .78rem; color: #92400e; font-style: italic; }}
+
+    /* ── Search bar ── */
+    .search-bar-wrap {{
+      background: #fff; border-radius: 12px; padding: .85rem 1.25rem;
+      margin-bottom: 1.25rem; box-shadow: 0 1px 3px rgba(0,0,0,.07);
+      display: flex; flex-direction: column; gap: .5rem;
+    }}
+    #search-form {{ display: flex; gap: .6rem; }}
+    .search-input {{
+      flex: 1; padding: .55rem 1rem; border: 1.5px solid #d1d5db;
+      border-radius: 8px; font-size: .92rem; outline: none;
+      transition: border-color .15s;
+    }}
+    .search-input:focus {{ border-color: #2563eb; }}
+    .search-btn {{
+      padding: .55rem 1.4rem; background: #2563eb; color: #fff;
+      border: none; border-radius: 8px; font-size: .92rem; font-weight: 600;
+      cursor: pointer; white-space: nowrap; transition: background .15s;
+    }}
+    .search-btn:hover {{ background: #1d4ed8; }}
+    .search-btn:disabled {{ background: #93c5fd; cursor: not-allowed; }}
+    .search-status {{ font-size: .82rem; color: #6b7280; min-height: 1.2em; }}
+    .search-status.err {{ color: #991b1b; }}
+    .search-status.ok  {{ color: #065f46; }}
+
+    /* ── Fee schedule collapsible ── */
+    .ps-section {{ padding: 0; overflow: hidden; }}
+    .ps-summary {{
+      cursor: pointer; padding: 1.25rem 1.75rem; list-style: none;
+      user-select: none; display: flex; align-items: center; gap: .5rem;
+    }}
+    .ps-summary::-webkit-details-marker {{ display: none; }}
+    details[open] > .ps-summary {{ border-bottom: 1px solid #f3f4f6; }}
+    .ps-section > .ps-disclaimer,
+    .ps-section > .ps-pro-note,
+    .ps-section > .ps-scroll {{ padding-left: 1.75rem; padding-right: 1.75rem; }}
+    .ps-section > .ps-disclaimer {{ padding-top: .75rem; }}
+    .ps-section > .ps-scroll {{ padding-bottom: 1.25rem; }}
+    .ps-pro-note {{
+      font-size: .78rem; color: #1e40af; background: #eff6ff;
+      border-radius: 6px; padding: .45rem .75rem; margin: .5rem 1.75rem;
+    }}
+    .ps-official {{ color: #374151; }}
+    .ps-pro {{ color: #1e40af; }}
+    .fx-badge {{
+      background: #d1fae5; color: #065f46; border-radius: 4px;
+      padding: .1rem .5rem; font-size: .68rem; font-weight: 700; margin-left: auto;
+    }}
+
+    /* ── Claims collapsible tab ── */
+    .claims-tab {{ padding: 0; overflow: hidden; }}
+    .claims-tab > summary {{
+      cursor: pointer; padding: 1.1rem 1.75rem; list-style: none; user-select: none;
+      display: flex; align-items: center; gap: .5rem;
+    }}
+    .claims-tab > summary::-webkit-details-marker {{ display: none; }}
+    details[open].claims-tab > summary {{ border-bottom: 1px solid #f3f4f6; }}
+    .claims-tab .claim-block {{ margin: .9rem 1.75rem; padding-bottom: .9rem;
+      border-bottom: 1px solid #f3f4f6; }}
+    .claims-tab .claim-block:last-child {{ border-bottom: none; }}
+
+    /* ── IDS check ── */
+    .ids-section {{ }}
+    .ids-disclaimer {{
+      font-size: .78rem; background: #fef3c7; color: #92400e;
+      border-radius: 6px; padding: .5rem .75rem; margin-bottom: .75rem;
+    }}
+    .ids-table {{ width: 100%; border-collapse: collapse; font-size: .82rem; min-width: 520px; }}
+    .ids-table th {{
+      background: #f8f9fa; text-align: left; padding: .35rem .5rem;
+      font-size: .72rem; text-transform: uppercase; letter-spacing: .05em;
+      color: #6b7280; border-bottom: 1px solid #e5e7eb;
+    }}
+    .ids-table td {{ padding: .4rem .5rem; border-bottom: 1px solid #f3f4f6; vertical-align: top; }}
+    .ids-table tr:last-child td {{ border-bottom: none; }}
+    .ids-note {{ font-size: .78rem; color: #4b5563; font-style: italic; }}
   </style>
 </head>
 <body>
+
+  <!-- Search bar -->
+  <div class="search-bar-wrap">
+    <form id="search-form" onsubmit="runSearch(event)">
+      <input id="search-input" type="text" class="search-input"
+             placeholder="Enter patent number: US12178560, EP1234567, JP2023534987, WO2021133786 …"
+             autocomplete="off" spellcheck="false" />
+      <button type="submit" class="search-btn">Search</button>
+    </form>
+    <div id="search-status" class="search-status"></div>
+  </div>
 
   <div class="hero">
     <div class="hero-eyebrow">Patent Family Dashboard</div>
@@ -2089,9 +2336,72 @@ def generate_dashboard_html(
 
   {epo_section_html}
 
+  {ids_html}
+
   {prior_html}
 
   <footer>Generated by patent-research-tool &mdash; {patent_input}</footer>
+
+<script>
+// ── Live FX rates ──────────────────────────────────────────────────────────
+(function() {{
+  fetch('https://api.exchangerate-api.com/v4/latest/USD')
+    .then(r => r.json())
+    .then(data => {{
+      const rates = data.rates || {{}};
+      const EUR = rates['EUR'] || 0, JPY = rates['JPY'] || 0, CNY = rates['CNY'] || 0;
+      if (!EUR || !JPY || !CNY) return;
+      document.querySelectorAll('[data-eur]').forEach(td => {{
+        const v = parseFloat(td.dataset.eur);
+        if (v) td.textContent = '\u20ac' + v.toLocaleString() + ' (~$' + Math.round(v/EUR).toLocaleString() + ')';
+      }});
+      document.querySelectorAll('[data-jpy]').forEach(td => {{
+        const v = parseFloat(td.dataset.jpy);
+        if (v) td.textContent = '\u00a5' + v.toLocaleString() + ' (~$' + Math.round(v/JPY).toLocaleString() + ')';
+      }});
+      document.querySelectorAll('[data-cny]').forEach(td => {{
+        const v = parseFloat(td.dataset.cny);
+        if (v) td.textContent = '\u00a5' + v.toLocaleString() + ' (~$' + Math.round(v/CNY).toLocaleString() + ')';
+      }});
+      const badge = document.getElementById('fx-rate-badge');
+      if (badge) {{
+        const d = new Date().toLocaleDateString();
+        badge.textContent = 'Live FX ' + d + ' \u00b7 \u20ac1=$' + (1/EUR).toFixed(2) + ' \u00b7 \u00a51=$' + (1/JPY).toFixed(4) + '(JPY) \u00b7 \u00a51=$' + (1/CNY).toFixed(3) + '(CNY)';
+        badge.style.display = '';
+      }}
+    }}).catch(() => {{}});
+}})();
+
+// ── Search bar ─────────────────────────────────────────────────────────────
+async function runSearch(evt) {{
+  evt.preventDefault();
+  const input  = document.getElementById('search-input');
+  const status = document.getElementById('search-status');
+  const btn    = document.querySelector('.search-btn');
+  const q      = (input.value || '').trim();
+  if (!q) return;
+  btn.disabled = true;
+  status.className = 'search-status';
+  status.textContent = 'Searching \u201c' + q + '\u201d \u2026 this may take 30\u201360 seconds';
+  try {{
+    const resp = await fetch('http://localhost:5001/api/search/local', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{patent_number: q}}),
+    }});
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Search failed (' + resp.status + ')');
+    document.open(); document.write(data.dashboard_html); document.close();
+  }} catch (err) {{
+    status.className = 'search-status err';
+    const isOffline = err.message.includes('fetch') || err.message.includes('Failed') || err.message.includes('NetworkError');
+    status.innerHTML = isOffline
+      ? 'Flask server not running. Start with: <code>python app.py</code>, then retry.'
+      : 'Error: ' + err.message;
+    btn.disabled = false;
+  }}
+}}
+</script>
 </body>
 </html>"""
 
