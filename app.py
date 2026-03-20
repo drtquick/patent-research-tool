@@ -547,6 +547,48 @@ def get_alerts():
         return jsonify({"error": str(exc)}), 500
 
 
+# ── Search history ───────────────────────────────────────────────────────────
+
+@app.route("/api/searches", methods=["GET"])
+@require_auth
+def list_searches():
+    """
+    Return the user's most recent patent searches, newest first.
+    Optional: ?limit=N (default 8, max 20).
+    """
+    try:
+        limit = min(int(request.args.get("limit", 8)), 20)
+        docs  = (
+            db.collection("users").document(request.uid)
+            .collection("searches")
+            .order_by("searched_at", direction=firestore.Query.DESCENDING)
+            .limit(limit)
+            .stream()
+        )
+        results = []
+        seen_nums: set[str] = set()
+        for doc in docs:
+            d   = doc.to_dict()
+            num = d.get("patent_number", "")
+            # Deduplicate: keep only the most recent search per patent number
+            if num in seen_nums:
+                continue
+            seen_nums.add(num)
+            sat = d.get("searched_at")
+            results.append({
+                "id":            doc.id,
+                "patent_number": num,
+                "title":         d.get("title", ""),
+                "family_size":   d.get("family_size", 0),
+                "granted_count": d.get("granted_count", 0),
+                "pending_count": d.get("pending_count", 0),
+                "searched_at":   sat.isoformat() if hasattr(sat, "isoformat") else str(sat or ""),
+            })
+        return jsonify({"searches": results})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

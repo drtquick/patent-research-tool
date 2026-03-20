@@ -128,7 +128,7 @@ export default function Settings() {
               <h3 style={styles.sectionTitle}>About PatentQ</h3>
               <div style={styles.infoRow}>
                 <span style={styles.infoLabel}>Version</span>
-                <span style={styles.infoValue}>β 0.3</span>
+                <span style={styles.infoValue}>β 0.4</span>
               </div>
               <div style={styles.infoRow}>
                 <span style={styles.infoLabel}>Data sources</span>

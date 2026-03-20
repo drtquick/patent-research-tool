@@ -39,4 +39,7 @@ export const api = {
 
   getAlerts: (days) =>
     authFetch(`/api/alerts${days ? `?days=${days}` : ""}`),
+
+  getSearchHistory: (limit = 8) =>
+    authFetch(`/api/searches?limit=${limit}`),
 };

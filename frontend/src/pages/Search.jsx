@@ -2,9 +2,11 @@ import { useState, useEffect, useRef } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import PrintBar from "../PrintBar";
+import { useIsMobile } from "../useIsMobile";
 
 export default function Search() {
   const [searchParams, setSearchParams] = useSearchParams();
+  const isMobile = useIsMobile();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
@@ -50,7 +52,7 @@ export default function Search() {
   const currentQuery = searchParams.get("q") || "";
 
   return (
-    <div style={styles.page}>
+    <div style={{ ...styles.page, padding: isMobile ? "1rem" : "1.5rem" }}>
       {/* Prompt when no query yet */}
       {!currentQuery && !loading && !result && (
         <div style={styles.empty}>
@@ -73,12 +75,16 @@ export default function Search() {
 
       {result && (
         <div style={styles.resultWrap}>
-          <div style={styles.resultHeader}>
-            <div>
-              <strong>{result.patent_number}</strong> — {result.title}
+          <div style={isMobile ? styles.resultHeaderMobile : styles.resultHeader}>
+            <div style={{ minWidth: 0 }}>
+              <strong>{result.patent_number}</strong>
+              {!isMobile && <> — {result.title}</>}
+              {isMobile && <div style={{ fontSize: 12, color: "#555", marginTop: 2,
+                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {result.title}
+              </div>}
               <div style={styles.meta}>
-                {result.family_size} family members · {result.jurisdictions} jurisdictions ·{" "}
-                {result.granted_count} granted · {result.pending_count} pending
+                {result.family_size} members · {result.granted_count}✓ · {result.pending_count} pending
               </div>
             </div>
             <button
@@ -86,7 +92,7 @@ export default function Search() {
               onClick={handleSave}
               disabled={saving || saved}
             >
-              {saved ? "✓ Saved to Portfolio" : saving ? "Saving…" : "Save to Portfolio"}
+              {saved ? "✓ Saved" : saving ? "Saving…" : isMobile ? "+ Portfolio" : "Save to Portfolio"}
             </button>
           </div>
           <iframe
@@ -131,6 +137,11 @@ const styles = {
     display: "flex", justifyContent: "space-between",
     alignItems: "flex-start", padding: "14px 18px", background: "#f8f9fa",
     borderBottom: "1px solid #e0e0e0", gap: 12,
+  },
+  resultHeaderMobile: {
+    display: "flex", justifyContent: "space-between", alignItems: "center",
+    padding: "10px 12px", background: "#f8f9fa",
+    borderBottom: "1px solid #e0e0e0", gap: 10,
   },
   meta: { fontSize: 13, color: "#666", marginTop: 4 },
   saveBtn: {

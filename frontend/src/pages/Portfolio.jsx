@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef } from "react";
 import { api } from "../api";
 import PrintBar from "../PrintBar";
+import { useIsMobile } from "../useIsMobile";
 
 /** Inline confirmation modal — replaces browser confirm() */
 function ConfirmModal({ patent, onConfirm, onCancel }) {
@@ -69,6 +70,7 @@ const STATUS_LEGEND = [
 ];
 
 export default function Portfolio() {
+  const isMobile = useIsMobile();
   const [patents, setPatents]             = useState([]);
   const [loading, setLoading]             = useState(true);
   const [error,   setError]               = useState("");
@@ -171,7 +173,7 @@ export default function Portfolio() {
   }
 
   return (
-    <div style={styles.page}>
+    <div style={{ ...styles.page, padding: isMobile ? "1rem" : "2rem" }}>
       {confirmTarget && (
         <ConfirmModal
           patent={confirmTarget.patentNumber}
@@ -200,7 +202,7 @@ export default function Portfolio() {
         </div>
       )}
 
-      <div style={styles.grid}>
+      <div style={{ ...styles.grid, gridTemplateColumns: isMobile ? "1fr" : "repeat(auto-fill, minmax(300px, 1fr))" }}>
         {patents.map((p) => {
           const family = p.family || [];
           const countryMap = new Map();
