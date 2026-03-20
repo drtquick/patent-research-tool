@@ -19,7 +19,7 @@ export default function Navbar() {
     <nav style={styles.nav}>
       <div style={styles.brand}>
         PatentQ
-        <span style={styles.version}>β 0.1</span>
+        <span style={styles.version}>β 0.2</span>
       </div>
 
       <form onSubmit={handleSearch} style={styles.searchForm}>

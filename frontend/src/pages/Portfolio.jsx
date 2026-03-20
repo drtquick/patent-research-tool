@@ -2,6 +2,42 @@ import { useEffect, useState, useRef } from "react";
 import { api } from "../api";
 import PrintBar from "../PrintBar";
 
+/** Inline confirmation modal — replaces browser confirm() */
+function ConfirmModal({ patent, onConfirm, onCancel }) {
+  return (
+    <div style={modal.overlay}>
+      <div style={modal.box}>
+        <div style={modal.icon}>🗑️</div>
+        <h3 style={modal.title}>Remove from Portfolio?</h3>
+        <p style={modal.body}>
+          This will remove <strong>{patent}</strong> and all its saved data
+          from your portfolio. This cannot be undone.
+        </p>
+        <div style={modal.actions}>
+          <button style={modal.cancelBtn} onClick={onCancel}>Keep it</button>
+          <button style={modal.confirmBtn} onClick={onConfirm}>Yes, remove</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const modal = {
+  overlay:    { position: "fixed", inset: 0, background: "rgba(0,0,0,.45)",
+    display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 },
+  box:        { background: "#fff", borderRadius: 14, padding: "2rem",
+    maxWidth: 400, width: "90%", boxShadow: "0 20px 60px rgba(0,0,0,.25)",
+    textAlign: "center" },
+  icon:       { fontSize: 40, marginBottom: 12 },
+  title:      { margin: "0 0 10px", fontSize: 18, color: "#1a1a2e" },
+  body:       { margin: "0 0 24px", fontSize: 14, color: "#555", lineHeight: 1.6 },
+  actions:    { display: "flex", gap: 12, justifyContent: "center" },
+  cancelBtn:  { padding: "10px 24px", borderRadius: 8, border: "1px solid #d0d7de",
+    background: "#fff", cursor: "pointer", fontSize: 14, fontWeight: 600, color: "#444" },
+  confirmBtn: { padding: "10px 24px", borderRadius: 8, border: "none",
+    background: "#d32f2f", color: "#fff", cursor: "pointer", fontSize: 14, fontWeight: 700 },
+};
+
 const STATUS_COLORS = {
   granted:   "#2e7d32",
   pending:   "#f57c00",
@@ -39,6 +75,7 @@ export default function Portfolio() {
   const [viewing, setViewing]             = useState(null);
   const [viewLoading, setViewLoading]     = useState(false);
   const [viewingNumber, setViewingNumber] = useState(null);
+  const [confirmTarget, setConfirmTarget] = useState(null); // { id, patent_number }
   const iframeRef                         = useRef(null);
 
   useEffect(() => { fetchPortfolio(); }, []);
@@ -69,8 +106,14 @@ export default function Portfolio() {
     }
   }
 
-  async function handleDelete(id, patentNumber) {
-    if (!confirm("Remove this patent from your portfolio?")) return;
+  function handleDelete(id, patentNumber) {
+    // Show styled in-page modal instead of browser confirm()
+    setConfirmTarget({ id, patentNumber });
+  }
+
+  async function confirmDelete() {
+    const { id, patentNumber } = confirmTarget;
+    setConfirmTarget(null);
     try {
       await api.deletePortfolio(id);
       setPatents((prev) => prev.filter((p) => p.id !== id));
@@ -98,6 +141,13 @@ export default function Portfolio() {
   if (viewing) {
     return (
       <div style={styles.page}>
+        {confirmTarget && (
+          <ConfirmModal
+            patent={confirmTarget.patentNumber}
+            onConfirm={confirmDelete}
+            onCancel={() => setConfirmTarget(null)}
+          />
+        )}
         <div style={styles.dashHeader}>
           <button
             style={styles.backBtn}
@@ -122,6 +172,13 @@ export default function Portfolio() {
 
   return (
     <div style={styles.page}>
+      {confirmTarget && (
+        <ConfirmModal
+          patent={confirmTarget.patentNumber}
+          onConfirm={confirmDelete}
+          onCancel={() => setConfirmTarget(null)}
+        />
+      )}
       <h2 style={styles.heading}>My Portfolio</h2>
 
       {/* Status color legend */}

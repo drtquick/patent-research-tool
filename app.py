@@ -95,15 +95,43 @@ def _run_search(patent_input: str) -> dict:
     import requests as _req
 
     url = tracker.build_url(patent_input)
-    try:
-        html = tracker.fetch_page(url)
-    except _req.HTTPError as exc:
-        if exc.response.status_code == 404:
-            alt = url.replace("B2/en", "B1/en")
-            html = tracker.fetch_page(alt)
-            url  = alt
-        else:
+    html = None
+    last_exc = None
+    # Try the primary URL first, then progressively softer kind-code fallbacks.
+    # All candidates are tried inside one unified try/except so no uncaught
+    # HTTPError can leak out as a raw "404 Client Error" string.
+    candidates = [url]
+    if "B2/en" in url:
+        candidates += [
+            url.replace("B2/en", "B1/en"),   # older-style grant
+            url.replace("B2/en", "A1/en"),   # published application
+            url.replace("B2/en", "A2/en"),   # PCT published application
+        ]
+    elif "B1/en" in url:
+        candidates += [url.replace("B1/en", "B2/en")]
+    # Always include the bare-number URL (no kind code) as a last resort
+    bare = f"https://patents.google.com/patent/{tracker.normalize(patent_input)}/en"
+    if bare not in candidates:
+        candidates.append(bare)
+
+    for candidate in candidates:
+        try:
+            html = tracker.fetch_page(candidate)
+            url  = candidate
+            break
+        except _req.HTTPError as exc:
+            last_exc = exc
+            if exc.response.status_code != 404:
+                raise   # non-404 errors propagate immediately
+            # 404 → try next candidate
+        except Exception:
             raise
+
+    if html is None:
+        raise ValueError(
+            f"Patent '{patent_input}' was not found on Google Patents. "
+            "Please verify the patent number format and try again."
+        )
 
     metas  = tracker.get_metas(html)
     family = tracker.parse_family(html)
