@@ -22,7 +22,6 @@ export default function Navbar() {
         <span style={styles.version}>β 0.1</span>
       </div>
 
-      {/* Inline search bar */}
       <form onSubmit={handleSearch} style={styles.searchForm}>
         <input
           style={styles.searchInput}
@@ -35,10 +34,11 @@ export default function Navbar() {
       </form>
 
       <div style={styles.links}>
-        <NavLink to="/search" style={navStyle}>Search</NavLink>
         <NavLink to="/portfolio" style={navStyle}>Portfolio</NavLink>
-        <NavLink to="/alerts" style={navStyle}>Alerts</NavLink>
+        <NavLink to="/alerts"    style={navStyle}>Alerts</NavLink>
+        <NavLink to="/settings"  style={navStyle}>Settings</NavLink>
       </div>
+
       <div style={styles.user}>
         <span style={styles.email}>{user?.email}</span>
         <button style={styles.logoutBtn} onClick={logout}>Sign out</button>
@@ -77,14 +77,11 @@ const styles = {
     background: "rgba(255,255,255,.12)", borderRadius: 4,
     padding: "1px 5px", letterSpacing: "0.03em",
   },
-  searchForm: {
-    display: "flex", gap: 6, flex: 1, maxWidth: 380, minWidth: 180,
-  },
+  searchForm: { display: "flex", gap: 6, flex: 1, maxWidth: 380, minWidth: 180 },
   searchInput: {
     flex: 1, padding: "6px 12px", borderRadius: 7,
     border: "1px solid rgba(255,255,255,.25)", background: "rgba(255,255,255,.1)",
     color: "#fff", fontSize: 14, outline: "none",
-    "::placeholder": { color: "rgba(255,255,255,.5)" },
   },
   searchBtn: {
     padding: "6px 14px", borderRadius: 7, background: "#1a73e8",
@@ -92,7 +89,7 @@ const styles = {
     fontWeight: 600, whiteSpace: "nowrap",
   },
   links: { display: "flex", gap: 22, flexShrink: 0 },
-  user: { display: "flex", alignItems: "center", gap: 10, marginLeft: "auto", flexShrink: 0 },
+  user:  { display: "flex", alignItems: "center", gap: 10, marginLeft: "auto", flexShrink: 0 },
   email: {
     color: "rgba(255,255,255,.6)", fontSize: 12,
     maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",

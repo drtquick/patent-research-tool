@@ -2,11 +2,11 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 
 const URGENCY = (daysLeft) => {
-  if (daysLeft < 0) return { color: "#c62828", label: "OVERDUE" };
+  if (daysLeft < 0)   return { color: "#c62828", label: "OVERDUE" };
   if (daysLeft <= 30) return { color: "#d32f2f", label: `${daysLeft}d` };
   if (daysLeft <= 60) return { color: "#f57c00", label: `${daysLeft}d` };
   if (daysLeft <= 90) return { color: "#f9a825", label: `${daysLeft}d` };
-  return { color: "#388e3c", label: `${daysLeft}d` };
+  return               { color: "#388e3c", label: `${daysLeft}d` };
 };
 
 function daysUntil(iso) {
@@ -15,11 +15,26 @@ function daysUntil(iso) {
   return Math.ceil(diff / (1000 * 60 * 60 * 24));
 }
 
+/** Group an array of alert objects by patent_number, preserving date sort within each group. */
+function groupByFamily(alerts) {
+  const order = [];
+  const map = {};
+  for (const a of alerts) {
+    const key = a.patent_number || "—";
+    if (!map[key]) {
+      map[key] = { patent_number: key, title: a.title || "", rows: [] };
+      order.push(key);
+    }
+    map[key].rows.push(a);
+  }
+  return order.map((k) => map[k]);
+}
+
 export default function Alerts() {
-  const [alerts, setAlerts] = useState([]);
+  const [alerts,  setAlerts]  = useState([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-  const [filter, setFilter] = useState(90);
+  const [error,   setError]   = useState("");
+  const [filter,  setFilter]  = useState(90);
 
   useEffect(() => { fetchAlerts(); }, [filter]);
 
@@ -34,6 +49,9 @@ export default function Alerts() {
       setLoading(false);
     }
   }
+
+  const families = groupByFamily(alerts);
+  const totalFees = alerts.reduce((s, a) => s + (a.amount_usd || 0), 0);
 
   return (
     <div style={styles.page}>
@@ -54,7 +72,7 @@ export default function Alerts() {
       </div>
 
       {loading && <p style={{ color: "#666" }}>Loading deadlines…</p>}
-      {error && <div style={styles.error}>{error}</div>}
+      {error   && <div style={styles.error}>{error}</div>}
 
       {!loading && alerts.length === 0 && (
         <div style={styles.empty}>
@@ -62,69 +80,71 @@ export default function Alerts() {
         </div>
       )}
 
-      <div style={styles.tableWrap}>
-        {alerts.length > 0 && (
-          <table style={styles.table}>
-            <thead>
-              <tr style={styles.thead}>
-                <th style={styles.th}>Due</th>
-                <th style={styles.th}>Days</th>
-                <th style={styles.th}>Patent</th>
-                <th style={styles.th}>Country</th>
-                <th style={styles.th}>Type</th>
-                <th style={styles.th}>Fee (USD)</th>
-                <th style={styles.th}>Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              {alerts.map((a, i) => {
-                const days = daysUntil(a.due_date);
-                const urg = URGENCY(days ?? 999);
-                return (
-                  <tr key={i} style={i % 2 === 0 ? styles.trEven : styles.trOdd}>
-                    <td style={styles.td}>{a.due_date?.slice(0, 10) || "—"}</td>
-                    <td style={{ ...styles.td, color: urg.color, fontWeight: 700 }}>
-                      {urg.label}
-                    </td>
-                    <td style={styles.td}>
-                      <div style={{ fontWeight: 600 }}>{a.patent_number}</div>
-                      <div style={{ fontSize: 12, color: "#666", maxWidth: 220,
-                        overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {a.title}
-                      </div>
-                    </td>
-                    <td style={{ ...styles.td, fontWeight: 700 }}>{a.country}</td>
-                    <td style={styles.td}>{a.label}</td>
-                    <td style={styles.td}>
-                      {a.amount_usd != null ? `$${a.amount_usd.toLocaleString()}` : "—"}
-                      {a.amount_local != null && a.currency !== "USD" && (
-                        <div style={{ fontSize: 11, color: "#888" }}>
-                          {a.currency} {a.amount_local?.toLocaleString()}
-                        </div>
-                      )}
-                    </td>
-                    <td style={styles.td}>
-                      <span style={{
-                        ...styles.statusBadge,
-                        background: a.status === "current" ? "#fff3e0" : "#e8f5e9",
-                        color: a.status === "current" ? "#e65100" : "#2e7d32",
-                      }}>
-                        {a.status}
-                      </span>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        )}
-      </div>
+      {families.map((fam) => (
+        <div key={fam.patent_number} style={styles.familyBlock}>
+          {/* Family header */}
+          <div style={styles.familyHeader}>
+            <span style={styles.familyNum}>{fam.patent_number}</span>
+            <span style={styles.familyTitle}>{fam.title}</span>
+            <span style={styles.familyCount}>{fam.rows.length} deadline{fam.rows.length !== 1 ? "s" : ""}</span>
+          </div>
+
+          {/* Per-family table */}
+          <div style={styles.tableWrap}>
+            <table style={styles.table}>
+              <thead>
+                <tr style={styles.thead}>
+                  <th style={styles.th}>Due</th>
+                  <th style={styles.th}>Days</th>
+                  <th style={styles.th}>Country</th>
+                  <th style={styles.th}>Type</th>
+                  <th style={styles.th}>Fee (USD)</th>
+                  <th style={styles.th}>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {fam.rows.map((a, i) => {
+                  const days = daysUntil(a.due_date);
+                  const urg  = URGENCY(days ?? 999);
+                  return (
+                    <tr key={i} style={i % 2 === 0 ? styles.trEven : styles.trOdd}>
+                      <td style={styles.td}>{a.due_date?.slice(0, 10) || "—"}</td>
+                      <td style={{ ...styles.td, color: urg.color, fontWeight: 700 }}>
+                        {urg.label}
+                      </td>
+                      <td style={{ ...styles.td, fontWeight: 700 }}>{a.country}</td>
+                      <td style={styles.td}>{a.label}</td>
+                      <td style={styles.td}>
+                        {a.amount_usd != null ? `$${a.amount_usd.toLocaleString()}` : "—"}
+                        {a.amount_local != null && a.currency !== "USD" && (
+                          <div style={{ fontSize: 11, color: "#888" }}>
+                            {a.currency} {a.amount_local?.toLocaleString()}
+                          </div>
+                        )}
+                      </td>
+                      <td style={styles.td}>
+                        <span style={{
+                          ...styles.statusBadge,
+                          background: a.status === "current" ? "#fff3e0" : "#e8f5e9",
+                          color:      a.status === "current" ? "#e65100" : "#2e7d32",
+                        }}>
+                          {a.status}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ))}
 
       {alerts.length > 0 && (
         <div style={styles.summary}>
           <strong>Total fees due in next {filter} days: </strong>
-          ${alerts.reduce((s, a) => s + (a.amount_usd || 0), 0).toLocaleString()} USD
-          across {alerts.length} deadline{alerts.length !== 1 ? "s" : ""}
+          ${totalFees.toLocaleString()} USD across {alerts.length} deadline{alerts.length !== 1 ? "s" : ""}
+          {" "}across {families.length} patent famil{families.length !== 1 ? "ies" : "y"}
         </div>
       )}
     </div>
@@ -132,13 +152,13 @@ export default function Alerts() {
 }
 
 const styles = {
-  page: { padding: "2rem", maxWidth: 1100, margin: "0 auto" },
+  page:      { padding: "2rem", maxWidth: 1100, margin: "0 auto" },
   headerRow: { display: "flex", justifyContent: "space-between",
     alignItems: "center", flexWrap: "wrap", gap: 12, marginBottom: 8 },
-  heading: { marginTop: 0, color: "#1a1a2e" },
-  filterGroup: { display: "flex", alignItems: "center", gap: 6 },
-  filterLabel: { fontSize: 13, color: "#666", marginRight: 4 },
-  filterBtn: { padding: "4px 12px", borderRadius: 16, border: "1px solid #d0d7de",
+  heading:   { marginTop: 0, color: "#1a1a2e" },
+  filterGroup:  { display: "flex", alignItems: "center", gap: 6 },
+  filterLabel:  { fontSize: 13, color: "#666", marginRight: 4 },
+  filterBtn:    { padding: "4px 12px", borderRadius: 16, border: "1px solid #d0d7de",
     background: "#fff", cursor: "pointer", fontSize: 13 },
   filterActive: { padding: "4px 12px", borderRadius: 16, border: "none",
     background: "#1a73e8", color: "#fff", cursor: "pointer", fontSize: 13, fontWeight: 700 },
@@ -146,15 +166,23 @@ const styles = {
     color: "#d32f2f", marginBottom: 16 },
   empty: { padding: "2rem", textAlign: "center", color: "#888",
     background: "#f8f9fa", borderRadius: 10, border: "1px dashed #ddd" },
-  tableWrap: { overflowX: "auto" },
-  table: { width: "100%", borderCollapse: "collapse", fontSize: 14 },
-  thead: { background: "#1a1a2e", color: "#fff" },
-  th: { padding: "10px 14px", textAlign: "left", fontWeight: 600,
-    whiteSpace: "nowrap" },
-  td: { padding: "10px 14px", verticalAlign: "middle" },
-  trEven: { background: "#fff" },
-  trOdd: { background: "#f8f9fa" },
+  familyBlock:  { marginBottom: 24, border: "1px solid #e0e0e0",
+    borderRadius: 10, overflow: "hidden", boxShadow: "0 1px 4px rgba(0,0,0,.05)" },
+  familyHeader: { display: "flex", alignItems: "center", gap: 12,
+    padding: "10px 16px", background: "#1a1a2e" },
+  familyNum:    { fontWeight: 800, color: "#7ecbff", fontSize: 15, whiteSpace: "nowrap" },
+  familyTitle:  { flex: 1, color: "rgba(255,255,255,.75)", fontSize: 13,
+    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  familyCount:  { color: "rgba(255,255,255,.5)", fontSize: 12, whiteSpace: "nowrap" },
+  tableWrap:  { overflowX: "auto" },
+  table:      { width: "100%", borderCollapse: "collapse", fontSize: 14 },
+  thead:      { background: "#f0f4f8" },
+  th:         { padding: "8px 14px", textAlign: "left", fontWeight: 600,
+    whiteSpace: "nowrap", color: "#1a1a2e", borderBottom: "1px solid #e0e0e0" },
+  td:         { padding: "10px 14px", verticalAlign: "middle" },
+  trEven:     { background: "#fff" },
+  trOdd:      { background: "#f8f9fa" },
   statusBadge: { padding: "2px 8px", borderRadius: 10, fontSize: 12, fontWeight: 600 },
-  summary: { marginTop: 16, padding: "12px 16px", background: "#e3f2fd",
+  summary:    { marginTop: 16, padding: "12px 16px", background: "#e3f2fd",
     borderRadius: 8, color: "#1565c0", fontSize: 14 },
 };

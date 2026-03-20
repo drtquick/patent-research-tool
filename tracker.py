@@ -404,15 +404,55 @@ def save_and_open_html(html: str, number: str) -> str:
 # ── Prosecution Dashboard ────────────────────────────────────────────────────
 
 COUNTRY_NAMES = {
-    "US": "United States", "WO": "Int'l (PCT)", "EP": "Europe (EPO)",
-    "CN": "China", "JP": "Japan", "KR": "South Korea", "AU": "Australia",
-    "CA": "Canada", "GB": "United Kingdom", "DE": "Germany", "FR": "France",
+    "US": "United States",  "WO": "Int'l (PCT)",    "EP": "Europe (EPO)",
+    "CN": "China",          "JP": "Japan",           "KR": "South Korea",
+    "AU": "Australia",      "CA": "Canada",          "GB": "United Kingdom",
+    "DE": "Germany",        "FR": "France",          "IT": "Italy",
+    "ES": "Spain",          "NL": "Netherlands",     "SE": "Sweden",
+    "CH": "Switzerland",    "BE": "Belgium",         "AT": "Austria",
+    "DK": "Denmark",        "FI": "Finland",         "NO": "Norway",
+    "PL": "Poland",         "PT": "Portugal",        "CZ": "Czechia",
+    "RO": "Romania",        "HU": "Hungary",         "IE": "Ireland",
+    "GR": "Greece",         "BG": "Bulgaria",        "SK": "Slovakia",
+    "HR": "Croatia",        "SI": "Slovenia",        "LT": "Lithuania",
+    "LV": "Latvia",         "EE": "Estonia",         "LU": "Luxembourg",
+    "MT": "Malta",          "CY": "Cyprus",          "IS": "Iceland",
+    "LI": "Liechtenstein",  "MC": "Monaco",          "SM": "San Marino",
+    "TR": "Türkiye",        "AL": "Albania",         "RS": "Serbia",
+    "ME": "Montenegro",     "MK": "N. Macedonia",
+    "IN": "India",          "BR": "Brazil",          "MX": "Mexico",
+    "RU": "Russia",         "ZA": "South Africa",    "IL": "Israel",
+    "SG": "Singapore",      "MY": "Malaysia",        "TW": "Taiwan",
+    "NZ": "New Zealand",    "AR": "Argentina",       "CL": "Chile",
+    "CO": "Colombia",       "EG": "Egypt",           "MA": "Morocco",
+    "SA": "Saudi Arabia",   "AE": "UAE",             "UA": "Ukraine",
 }
 COUNTRY_FLAGS = {
-    "US": "🇺🇸", "WO": "🌍", "EP": "🇪🇺", "CN": "🇨🇳",
-    "JP": "🇯🇵", "KR": "🇰🇷", "AU": "🇦🇺", "CA": "🇨🇦",
-    "GB": "🇬🇧", "DE": "🇩🇪", "FR": "🇫🇷",
+    "US": "🇺🇸", "WO": "🌍", "EP": "🇪🇺", "CN": "🇨🇳", "JP": "🇯🇵",
+    "KR": "🇰🇷", "AU": "🇦🇺", "CA": "🇨🇦", "GB": "🇬🇧", "DE": "🇩🇪",
+    "FR": "🇫🇷", "IT": "🇮🇹", "ES": "🇪🇸", "NL": "🇳🇱", "SE": "🇸🇪",
+    "CH": "🇨🇭", "BE": "🇧🇪", "AT": "🇦🇹", "DK": "🇩🇰", "FI": "🇫🇮",
+    "NO": "🇳🇴", "PL": "🇵🇱", "PT": "🇵🇹", "CZ": "🇨🇿", "RO": "🇷🇴",
+    "HU": "🇭🇺", "IE": "🇮🇪", "GR": "🇬🇷", "BG": "🇧🇬", "SK": "🇸🇰",
+    "HR": "🇭🇷", "SI": "🇸🇮", "LT": "🇱🇹", "LV": "🇱🇻", "EE": "🇪🇪",
+    "LU": "🇱🇺", "MT": "🇲🇹", "CY": "🇨🇾", "IS": "🇮🇸", "LI": "🇱🇮",
+    "MC": "🇲🇨", "TR": "🇹🇷", "IN": "🇮🇳", "BR": "🇧🇷", "MX": "🇲🇽",
+    "RU": "🇷🇺", "ZA": "🇿🇦", "IL": "🇮🇱", "SG": "🇸🇬", "MY": "🇲🇾",
+    "TW": "🇹🇼", "NZ": "🇳🇿", "AR": "🇦🇷", "CL": "🇨🇱", "CO": "🇨🇴",
+    "EG": "🇪🇬", "MA": "🇲🇦", "SA": "🇸🇦", "AE": "🇦🇪", "UA": "🇺🇦",
 }
+
+# EPO-designated European jurisdictions: the EP regional patent itself plus all
+# EPC full member states (38 countries, all geographically in Europe).
+# Any EPO INPADOC member whose country code is NOT in this set is treated as a
+# non-European filing and rendered as a first-class tile in the main dashboard.
+_EUROPEAN_COUNTRY_CODES: frozenset[str] = frozenset({
+    "EP",
+    "AL", "AT", "BE", "BG", "CH", "CY", "CZ", "DE", "DK", "EE",
+    "ES", "FI", "FR", "GB", "GR", "HR", "HU", "IE", "IS", "IT",
+    "LI", "LT", "LU", "LV", "MC", "ME", "MK", "MT", "NL", "NO",
+    "PL", "PT", "RO", "RS", "SE", "SI", "SK", "SM", "TR",
+})
 STATUS_META = {
     "granted":   {"label": "Granted",   "bg": "#d1fae5", "fg": "#065f46", "border": "#34d399"},
     "pending":   {"label": "Pending",   "bg": "#dbeafe", "fg": "#1e40af", "border": "#60a5fa"},
@@ -1122,6 +1162,27 @@ def _epo_member_status(kind: str) -> str:
     if kind.startswith("A"):
         return "pending"
     return "unknown"
+
+
+def _epo_to_family_member(em: dict) -> dict:
+    """
+    Convert an EPO INPADOC member dict (from parse_epo_family) to the
+    family_details format expected by _render_card and generate_dashboard_html.
+    Used to promote non-European EPO members into first-class dashboard tiles.
+    """
+    status = _epo_member_status(em["kind"])
+    return {
+        "pub_num":      em["pub_num"],
+        "app_num":      em.get("app_num", ""),
+        "status":       status,
+        "filing_date":  em.get("app_date", ""),
+        "grant_date":   em.get("pub_date", "") if status == "granted" else "",
+        "date":         em.get("pub_date", "") or em.get("app_date", ""),
+        "title":        "",
+        "abstract":     "",
+        "events":       [],
+        "backward_refs": [],
+    }
 
 
 def _render_epo_section(
@@ -1964,6 +2025,20 @@ def generate_dashboard_html(
     by_country: dict[str, list] = {}
     for m in family_details:
         by_country.setdefault(country_code(m["pub_num"]), []).append(m)
+
+    # ── Split EPO-only members into European (stay in EPO section) vs non-European
+    #    (promoted to first-class tiles in the main status-grouped sections).
+    if epo_only:
+        epo_european     = [em for em in epo_only if em["country"] in _EUROPEAN_COUNTRY_CODES]
+        epo_non_european = [em for em in epo_only if em["country"] not in _EUROPEAN_COUNTRY_CODES]
+        # Promote non-European EPO members — convert to family_details format
+        existing_countries = {country_code(m["pub_num"]) for m in family_details}
+        for em in epo_non_european:
+            if em["country"] not in existing_countries:
+                family_details = list(family_details) + [_epo_to_family_member(em)]
+                existing_countries.add(em["country"])
+        # Only pass European members to the EPO section renderer
+        epo_only = epo_european if epo_european else None
 
     # Portfolio fee schedule (rendered at bottom)
     portfolio_html = _render_portfolio_summary(calc_portfolio_schedule(family_details))
