@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
-# Deploy Flask backend to Cloud Run.
-# Run once after enabling billing: bash deploy.sh
+# Deploy Flask backend to Cloud Run (taskq-80ce7 project — billing already enabled).
+# Frontend stays on Firebase Hosting under patent-research-tool.
 set -euo pipefail
 
-PROJECT="patent-research-tool"
+PROJECT="taskq-80ce7"
 REGION="us-central1"
 SERVICE="patent-api"
 IMAGE="gcr.io/${PROJECT}/${SERVICE}"
 
-echo "==> Building and pushing Docker image..."
+echo "==> Building and pushing Docker image to ${IMAGE}..."
 gcloud builds submit \
   --tag "${IMAGE}" \
   --project "${PROJECT}" \
   .
 
 echo "==> Reading service account JSON..."
-SA_JSON=$(cat firebase-service-account.json | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin)))")
+SA_JSON=$(python3 -c "import json,sys; print(json.dumps(json.load(open('firebase-service-account.json'))))")
 
-echo "==> Deploying to Cloud Run..."
+echo "==> Deploying ${SERVICE} to Cloud Run (${REGION})..."
 gcloud run deploy "${SERVICE}" \
   --image "${IMAGE}" \
   --platform managed \
@@ -27,13 +27,13 @@ gcloud run deploy "${SERVICE}" \
   --memory 1Gi \
   --timeout 300 \
   --set-env-vars "FIREBASE_SERVICE_ACCOUNT_JSON=${SA_JSON}" \
-  --set-env-vars "EPO_CONSUMER_KEY=$(grep EPO_CONSUMER_KEY .env | cut -d= -f2)" \
-  --set-env-vars "EPO_CONSUMER_SECRET=$(grep EPO_CONSUMER_SECRET .env | cut -d= -f2)" \
-  --set-env-vars "DEEPL_API_KEY=$(grep DEEPL_API_KEY .env | cut -d= -f2)" \
+  --set-env-vars "EPO_CONSUMER_KEY=$(grep ^EPO_CONSUMER_KEY .env | cut -d= -f2-)" \
+  --set-env-vars "EPO_CONSUMER_SECRET=$(grep ^EPO_CONSUMER_SECRET .env | cut -d= -f2-)" \
+  --set-env-vars "DEEPL_API_KEY=$(grep ^DEEPL_API_KEY .env | cut -d= -f2-)" \
   --set-env-vars "FLASK_DEBUG=false"
 
 echo ""
-echo "==> Deploy complete. Service URL:"
+echo "==> Service URL:"
 gcloud run services describe "${SERVICE}" \
   --region "${REGION}" \
   --project "${PROJECT}" \

@@ -1,6 +1,9 @@
-# Environment variables
+# Environment variables (local secrets only)
 .env
-.env.*
+.env.local
+.env.*.local
+# Production env files are safe to commit (they only contain public URLs)
+# .env.production is intentionally NOT ignored
 
 # Firebase service account (private key — never commit)
 firebase-service-account.json
