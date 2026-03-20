@@ -795,13 +795,12 @@ def _render_rejection_summary(summary: dict) -> str:
         oa_rows += (
             f'<tr>'
             f'<td class="rej-date">{ev["date"]}</td>'
-            f'<td><span class="rej-code">{ev.get("code","")}</span></td>'
             f'<td>{ev.get("label") or ev.get("title") or ev.get("value", "")}</td>'
             f'</tr>'
         )
     oa_table = (
         f'<table class="rej-table">'
-        f'<thead><tr><th>Date</th><th>Code</th><th>Event</th></tr></thead>'
+        f'<thead><tr><th>Date</th><th>Event</th></tr></thead>'
         f'<tbody>{oa_rows}</tbody>'
         f'</table>'
     ) if oa_rows else '<p class="rej-none">No office action events found in page source.</p>'
@@ -1680,13 +1679,56 @@ def _status_badge(status: str) -> str:
     )
 
 
+def _pending_app_status(m: dict) -> str:
+    """
+    For pending applications, return a human-readable status string showing
+    the current prosecution status and upcoming response deadline.
+    E.g. "Response to Non-Final Office Action due April 15, 2026"
+    """
+    from datetime import date as _dt
+    events = m.get("events", [])
+    if not events:
+        return ""
+    last_ev   = events[-1]
+    ev_title  = (last_ev.get("title") or last_ev.get("value") or "").upper()
+    date_str  = last_ev.get("date", "")
+
+    _OA_DEADLINES: dict[str, tuple[str, int]] = {
+        "NON FINAL ACTION MAILED":        ("Response to Non-Final Office Action", 3),
+        "NON-FINAL ACTION MAILED":        ("Response to Non-Final Office Action", 3),
+        "FINAL ACTION MAILED":            ("Response to Final Office Action", 2),
+        "FINAL REJECTION MAILED":         ("Response to Final Rejection", 2),
+        "RESTRICTION REQUIREMENT MAILED": ("Response to Restriction Requirement", 2),
+        "NOTICE OF ALLOWANCE MAILED":     ("Issue fee payment", 3),
+        "NOTICE OF ALLOWANCE":            ("Issue fee payment", 3),
+    }
+    for key, (label, months) in _OA_DEADLINES.items():
+        if key in ev_title:
+            if date_str:
+                try:
+                    oa_date   = _dt.fromisoformat(date_str)
+                    due_month = oa_date.month + months
+                    due_year  = oa_date.year + (due_month - 1) // 12
+                    due_month = ((due_month - 1) % 12) + 1
+                    due_date  = oa_date.replace(year=due_year, month=due_month)
+                    due_str   = due_date.strftime("%B %-d, %Y")
+                    return f"{label} due {due_str}"
+                except (ValueError, TypeError, OverflowError):
+                    pass
+            return label
+    # Fall back to human-readable last event label
+    label = _classify_oa_event(last_ev.get("value", ""), last_ev.get("title", ""))
+    return label or ""
+
+
 def _render_card(m: dict) -> str:
     code   = country_code(m["pub_num"])
     status = m.get("status", "unknown")
     border = STATUS_META.get(status, STATUS_META["unknown"])["border"]
     href    = m.get("href", "")
     app_num = m.get("app_num", "").strip()
-    display = app_num if app_num else m["pub_num"]
+    # Granted patents → show patent publication number; pending/other → show application number
+    display = m["pub_num"] if status == "granted" else (app_num if app_num else m["pub_num"])
     pnum    = (
         f'<a href="{href}" target="_blank">{display}</a>'
         if href else display
@@ -1694,12 +1736,21 @@ def _render_card(m: dict) -> str:
     title = (m.get("member_title") or m.get("title") or "").strip()
     filing = m.get("filing_date") or m.get("date") or "—"
     grant  = m.get("grant_date", "")
+    flag  = COUNTRY_FLAGS.get(code, "")
+    cname = COUNTRY_NAMES.get(code, code)
 
     # Dates row — label second date as "Granted" only when actually granted
     date_items = f'<span>Filed: <b>{filing}</b></span>'
     if grant:
         second_label = "Granted" if status == "granted" else "Published"
         date_items += f'<span>{second_label}: <b>{grant}</b></span>'
+
+    # Pending application status banner
+    pending_status_html = ""
+    if status in ("pending", "unknown"):
+        ps = _pending_app_status(m)
+        if ps:
+            pending_status_html = f'<div class="pending-status">&#128203; {ps}</div>'
 
     # Maintenance fees (granted patents only)
     maint_html = ""
@@ -1812,13 +1863,35 @@ def _render_card(m: dict) -> str:
             f'</div>'
         )
 
+    # Build rejection grounds lookup for annotating rejection events in history
+    grounds_lookup: dict[str, str] = {}
+    for r in m.get("rejections", []):
+        sm    = re.search(r'(\d+)\(([a-z])\)', r, re.IGNORECASE)
+        sec_m = re.search(r'(\d+)', r)
+        sec   = sec_m.group(1) if sec_m else ""
+        sub   = sm.group(2).lower() if sm else ""
+        key   = f"{sec}{sub}" if sub else sec
+        info  = _REJECTION_GROUNDS.get(key) or _REJECTION_GROUNDS.get(sec)
+        if info and key not in grounds_lookup:
+            grounds_lookup[key] = info["title"]
+
+    def _ev_desc(e: dict) -> str:
+        raw_title = e.get("title", "")
+        label     = _classify_oa_event(e.get("value", ""), raw_title)
+        desc      = label or raw_title
+        if grounds_lookup and label and (
+            "rejection" in label.lower() or "action" in label.lower()
+        ):
+            grounds_str = "; ".join(grounds_lookup.values())
+            desc = f'{desc} <span class="ev-grounds">({grounds_str})</span>'
+        return desc
+
     # Collapsible prosecution history
     if events:
         rows = "".join(
             f'<tr>'
-            f'<td>{e.get("date","")}</td>'
-            f'<td><code>{e.get("code","")}</code></td>'
-            f'<td>{e.get("title","")}</td>'
+            f'<td class="ev-date-col">{e.get("date","")}</td>'
+            f'<td>{_ev_desc(e)}</td>'
             f'</tr>'
             for e in events
         )
@@ -1826,7 +1899,7 @@ def _render_card(m: dict) -> str:
             f'<details class="history">'
             f'<summary>Prosecution history <span class="ev-count">{len(events)} events</span></summary>'
             f'<table class="hist-table">'
-            f'<thead><tr><th>Date</th><th>Code</th><th>Event</th></tr></thead>'
+            f'<thead><tr><th>Date</th><th>Event</th></tr></thead>'
             f'<tbody>{rows}</tbody>'
             f'</table>'
             f'</details>'
@@ -1850,11 +1923,15 @@ def _render_card(m: dict) -> str:
         f'<div class="card" style="border-top:4px solid {border}">'
         f'  <div class="card-head">'
         f'    <span class="card-pnum">{pnum}</span>'
-        f'    {_status_badge(status)}'
+        f'    <div style="display:flex;align-items:center;gap:5px;flex-shrink:0">'
+        f'      <span class="card-country-chip">{flag} {cname}</span>'
+        f'      {_status_badge(status)}'
+        f'    </div>'
         f'  </div>'
         + (f'  <div class="card-title">{title}</div>' if title else '')
         + translated_html
         + f'  <div class="card-dates">{date_items}</div>'
+        + pending_status_html
         + maint_html + annuity_html + latest_html + rej_html + rej_summary_html + err_html + history_html
         + '</div>'
     )
@@ -1883,17 +1960,12 @@ def generate_dashboard_html(
         or any(kw in c for kw in ("LLC", "Inc", "Corp", "Ltd", "Company", "Institute", "University"))
     ]
 
-    # Group by country, sorted by preference
+    # Group by country (for jurisdictions count in stats bar)
     by_country: dict[str, list] = {}
     for m in family_details:
         by_country.setdefault(country_code(m["pub_num"]), []).append(m)
 
-    sorted_codes = sorted(
-        by_country.keys(),
-        key=lambda c: (_PREFERRED_COUNTRIES.index(c) if c in _PREFERRED_COUNTRIES else 99, c)
-    )
-
-    # Portfolio fee schedule
+    # Portfolio fee schedule (rendered at bottom)
     portfolio_html = _render_portfolio_summary(calc_portfolio_schedule(family_details))
 
     # Summary counts
@@ -1901,16 +1973,31 @@ def generate_dashboard_html(
     pending = sum(1 for m in family_details if m["status"] == "pending")
     other   = len(family_details) - granted - pending
 
-    # Country sections
+    # Status-grouped sections: Issued → Pending (oldest filing first) → Abandoned
+    granted_members   = sorted(
+        [m for m in family_details if m.get("status") == "granted"],
+        key=lambda m: m.get("grant_date") or m.get("filing_date") or m.get("date") or "",
+    )
+    pending_members   = sorted(
+        [m for m in family_details if m.get("status") in ("pending", "unknown")],
+        key=lambda m: m.get("filing_date") or m.get("date") or "",
+    )
+    abandoned_members = sorted(
+        [m for m in family_details if m.get("status") in ("abandoned", "expired", "rejected")],
+        key=lambda m: m.get("filing_date") or m.get("date") or "",
+    )
     country_html = ""
-    for code in sorted_codes:
-        members = sorted(by_country[code], key=lambda m: m.get("date") or "")
-        flag  = COUNTRY_FLAGS.get(code, "")
-        cname = COUNTRY_NAMES.get(code, code)
+    for group_label, members, icon in [
+        ("Issued Patents",       granted_members,   "✅"),
+        ("Pending Applications", pending_members,   "🔄"),
+        ("Abandoned / Lapsed",   abandoned_members, "❌"),
+    ]:
+        if not members:
+            continue
         cards = "".join(_render_card(m) for m in members)
         country_html += (
             f'<section class="country-section">'
-            f'  <h2 class="country-h">{flag} {cname}'
+            f'  <h2 class="country-h">{icon} {group_label}'
             f'    <span class="country-count">{len(members)}</span>'
             f'  </h2>'
             f'  <div class="cards-grid">{cards}</div>'
@@ -1978,11 +2065,11 @@ def generate_dashboard_html(
                 '</div>'
             )
         abstract_section_html = (
-            '<section class="info-section">'
-            '<h2 class="section-h">Abstract</h2>'
+            '<details class="info-section abstract-details" open>'
+            '<summary class="section-h abstract-summary">&#128196; Abstract</summary>'
             f'<div class="abstract">{abstract}</div>'
             f'{tr_abstract_html}'
-            '</section>'
+            '</details>'
         )
     else:
         abstract_section_html = ""
@@ -2253,6 +2340,66 @@ def generate_dashboard_html(
     .fetch-error {{ font-size: .75rem; color: #b45309; background: #fef3c7;
                     border-radius: 4px; padding: .3rem .6rem; }}
 
+    /* ── Country chip on each card ── */
+    .card-country-chip {{
+      font-size: .68rem; font-weight: 700; background: #f1f5f9;
+      color: #475569; border-radius: 4px; padding: .1rem .4rem;
+      white-space: nowrap;
+    }}
+
+    /* ── Pending application status ── */
+    .pending-status {{
+      font-size: .78rem; font-weight: 600; color: #1e40af;
+      background: #eff6ff; border: 1px solid #bfdbfe;
+      border-radius: 6px; padding: .3rem .65rem;
+    }}
+
+    /* ── Rejection grounds annotation in history table ── */
+    .ev-grounds {{
+      font-size: .72rem; color: #6b7280; font-style: italic;
+    }}
+    .ev-date-col {{ white-space: nowrap; color: #6b7280; }}
+
+    /* ── Abstract collapsible ── */
+    .abstract-details {{ cursor: default; }}
+    .abstract-summary {{
+      cursor: pointer; list-style: none; user-select: none;
+      display: flex; align-items: center; gap: .5rem;
+    }}
+    .abstract-summary::-webkit-details-marker {{ display: none; }}
+    .abstract-summary::after {{
+      content: "▲"; font-size: .6rem; margin-left: auto; color: #9ca3af;
+      transition: transform .15s;
+    }}
+    details.abstract-details:not([open]) .abstract-summary::after {{
+      content: "▼";
+    }}
+
+    /* ── Print report bar ── */
+    .print-bar {{
+      display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+      background: #fff; border-radius: 10px; padding: .7rem 1.25rem;
+      margin-bottom: 1.25rem; box-shadow: 0 1px 3px rgba(0,0,0,.07);
+      font-size: .85rem; color: #374151;
+    }}
+    .print-bar-label {{
+      font-weight: 700; font-size: .8rem; color: #0f172a; margin-right: 4px;
+    }}
+    .print-bar label {{ display: flex; align-items: center; gap: 5px; cursor: pointer; }}
+    .print-btn {{
+      margin-left: auto; padding: .45rem 1.1rem; border-radius: 7px;
+      background: #1a73e8; color: #fff; border: none; font-size: .85rem;
+      font-weight: 600; cursor: pointer;
+    }}
+    .print-btn:hover {{ background: #1558b0; }}
+
+    @media print {{
+      .no-print {{ display: none !important; }}
+      .print-hide {{ display: none !important; }}
+      body {{ background: #fff; padding: .5rem; }}
+      .card {{ break-inside: avoid; }}
+    }}
+
     .claim-block {{ margin-bottom: .9rem; padding-bottom: .9rem; border-bottom: 1px solid #f3f4f6; }}
     .claim-block:last-child {{ border-bottom: none; margin-bottom: 0; }}
     .claim-num {{
@@ -2431,7 +2578,14 @@ def generate_dashboard_html(
     </div>
   </div>
 
-  {portfolio_html}
+  <!-- Print report button -->
+  <div class="print-bar no-print" id="print-bar">
+    <span class="print-bar-label">&#128438; Print Report</span>
+    <label><input type="checkbox" id="pr-abstract" checked> Abstract</label>
+    <label><input type="checkbox" id="pr-claims" checked> Granted Claims</label>
+    <label><input type="checkbox" id="pr-fees" checked> Fee Schedule</label>
+    <button class="print-btn" onclick="printReport()">Print / Save PDF</button>
+  </div>
 
   {abstract_section_html}
 
@@ -2445,7 +2599,9 @@ def generate_dashboard_html(
 
   {prior_html}
 
-  <footer>Generated by patent-research-tool &mdash; {patent_input}</footer>
+  <div id="portfolio-fees-section">{portfolio_html}</div>
+
+  <footer>Generated by PatentQ &mdash; {patent_input}</footer>
 
 <script>
 // ── Live FX rates ──────────────────────────────────────────────────────────
@@ -2476,6 +2632,33 @@ def generate_dashboard_html(
       }}
     }}).catch(() => {{}});
 }})();
+
+// ── Print report ──────────────────────────────────────────────────────────
+function printReport() {{
+  const inclAbstract = document.getElementById('pr-abstract').checked;
+  const inclClaims   = document.getElementById('pr-claims').checked;
+  const inclFees     = document.getElementById('pr-fees').checked;
+
+  // Show/hide sections based on checkboxes before printing
+  const abstractEl = document.querySelector('.abstract-details');
+  const claimsEl   = document.querySelector('.claims-tab');
+  const feesEl     = document.getElementById('portfolio-fees-section');
+
+  if (abstractEl) abstractEl.classList.toggle('print-hide', !inclAbstract);
+  if (claimsEl)   claimsEl.classList.toggle('print-hide', !inclClaims);
+  if (feesEl)     feesEl.classList.toggle('print-hide', !inclFees);
+
+  // Ensure abstract is open for printing
+  if (abstractEl && inclAbstract) abstractEl.open = true;
+  if (claimsEl   && inclClaims)   claimsEl.open   = true;
+
+  window.print();
+
+  // Restore
+  if (abstractEl) abstractEl.classList.remove('print-hide');
+  if (claimsEl)   claimsEl.classList.remove('print-hide');
+  if (feesEl)     feesEl.classList.remove('print-hide');
+}}
 
 // ── Search bar ─────────────────────────────────────────────────────────────
 async function runSearch(evt) {{

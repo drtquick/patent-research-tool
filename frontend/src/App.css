@@ -182,3 +182,8 @@
     border-right-color: var(--border);
   }
 }
+
+/* ── Spinner animation ── */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}

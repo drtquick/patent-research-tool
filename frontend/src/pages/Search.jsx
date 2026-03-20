@@ -1,21 +1,29 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
+import { useSearchParams } from "react-router-dom";
 import { api } from "../api";
 
 export default function Search() {
-  const [query, setQuery] = useState("");
+  const [searchParams, setSearchParams] = useSearchParams();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const ranQuery = useRef(null);
 
-  async function handleSearch(e) {
-    e.preventDefault();
-    if (!query.trim()) return;
+  // Run search whenever ?q= param changes (including on first load)
+  useEffect(() => {
+    const q = searchParams.get("q") || "";
+    if (!q.trim() || q === ranQuery.current) return;
+    ranQuery.current = q;
+    runSearch(q.trim());
+  }, [searchParams]);
+
+  async function runSearch(q) {
     setError(""); setResult(null); setSaved(false);
     setLoading(true);
     try {
-      const data = await api.search(query.trim());
+      const data = await api.search(q);
       setResult(data);
     } catch (err) {
       setError(err.message);
@@ -37,20 +45,27 @@ export default function Search() {
     }
   }
 
+  const currentQuery = searchParams.get("q") || "";
+
   return (
     <div style={styles.page}>
-      <h2 style={styles.heading}>Search Patents</h2>
-      <form onSubmit={handleSearch} style={styles.form}>
-        <input
-          style={styles.input}
-          placeholder="Enter patent number (e.g. US 12,178,560)"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-        />
-        <button style={styles.btn} type="submit" disabled={loading}>
-          {loading ? "Searching…" : "Search"}
-        </button>
-      </form>
+      {/* Prompt when no query yet */}
+      {!currentQuery && !loading && !result && (
+        <div style={styles.empty}>
+          Enter a patent number in the search bar above to get started.
+          <div style={styles.hint}>e.g. US12178560 · EP1234567 · WO2021133786</div>
+        </div>
+      )}
+
+      {loading && (
+        <div style={styles.loadingWrap}>
+          <div style={styles.spinner} />
+          <span style={styles.loadingText}>
+            Fetching family data for <strong>{currentQuery}</strong>…
+            <br /><span style={styles.loadingSub}>This usually takes 20–60 seconds</span>
+          </span>
+        </div>
+      )}
 
       {error && <div style={styles.error}>{error}</div>}
 
@@ -85,25 +100,44 @@ export default function Search() {
 }
 
 const styles = {
-  page: { padding: "2rem", maxWidth: 1100, margin: "0 auto" },
-  heading: { marginTop: 0, color: "#1a1a2e" },
-  form: { display: "flex", gap: 10, marginBottom: 20 },
-  input: { flex: 1, padding: "10px 14px", borderRadius: 8,
-    border: "1px solid #d0d7de", fontSize: 15 },
-  btn: { padding: "10px 22px", borderRadius: 8, background: "#1a73e8",
-    color: "#fff", border: "none", fontSize: 15, cursor: "pointer", fontWeight: 600 },
-  error: { padding: "12px 16px", background: "#fdecea", borderRadius: 8,
-    color: "#d32f2f", marginBottom: 16 },
-  resultWrap: { border: "1px solid #e0e0e0", borderRadius: 10, overflow: "hidden" },
-  resultHeader: { display: "flex", justifyContent: "space-between",
+  page: { padding: "1.5rem", maxWidth: 1200, margin: "0 auto" },
+  empty: {
+    marginTop: "6rem", textAlign: "center", color: "#888",
+    fontSize: 16,
+  },
+  hint: { marginTop: 8, fontSize: 13, color: "#aaa", fontFamily: "monospace" },
+  loadingWrap: {
+    display: "flex", alignItems: "center", gap: 16,
+    padding: "2rem", background: "#f8f9fa", borderRadius: 10,
+    border: "1px dashed #ddd", marginTop: "2rem",
+  },
+  spinner: {
+    width: 28, height: 28, borderRadius: "50%",
+    border: "3px solid #e0e0e0", borderTopColor: "#1a73e8",
+    animation: "spin 0.8s linear infinite", flexShrink: 0,
+  },
+  loadingText: { color: "#444", fontSize: 15, lineHeight: 1.6 },
+  loadingSub: { fontSize: 12, color: "#888" },
+  error: {
+    padding: "12px 16px", background: "#fdecea", borderRadius: 8,
+    color: "#d32f2f", marginTop: 16,
+  },
+  resultWrap: { border: "1px solid #e0e0e0", borderRadius: 10, overflow: "hidden", marginTop: 4 },
+  resultHeader: {
+    display: "flex", justifyContent: "space-between",
     alignItems: "flex-start", padding: "14px 18px", background: "#f8f9fa",
-    borderBottom: "1px solid #e0e0e0", gap: 12 },
+    borderBottom: "1px solid #e0e0e0", gap: 12,
+  },
   meta: { fontSize: 13, color: "#666", marginTop: 4 },
-  saveBtn: { padding: "8px 18px", borderRadius: 8, background: "#34a853",
+  saveBtn: {
+    padding: "8px 18px", borderRadius: 8, background: "#34a853",
     color: "#fff", border: "none", cursor: "pointer", fontWeight: 600,
-    whiteSpace: "nowrap", fontSize: 14 },
-  savedBtn: { padding: "8px 18px", borderRadius: 8, background: "#e8f5e9",
+    whiteSpace: "nowrap", fontSize: 14,
+  },
+  savedBtn: {
+    padding: "8px 18px", borderRadius: 8, background: "#e8f5e9",
     color: "#2e7d32", border: "1px solid #a5d6a7", fontWeight: 600,
-    whiteSpace: "nowrap", fontSize: 14, cursor: "default" },
+    whiteSpace: "nowrap", fontSize: 14, cursor: "default",
+  },
   iframe: { width: "100%", height: "85vh", border: "none", display: "block" },
 };
