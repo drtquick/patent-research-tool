@@ -17,7 +17,10 @@ export default function Navbar() {
 
   return (
     <nav style={styles.nav}>
-      <div style={styles.brand}>PatentQ</div>
+      <div style={styles.brand}>
+        PatentQ
+        <span style={styles.version}>β 0.1</span>
+      </div>
 
       {/* Inline search bar */}
       <form onSubmit={handleSearch} style={styles.searchForm}>
@@ -67,6 +70,12 @@ const styles = {
   brand: {
     color: "#fff", fontWeight: 800, fontSize: 18,
     letterSpacing: "-0.02em", whiteSpace: "nowrap", flexShrink: 0,
+    display: "flex", alignItems: "baseline", gap: 6,
+  },
+  version: {
+    fontSize: 10, fontWeight: 600, color: "rgba(255,255,255,.55)",
+    background: "rgba(255,255,255,.12)", borderRadius: 4,
+    padding: "1px 5px", letterSpacing: "0.03em",
   },
   searchForm: {
     display: "flex", gap: 6, flex: 1, maxWidth: 380, minWidth: 180,

@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api } from "../api";
+import PrintBar from "../PrintBar";
 
 export default function Search() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -9,7 +10,8 @@ export default function Search() {
   const [result, setResult] = useState(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
-  const ranQuery = useRef(null);
+  const ranQuery  = useRef(null);
+  const iframeRef = useRef(null);
 
   // Run search whenever ?q= param changes (including on first load)
   useEffect(() => {
@@ -88,11 +90,13 @@ export default function Search() {
             </button>
           </div>
           <iframe
+            ref={iframeRef}
             title="Patent Dashboard"
             style={styles.iframe}
             srcDoc={result.dashboard_html}
             sandbox="allow-scripts allow-same-origin"
           />
+          <PrintBar iframeRef={iframeRef} />
         </div>
       )}
     </div>

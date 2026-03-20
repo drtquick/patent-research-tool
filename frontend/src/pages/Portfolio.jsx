@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { api } from "../api";
+import PrintBar from "../PrintBar";
 
 const STATUS_COLORS = {
   granted:   "#2e7d32",
@@ -18,11 +19,12 @@ const FLAG = {
 };
 
 export default function Portfolio() {
-  const [patents, setPatents]       = useState([]);
-  const [loading, setLoading]       = useState(true);
-  const [error, setError]           = useState("");
-  const [viewing, setViewing]       = useState(null);
+  const [patents, setPatents]         = useState([]);
+  const [loading, setLoading]         = useState(true);
+  const [error, setError]             = useState("");
+  const [viewing, setViewing]         = useState(null);
   const [viewLoading, setViewLoading] = useState(false);
+  const iframeRef                     = useRef(null);
 
   useEffect(() => { fetchPortfolio(); }, []);
 
@@ -64,15 +66,21 @@ export default function Portfolio() {
   if (viewing) {
     return (
       <div style={styles.page}>
-        <button style={styles.backBtn} onClick={() => setViewing(null)}>
-          ← Back to Portfolio
-        </button>
-        <iframe
-          title="Patent Dashboard"
-          style={styles.iframe}
-          srcDoc={viewing.dashboard_html}
-          sandbox="allow-scripts allow-same-origin"
-        />
+        <div style={styles.dashHeader}>
+          <button style={styles.backBtn} onClick={() => setViewing(null)}>
+            ← Back to Portfolio
+          </button>
+        </div>
+        <div style={styles.iframeWrap}>
+          <iframe
+            ref={iframeRef}
+            title="Patent Dashboard"
+            style={styles.iframe}
+            srcDoc={viewing.dashboard_html}
+            sandbox="allow-scripts allow-same-origin"
+          />
+          <PrintBar iframeRef={iframeRef} />
+        </div>
       </div>
     );
   }
@@ -161,6 +169,8 @@ const styles = {
   cardActions: { display: "flex", gap: 8, marginTop: 4 },
   viewBtn: { flex: 1, padding: "8px", borderRadius: 8, background: "#1a73e8", color: "#fff", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600 },
   deleteBtn: { padding: "8px 14px", borderRadius: 8, background: "#fff", color: "#d32f2f", border: "1px solid #f5c6cb", cursor: "pointer", fontSize: 13 },
-  backBtn: { marginBottom: 16, padding: "8px 16px", borderRadius: 8, background: "#f0f4f8", border: "1px solid #d0d7de", cursor: "pointer", fontSize: 14 },
-  iframe:  { width: "100%", height: "88vh", border: "1px solid #e0e0e0", display: "block", borderRadius: 8 },
+  dashHeader: { marginBottom: 12 },
+  backBtn:  { padding: "8px 16px", borderRadius: 8, background: "#f0f4f8", border: "1px solid #d0d7de", cursor: "pointer", fontSize: 14 },
+  iframeWrap: { border: "1px solid #e0e0e0", borderRadius: 10, overflow: "hidden" },
+  iframe:   { width: "100%", height: "85vh", border: "none", display: "block" },
 };

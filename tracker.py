@@ -2375,29 +2375,14 @@ def generate_dashboard_html(
       content: "▼";
     }}
 
-    /* ── Print report bar ── */
-    .print-bar {{
-      display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
-      background: #fff; border-radius: 10px; padding: .7rem 1.25rem;
-      margin-bottom: 1.25rem; box-shadow: 0 1px 3px rgba(0,0,0,.07);
-      font-size: .85rem; color: #374151;
-    }}
-    .print-bar-label {{
-      font-weight: 700; font-size: .8rem; color: #0f172a; margin-right: 4px;
-    }}
-    .print-bar label {{ display: flex; align-items: center; gap: 5px; cursor: pointer; }}
-    .print-btn {{
-      margin-left: auto; padding: .45rem 1.1rem; border-radius: 7px;
-      background: #1a73e8; color: #fff; border: none; font-size: .85rem;
-      font-weight: 600; cursor: pointer;
-    }}
-    .print-btn:hover {{ background: #1558b0; }}
-
     @media print {{
       .no-print {{ display: none !important; }}
       .print-hide {{ display: none !important; }}
       body {{ background: #fff; padding: .5rem; }}
       .card {{ break-inside: avoid; }}
+      .history {{ display: block; }}
+      details {{ display: block; }}
+      details > summary {{ display: none; }}
     }}
 
     .claim-block {{ margin-bottom: .9rem; padding-bottom: .9rem; border-bottom: 1px solid #f3f4f6; }}
@@ -2448,29 +2433,7 @@ def generate_dashboard_html(
     .cons-table tr:last-child td {{ border-bottom: none; }}
     .disc-note {{ font-size: .78rem; color: #92400e; font-style: italic; }}
 
-    /* ── Search bar ── */
-    .search-bar-wrap {{
-      background: #fff; border-radius: 12px; padding: .85rem 1.25rem;
-      margin-bottom: 1.25rem; box-shadow: 0 1px 3px rgba(0,0,0,.07);
-      display: flex; flex-direction: column; gap: .5rem;
-    }}
-    #search-form {{ display: flex; gap: .6rem; }}
-    .search-input {{
-      flex: 1; padding: .55rem 1rem; border: 1.5px solid #d1d5db;
-      border-radius: 8px; font-size: .92rem; outline: none;
-      transition: border-color .15s;
-    }}
-    .search-input:focus {{ border-color: #2563eb; }}
-    .search-btn {{
-      padding: .55rem 1.4rem; background: #2563eb; color: #fff;
-      border: none; border-radius: 8px; font-size: .92rem; font-weight: 600;
-      cursor: pointer; white-space: nowrap; transition: background .15s;
-    }}
-    .search-btn:hover {{ background: #1d4ed8; }}
-    .search-btn:disabled {{ background: #93c5fd; cursor: not-allowed; }}
-    .search-status {{ font-size: .82rem; color: #6b7280; min-height: 1.2em; }}
-    .search-status.err {{ color: #991b1b; }}
-    .search-status.ok  {{ color: #065f46; }}
+
 
     /* ── Fee schedule collapsible ── */
     .ps-section {{ padding: 0; overflow: hidden; }}
@@ -2527,17 +2490,6 @@ def generate_dashboard_html(
 </head>
 <body>
 
-  <!-- Search bar -->
-  <div class="search-bar-wrap">
-    <form id="search-form" onsubmit="runSearch(event)">
-      <input id="search-input" type="text" class="search-input"
-             placeholder="Enter patent number: US12178560, EP1234567, JP2023534987, WO2021133786 …"
-             autocomplete="off" spellcheck="false" />
-      <button type="submit" class="search-btn">Search</button>
-    </form>
-    <div id="search-status" class="search-status"></div>
-  </div>
-
   <div class="hero">
     <div class="hero-eyebrow">Patent Family Dashboard</div>
     <div class="hero-title">{title or number}</div>
@@ -2576,15 +2528,6 @@ def generate_dashboard_html(
       <div class="stat-label">Prior Art Citations</div>
       <div class="stat-value">{len(relations)}</div>
     </div>
-  </div>
-
-  <!-- Print report button -->
-  <div class="print-bar no-print" id="print-bar">
-    <span class="print-bar-label">&#128438; Print Report</span>
-    <label><input type="checkbox" id="pr-abstract" checked> Abstract</label>
-    <label><input type="checkbox" id="pr-claims" checked> Granted Claims</label>
-    <label><input type="checkbox" id="pr-fees" checked> Fee Schedule</label>
-    <button class="print-btn" onclick="printReport()">Print / Save PDF</button>
   </div>
 
   {abstract_section_html}
@@ -2633,62 +2576,6 @@ def generate_dashboard_html(
     }}).catch(() => {{}});
 }})();
 
-// ── Print report ──────────────────────────────────────────────────────────
-function printReport() {{
-  const inclAbstract = document.getElementById('pr-abstract').checked;
-  const inclClaims   = document.getElementById('pr-claims').checked;
-  const inclFees     = document.getElementById('pr-fees').checked;
-
-  // Show/hide sections based on checkboxes before printing
-  const abstractEl = document.querySelector('.abstract-details');
-  const claimsEl   = document.querySelector('.claims-tab');
-  const feesEl     = document.getElementById('portfolio-fees-section');
-
-  if (abstractEl) abstractEl.classList.toggle('print-hide', !inclAbstract);
-  if (claimsEl)   claimsEl.classList.toggle('print-hide', !inclClaims);
-  if (feesEl)     feesEl.classList.toggle('print-hide', !inclFees);
-
-  // Ensure abstract is open for printing
-  if (abstractEl && inclAbstract) abstractEl.open = true;
-  if (claimsEl   && inclClaims)   claimsEl.open   = true;
-
-  window.print();
-
-  // Restore
-  if (abstractEl) abstractEl.classList.remove('print-hide');
-  if (claimsEl)   claimsEl.classList.remove('print-hide');
-  if (feesEl)     feesEl.classList.remove('print-hide');
-}}
-
-// ── Search bar ─────────────────────────────────────────────────────────────
-async function runSearch(evt) {{
-  evt.preventDefault();
-  const input  = document.getElementById('search-input');
-  const status = document.getElementById('search-status');
-  const btn    = document.querySelector('.search-btn');
-  const q      = (input.value || '').trim();
-  if (!q) return;
-  btn.disabled = true;
-  status.className = 'search-status';
-  status.textContent = 'Searching \u201c' + q + '\u201d \u2026 this may take 30\u201360 seconds';
-  try {{
-    const resp = await fetch('http://localhost:5001/api/search/local', {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{patent_number: q}}),
-    }});
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || 'Search failed (' + resp.status + ')');
-    document.open(); document.write(data.dashboard_html); document.close();
-  }} catch (err) {{
-    status.className = 'search-status err';
-    const isOffline = err.message.includes('fetch') || err.message.includes('Failed') || err.message.includes('NetworkError');
-    status.innerHTML = isOffline
-      ? 'Flask server not running. Start with: <code>python app.py</code>, then retry.'
-      : 'Error: ' + err.message;
-    btn.disabled = false;
-  }}
-}}
 </script>
 </body>
 </html>"""
