@@ -40,14 +40,20 @@ def normalize(raw: str) -> str:
 def build_url(patent_id: str) -> str:
     """
     Build a Google Patents URL from a raw patent string.
-    Tries to handle numbers given without a kind code (B1/B2).
+    Handles numbers given without a country code (e.g. bare "12178560" or
+    "12178560B2" — Google Patents citation_patent_number often omits the CC).
+    Defaults to US when the cleaned string starts with a digit.
     """
     clean = normalize(patent_id)
-    # Already has a kind code?
+    # If no country-code prefix (starts with a digit), assume US.
+    # This covers bare numbers like "12178560" or kind-coded "12178560B2".
+    if clean and clean[0].isdigit():
+        clean = "US" + clean
+    # Already has a kind code (ends letter+digit, e.g. B2, A1, T2)?
     if re.search(r"[A-Z]\d$", clean):
         pub_num = clean
     elif clean.startswith("US") and clean[2:].isdigit():
-        # Try B2 first (most common for utility grants), then B1
+        # Pure US number without kind code — try B2 first (most common utility grant)
         pub_num = clean + "B2"
     else:
         pub_num = clean
@@ -2448,6 +2454,38 @@ def generate_dashboard_html(
     }}
     details.abstract-details:not([open]) .abstract-summary::after {{
       content: "▼";
+    }}
+
+    /* ── Mobile responsive ── */
+    @media (max-width: 640px) {{
+      body {{ padding: .75rem; }}
+      .hero {{ padding: 1.1rem 1.25rem; border-radius: 10px; }}
+      .hero-title {{ font-size: 1.15rem; }}
+      .hero-sub {{ gap: .5rem; }}
+      .stats-bar {{
+        display: grid; grid-template-columns: 1fr 1fr; gap: .5rem;
+      }}
+      .stat-card {{ padding: .65rem .9rem; min-width: 0; }}
+      .stat-value {{ font-size: 1.25rem; }}
+      .cards-grid {{
+        grid-template-columns: 1fr;
+      }}
+      .card {{ padding: .9rem 1rem; }}
+      .info-section {{ padding: 1rem 1.1rem; }}
+      .card-head {{ flex-wrap: wrap; gap: .35rem; }}
+      .card-dates {{ flex-direction: column; gap: .25rem; }}
+      .hist-table, .ps-table, .cons-table, .ids-table, .rej-table {{
+        font-size: .74rem;
+      }}
+      .ps-summary {{ padding: 1rem 1.1rem; }}
+      .ps-section > .ps-disclaimer,
+      .ps-section > .ps-pro-note,
+      .ps-section > .ps-scroll {{ padding-left: 1.1rem; padding-right: 1.1rem; }}
+      .ps-section > .ps-scroll {{ padding-bottom: 1rem; }}
+      .ps-pro-note {{ margin-left: 1.1rem; margin-right: 1.1rem; }}
+      .claims-tab > summary {{ padding: .9rem 1.1rem; }}
+      .claims-tab .claim-block {{ margin: .75rem 1.1rem; }}
+      footer {{ margin-top: 1.5rem; }}
     }}
 
     @media print {{

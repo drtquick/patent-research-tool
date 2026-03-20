@@ -140,7 +140,21 @@ def _run_search(patent_input: str) -> dict:
     if not metas.get("citation_patent_number"):
         raise ValueError(f"No patent data found for '{patent_input}'")
 
-    number = tracker._first(metas.get("citation_patent_number", [])) or patent_input
+    # Prefer the caller-supplied patent_input (normalized) as the canonical number
+    # because Google's citation_patent_number meta often omits the country code
+    # (e.g. returns "12,178,560" instead of "US12178560B2"), which breaks
+    # portfolio re-searches later.  Fall back to the meta value only when no
+    # country-code-prefixed input was given.
+    raw_meta = tracker._first(metas.get("citation_patent_number", [])) or ""
+    norm_input = tracker.normalize(patent_input)
+    # If patent_input itself looks like a bare number (no CC), the meta value
+    # (which may include the CC) is more informative.
+    if norm_input and not norm_input[0].isdigit():
+        number = norm_input          # e.g. "US12178560B2" from user input
+    elif raw_meta:
+        number = tracker.normalize(raw_meta)  # use meta but at least normalize it
+    else:
+        number = norm_input or patent_input
     dates  = metas.get("DC.date", [])
 
     # Fetch all family member details (slow — one HTTP request per member)

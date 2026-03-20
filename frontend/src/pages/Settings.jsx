@@ -1,9 +1,11 @@
 import { useState } from "react";
 import { useAuth } from "../AuthContext";
 import { updatePassword, EmailAuthProvider, reauthenticateWithCredential } from "firebase/auth";
+import { useIsMobile } from "../useIsMobile";
 
 export default function Settings() {
   const { user, logout } = useAuth();
+  const isMobile = useIsMobile();
   const [section, setSection] = useState("account");
 
   // Password change state
@@ -41,9 +43,9 @@ export default function Settings() {
     <div style={styles.page}>
       <h2 style={styles.heading}>Settings</h2>
 
-      <div style={styles.layout}>
-        {/* Sidebar nav */}
-        <nav style={styles.sidebar}>
+      <div style={isMobile ? styles.layoutMobile : styles.layout}>
+        {/* Sidebar nav — horizontal pill tabs on mobile, vertical list on desktop */}
+        <nav style={isMobile ? styles.tabBar : styles.sidebar}>
           {[
             { key: "account",       label: "Account" },
             { key: "notifications", label: "Notifications" },
@@ -51,7 +53,9 @@ export default function Settings() {
           ].map(({ key, label }) => (
             <button
               key={key}
-              style={section === key ? styles.sideItemActive : styles.sideItem}
+              style={section === key
+                ? (isMobile ? styles.tabActive : styles.sideItemActive)
+                : (isMobile ? styles.tab      : styles.sideItem)}
               onClick={() => setSection(key)}
             >
               {label}
@@ -124,7 +128,7 @@ export default function Settings() {
               <h3 style={styles.sectionTitle}>About PatentQ</h3>
               <div style={styles.infoRow}>
                 <span style={styles.infoLabel}>Version</span>
-                <span style={styles.infoValue}>β 0.1</span>
+                <span style={styles.infoValue}>β 0.3</span>
               </div>
               <div style={styles.infoRow}>
                 <span style={styles.infoLabel}>Data sources</span>
@@ -145,11 +149,20 @@ export default function Settings() {
 }
 
 const styles = {
-  page:    { padding: "2rem", maxWidth: 900, margin: "0 auto" },
+  page:    { padding: "1.5rem", maxWidth: 900, margin: "0 auto" },
   heading: { marginTop: 0, color: "#1a1a2e" },
-  layout:  { display: "flex", gap: 24, alignItems: "flex-start" },
+  /* Desktop: sidebar left + panel right */
+  layout:       { display: "flex", gap: 24, alignItems: "flex-start" },
+  /* Mobile: tabs across top + panel below */
+  layoutMobile: { display: "flex", flexDirection: "column", gap: 12 },
   sidebar: { display: "flex", flexDirection: "column", gap: 4,
     minWidth: 160, flexShrink: 0 },
+  /* Mobile: horizontal pill tab bar */
+  tabBar: { display: "flex", gap: 6, flexWrap: "wrap" },
+  tab: { padding: "8px 16px", borderRadius: 20, border: "1px solid #d0d7de",
+    background: "#fff", cursor: "pointer", fontSize: 14, color: "#444", fontWeight: 500 },
+  tabActive: { padding: "8px 16px", borderRadius: 20, border: "none",
+    background: "#1a73e8", color: "#fff", cursor: "pointer", fontSize: 14, fontWeight: 700 },
   sideItem: { padding: "9px 16px", borderRadius: 8, border: "none",
     background: "transparent", textAlign: "left", cursor: "pointer",
     fontSize: 14, color: "#444", fontWeight: 400 },

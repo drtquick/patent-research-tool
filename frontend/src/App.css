@@ -187,3 +187,41 @@
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
+
+/* ── Global mobile layout fixes ── */
+@media (max-width: 720px) {
+  /* Reduce page padding on small screens */
+  body { font-size: 15px; }
+
+  /* Portfolio / Alerts / Settings pages */
+  .patentq-page {
+    padding: 1rem !important;
+  }
+
+  /* Portfolio card grid: single column below 480px */
+  .portfolio-grid {
+    grid-template-columns: 1fr !important;
+  }
+
+  /* Alerts family header: allow title to wrap */
+  .family-header {
+    flex-wrap: wrap;
+  }
+
+  /* Settings panel: full width on mobile */
+  .settings-panel {
+    width: 100%;
+    box-sizing: border-box;
+  }
+
+  /* Dashboard iframe: let it expand naturally, remove fixed height */
+  .dashboard-iframe {
+    height: 75vh !important;
+  }
+}
+
+@media (max-width: 480px) {
+  .dashboard-iframe {
+    height: 70vh !important;
+  }
+}
