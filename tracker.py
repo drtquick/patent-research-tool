@@ -1746,16 +1746,16 @@ def _status_badge(status: str) -> str:
     )
 
 
-def _pending_app_status(m: dict) -> str:
+def _pending_app_deadline(m: dict) -> tuple[str, str]:
     """
-    For pending applications, return a human-readable status string showing
-    the current prosecution status and upcoming response deadline.
-    E.g. "Response to Non-Final Office Action due April 15, 2026"
+    For pending applications, compute the upcoming response deadline from
+    prosecution events. Returns (human-readable label, ISO due-date string).
+    E.g. ("Response to Non-Final Office Action due April 15, 2026", "2026-04-15")
     """
     from datetime import date as _dt
     events = m.get("events", [])
     if not events:
-        return ""
+        return "", ""
     last_ev   = events[-1]
     ev_title  = (last_ev.get("title") or last_ev.get("value") or "").upper()
     date_str  = last_ev.get("date", "")
@@ -1779,13 +1779,66 @@ def _pending_app_status(m: dict) -> str:
                     due_month = ((due_month - 1) % 12) + 1
                     due_date  = oa_date.replace(year=due_year, month=due_month)
                     due_str   = due_date.strftime("%B %-d, %Y")
-                    return f"{label} due {due_str}"
+                    return f"{label} due {due_str}", due_date.isoformat()
                 except (ValueError, TypeError, OverflowError):
                     pass
-            return label
+            return label, ""
     # Fall back to human-readable last event label
     label = _classify_oa_event(last_ev.get("value", ""), last_ev.get("title", ""))
-    return label or ""
+    return (label or ""), ""
+
+
+def _pending_app_status(m: dict) -> str:
+    """Backward-compat wrapper — returns just the display string."""
+    return _pending_app_deadline(m)[0]
+
+
+def _get_next_deadline(m: dict) -> dict | None:
+    """
+    Return the single most important upcoming deadline for any family member tile.
+    Works for pending US/foreign apps (OA response), granted US (maintenance fee),
+    and foreign grants (annuity). Returns {"label", "date", "type"} or None.
+    """
+    from datetime import date as _dt
+    code   = country_code(m["pub_num"])
+    status = m.get("status", "unknown")
+
+    # Pending: office action / prosecution response deadline
+    if status in ("pending", "unknown"):
+        label, iso = _pending_app_deadline(m)
+        if label:
+            return {"label": label, "date": iso, "type": "response"}
+        return None
+
+    # Granted US: next unpaid maintenance fee
+    if code == "US" and status == "granted":
+        grant = m.get("grant_date", "")
+        if grant:
+            fees = calc_maintenance_fees(grant)
+            for f in fees:
+                if f["status"] not in ("paid",):
+                    return {
+                        "label": f"Maintenance fee – {f['label']} due {f['due']}",
+                        "date":  f["due"],
+                        "type":  "maintenance",
+                    }
+        return None
+
+    # Foreign granted/pending: next annuity
+    filing_raw = m.get("filing_date") or m.get("date") or ""
+    if code in _ANNUITY_SCHEDULES and filing_raw and code != "WO":
+        ann = calc_annuities(filing_raw, code)
+        if ann and not ann.get("expired") and not ann.get("wo"):
+            for r in ann.get("rows", []):
+                if r.get("is_current"):
+                    try:
+                        fd     = _dt.fromisoformat(filing_raw)
+                        due_dt = _add_months(fd, r["year"] * 12)
+                        lbl    = f"Year {r['year']} annuity due {due_dt.strftime('%B %-d, %Y')}"
+                        return {"label": lbl, "date": due_dt.isoformat(), "type": "annuity"}
+                    except Exception:
+                        pass
+    return None
 
 
 def _render_card(m: dict) -> str:
@@ -1812,12 +1865,34 @@ def _render_card(m: dict) -> str:
         second_label = "Granted" if status == "granted" else "Published"
         date_items += f'<span>{second_label}: <b>{grant}</b></span>'
 
-    # Pending application status banner
-    pending_status_html = ""
-    if status in ("pending", "unknown"):
-        ps = _pending_app_status(m)
-        if ps:
-            pending_status_html = f'<div class="pending-status">&#128203; {ps}</div>'
+    # Next deadline banner — visible for all tile types (OA response, maintenance, annuity)
+    next_deadline_html = ""
+    next_dl = _get_next_deadline(m)
+    if next_dl:
+        dl_label = next_dl["label"]
+        dl_date  = next_dl["date"]
+        dl_type  = next_dl["type"]
+        # Urgency-aware color
+        bg, fg, bdr = "#eff6ff", "#1e40af", "#bfdbfe"   # default: blue
+        if dl_date:
+            try:
+                from datetime import date as _dt2
+                days_left = (_dt2.fromisoformat(dl_date) - _dt2.today()).days
+                if days_left < 0:
+                    bg, fg, bdr = "#fef2f2", "#991b1b", "#fecaca"   # overdue: red
+                elif days_left <= 30:
+                    bg, fg, bdr = "#fff1f2", "#c62828", "#fca5a5"   # urgent: red
+                elif days_left <= 90:
+                    bg, fg, bdr = "#fff7ed", "#c2410c", "#fed7aa"   # soon: orange
+            except Exception:
+                pass
+        icon = "&#128203;" if dl_type == "response" else "&#128197;"
+        next_deadline_html = (
+            f'<div class="next-deadline" style="'
+            f'background:{bg};color:{fg};border:1px solid {bdr}">'
+            f'{icon} <strong>Next deadline:</strong> {dl_label}'
+            f'</div>'
+        )
 
     # Maintenance fees (granted patents only)
     maint_html = ""
@@ -1998,7 +2073,7 @@ def _render_card(m: dict) -> str:
         + (f'  <div class="card-title">{title}</div>' if title else '')
         + translated_html
         + f'  <div class="card-dates">{date_items}</div>'
-        + pending_status_html
+        + next_deadline_html
         + maint_html + annuity_html + latest_html + rej_html + rej_summary_html + err_html + history_html
         + '</div>'
     )
@@ -2428,7 +2503,12 @@ def generate_dashboard_html(
       white-space: nowrap;
     }}
 
-    /* ── Pending application status ── */
+    /* ── Next deadline banner (all tile types) ── */
+    .next-deadline {{
+      font-size: .78rem; font-weight: 600;
+      border-radius: 6px; padding: .3rem .65rem; margin: .4rem 0 .1rem;
+    }}
+    /* keep legacy rule in case old cached HTML is rendered */
     .pending-status {{
       font-size: .78rem; font-weight: 600; color: #1e40af;
       background: #eff6ff; border: 1px solid #bfdbfe;

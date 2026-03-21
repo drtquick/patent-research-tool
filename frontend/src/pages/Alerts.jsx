@@ -50,8 +50,10 @@ export default function Alerts() {
     }
   }
 
-  const families = groupByFamily(alerts);
-  const totalFees = alerts.reduce((s, a) => s + (a.amount_usd || 0), 0);
+  const families  = groupByFamily(alerts);
+  const feeAlerts = alerts.filter(a => a.type !== "office_action");
+  const oaAlerts  = alerts.filter(a => a.type === "office_action");
+  const totalFees = feeAlerts.reduce((s, a) => s + (a.amount_usd || 0), 0);
 
   return (
     <div style={styles.page}>
@@ -106,6 +108,7 @@ export default function Alerts() {
                 {fam.rows.map((a, i) => {
                   const days = daysUntil(a.due_date);
                   const urg  = URGENCY(days ?? 999);
+                  const isOA = a.type === "office_action";
                   return (
                     <tr key={i} style={i % 2 === 0 ? styles.trEven : styles.trOdd}>
                       <td style={styles.td}>{a.due_date?.slice(0, 10) || "—"}</td>
@@ -113,22 +116,41 @@ export default function Alerts() {
                         {urg.label}
                       </td>
                       <td style={{ ...styles.td, fontWeight: 700 }}>{a.country}</td>
-                      <td style={styles.td}>{a.label}</td>
                       <td style={styles.td}>
-                        {a.amount_usd != null ? `$${a.amount_usd.toLocaleString()}` : "—"}
-                        {a.amount_local != null && a.currency !== "USD" && (
-                          <div style={{ fontSize: 11, color: "#888" }}>
-                            {a.currency} {a.amount_local?.toLocaleString()}
-                          </div>
+                        {isOA && (
+                          <span style={styles.typeBadgeOA}>📋 Response</span>
+                        )}
+                        {!isOA && a.type === "maintenance" && (
+                          <span style={styles.typeBadgeFee}>🔧 Maintenance</span>
+                        )}
+                        {!isOA && a.type === "annuity" && (
+                          <span style={styles.typeBadgeFee}>📅 Annuity</span>
+                        )}
+                        <div style={{ marginTop: isOA ? 3 : 0, fontSize: 13 }}>{a.label}</div>
+                      </td>
+                      <td style={styles.td}>
+                        {isOA ? (
+                          <span style={{ color: "#888", fontSize: 12 }}>N/A</span>
+                        ) : (
+                          <>
+                            {a.amount_usd != null ? `$${a.amount_usd.toLocaleString()}` : "—"}
+                            {a.amount_local != null && a.currency !== "USD" && (
+                              <div style={{ fontSize: 11, color: "#888" }}>
+                                {a.currency} {a.amount_local?.toLocaleString()}
+                              </div>
+                            )}
+                          </>
                         )}
                       </td>
                       <td style={styles.td}>
                         <span style={{
                           ...styles.statusBadge,
-                          background: a.status === "current" ? "#fff3e0" : "#e8f5e9",
-                          color:      a.status === "current" ? "#e65100" : "#2e7d32",
+                          background: isOA         ? "#fce4ec"
+                                    : a.status === "current"  ? "#fff3e0" : "#e8f5e9",
+                          color:      isOA         ? "#b71c1c"
+                                    : a.status === "current"  ? "#e65100" : "#2e7d32",
                         }}>
-                          {a.status}
+                          {isOA ? "action required" : a.status}
                         </span>
                       </td>
                     </tr>
@@ -142,9 +164,13 @@ export default function Alerts() {
 
       {alerts.length > 0 && (
         <div style={styles.summary}>
-          <strong>Total fees due in next {filter} days: </strong>
-          ${totalFees.toLocaleString()} USD across {alerts.length} deadline{alerts.length !== 1 ? "s" : ""}
-          {" "}across {families.length} patent famil{families.length !== 1 ? "ies" : "y"}
+          {feeAlerts.length > 0 && (
+            <span><strong>Total fees:</strong> ${totalFees.toLocaleString()} USD ({feeAlerts.length} payment{feeAlerts.length !== 1 ? "s" : ""}){oaAlerts.length > 0 ? " · " : ""}</span>
+          )}
+          {oaAlerts.length > 0 && (
+            <span><strong>Responses due:</strong> {oaAlerts.length} office action{oaAlerts.length !== 1 ? "s" : ""}</span>
+          )}
+          <span style={{ color: "#1565c0" }}> — {families.length} patent famil{families.length !== 1 ? "ies" : "y"}</span>
         </div>
       )}
     </div>
@@ -182,7 +208,11 @@ const styles = {
   td:         { padding: "10px 14px", verticalAlign: "middle" },
   trEven:     { background: "#fff" },
   trOdd:      { background: "#f8f9fa" },
-  statusBadge: { padding: "2px 8px", borderRadius: 10, fontSize: 12, fontWeight: 600 },
+  statusBadge:    { padding: "2px 8px", borderRadius: 10, fontSize: 12, fontWeight: 600 },
+  typeBadgeOA:    { display: "inline-block", padding: "1px 7px", borderRadius: 8,
+    fontSize: 11, fontWeight: 700, background: "#fce4ec", color: "#b71c1c", marginBottom: 2 },
+  typeBadgeFee:   { display: "inline-block", padding: "1px 7px", borderRadius: 8,
+    fontSize: 11, fontWeight: 700, background: "#e8f5e9", color: "#2e7d32", marginBottom: 2 },
   summary:    { marginTop: 16, padding: "12px 16px", background: "#e3f2fd",
     borderRadius: 8, color: "#1565c0", fontSize: 14 },
 };

@@ -254,20 +254,25 @@ def _run_search(patent_input: str) -> dict:
     ]
     inventors = [c.strip() for c in contributors if c.strip() not in assignees]
 
-    # Compact family summary safe for Firestore (no huge HTML strings)
-    family_summary = [
-        {
-            "pub_num":    m["pub_num"],
-            "country":    tracker.country_code(m["pub_num"]),
-            "status":     m.get("status", "unknown"),
-            "filing_date":m.get("filing_date") or m.get("date") or "",
-            "grant_date": m.get("grant_date", ""),
-            "app_num":    m.get("app_num", ""),
-            "title":      m.get("member_title", ""),
-            "href":       m.get("href", ""),
-        }
-        for m in family_details
-    ]
+    # Compact family summary safe for Firestore (no huge HTML strings).
+    # next_deadline_* fields are computed now (while we still have prosecution events)
+    # so that _compute_deadlines() can generate office-action alerts later.
+    family_summary = []
+    for m in family_details:
+        dl = tracker._get_next_deadline(m)
+        family_summary.append({
+            "pub_num":             m["pub_num"],
+            "country":             tracker.country_code(m["pub_num"]),
+            "status":              m.get("status", "unknown"),
+            "filing_date":         m.get("filing_date") or m.get("date") or "",
+            "grant_date":          m.get("grant_date", ""),
+            "app_num":             m.get("app_num", ""),
+            "title":               m.get("member_title", ""),
+            "href":                m.get("href", ""),
+            "next_deadline_label": dl["label"] if dl else "",
+            "next_deadline_date":  dl["date"]  if dl else "",
+            "next_deadline_type":  dl["type"]  if dl else "",
+        })
 
     return {
         "patent_number":      number,
@@ -348,6 +353,25 @@ def _compute_deadlines(patent_data: dict) -> list[dict]:
                     "currency":      sched["currency"],
                     "status":        "current" if row["is_current"] else "upcoming",
                 })
+
+        # Office action / prosecution response deadlines stored at search time
+        ndl_label = m.get("next_deadline_label", "")
+        ndl_date  = m.get("next_deadline_date",  "")
+        ndl_type  = m.get("next_deadline_type",  "")
+        if ndl_type == "response" and ndl_label and ndl_date:
+            deadlines.append({
+                "patent_number": pnum,
+                "title":         title,
+                "pub_num":       pub_num,
+                "country":       cc,
+                "type":          "office_action",
+                "label":         ndl_label,
+                "due_date":      ndl_date,
+                "grace_end":     None,
+                "amount_usd":    None,
+                "currency":      None,
+                "status":        "current",
+            })
 
     return sorted(deadlines, key=lambda x: x["due_date"])
 

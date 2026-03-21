@@ -88,7 +88,7 @@ export default function Navbar() {
     return (
       <>
         <nav style={s.navMobile}>
-          <div style={s.brand}>PatentQ<span style={s.version}>β 0.5</span></div>
+          <button style={s.brandBtn} onClick={() => navigate("/portfolio")}>PatentQ<span style={s.version}>β 0.6</span></button>
 
           <div style={{ ...s.searchFormMobile, position: "relative" }}>
             <form onSubmit={handleSearch} style={{ display: "flex", gap: 4, flex: 1 }}>
@@ -129,7 +129,7 @@ export default function Navbar() {
   /* ── Desktop layout ─────────────────────────────────── */
   return (
     <nav style={s.nav}>
-      <div style={s.brand}>PatentQ<span style={s.version}>β 0.5</span></div>
+      <button style={s.brandBtn} onClick={() => navigate("/portfolio")}>PatentQ<span style={s.version}>β 0.6</span></button>
 
       <div style={{ position: "relative", flex: 1, maxWidth: 420, minWidth: 180 }}>
         <form onSubmit={handleSearch} style={s.searchForm}>
@@ -220,6 +220,12 @@ const s = {
   brand: {
     color: "#fff", fontWeight: 800, fontSize: 18, letterSpacing: "-0.02em",
     whiteSpace: "nowrap", flexShrink: 0, display: "flex", alignItems: "baseline", gap: 6,
+  },
+  brandBtn: {
+    color: "#fff", fontWeight: 800, fontSize: 18, letterSpacing: "-0.02em",
+    whiteSpace: "nowrap", flexShrink: 0, display: "flex", alignItems: "baseline", gap: 6,
+    background: "transparent", border: "none", cursor: "pointer", padding: 0,
+    fontFamily: "inherit", lineHeight: "inherit",
   },
   version: {
     fontSize: 10, fontWeight: 600, color: "rgba(255,255,255,.55)",
