@@ -523,7 +523,44 @@ def get_portfolio(portfolio_id: str):
             return jsonify({"error": "Not found"}), 404
         entry       = doc.to_dict()
         entry["id"] = doc.id
+        # Serialize Firestore timestamp objects → ISO strings so JSON encoding works
+        for k in ("saved_at", "refreshed_at"):
+            v = entry.get(k)
+            if hasattr(v, "isoformat"):
+                entry[k] = v.isoformat()
         return jsonify(entry)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/portfolios/<portfolio_id>/dashboard", methods=["PATCH"])
+@require_auth
+def patch_portfolio_dashboard(portfolio_id: str):
+    """
+    Persist a freshly-generated dashboard HTML back to Firestore.
+    Called after a manual refresh so the next load can serve it from cache.
+    Body: { "dashboard_html": "...", "family": [...] }
+    """
+    body           = request.get_json(silent=True) or {}
+    dashboard_html = body.get("dashboard_html", "")
+    family         = body.get("family")
+    if not dashboard_html:
+        return jsonify({"error": "dashboard_html is required"}), 400
+    try:
+        ref = (
+            db.collection("users").document(request.uid)
+            .collection("portfolios").document(portfolio_id)
+        )
+        if not ref.get().exists:
+            return jsonify({"error": "Not found"}), 404
+        update: dict = {
+            "dashboard_html": dashboard_html,
+            "refreshed_at":   datetime.now(timezone.utc),
+        }
+        if family is not None:
+            update["family"] = family
+        ref.update(update)
+        return jsonify({"ok": True})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 

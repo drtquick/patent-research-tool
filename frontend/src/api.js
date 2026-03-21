@@ -54,4 +54,10 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ notes }),
     }),
+
+  refreshPortfolio: (id, data) =>
+    authFetch(`/api/portfolios/${id}/dashboard`, {
+      method: "PATCH",
+      body: JSON.stringify(data),
+    }),
 };

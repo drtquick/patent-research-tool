@@ -70,6 +70,18 @@ const STATUS_LEGEND = [
   { key: "unknown",   label: "Unknown",   color: "#9e9e9e" },
 ];
 
+function _timeAgo(isoStr) {
+  if (!isoStr) return "";
+  const ms   = Date.now() - new Date(isoStr).getTime();
+  const mins = Math.floor(ms / 60000);
+  if (mins < 1)  return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24)  return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  return `${days}d ago`;
+}
+
 export default function Portfolio() {
   const isMobile  = useIsMobile();
   const navigate  = useNavigate();
@@ -82,6 +94,7 @@ export default function Portfolio() {
   const [viewingId, setViewingId]         = useState(null);
   const [familyName, setFamilyName]       = useState("");
   const [nameTimer, setNameTimer]         = useState(null);
+  const [loadingMsg, setLoadingMsg]       = useState("");
   const [confirmTarget, setConfirmTarget] = useState(null);
   const iframeRef      = useRef(null);
   const notesRef       = useRef({});   // always-current notes for the open dashboard
@@ -102,23 +115,61 @@ export default function Portfolio() {
     }
   }
 
+  async function _doSearch(portfolioId, patentNumber) {
+    // Run a fresh scrape and persist the result back to Firestore cache
+    const data = await api.search(patentNumber);
+    api.refreshPortfolio(portfolioId, {
+      dashboard_html: data.dashboard_html,
+      family:         data.family,
+    }).catch(() => {});
+    setViewing(data);
+    setViewLoading(false);
+  }
+
   async function handleView(portfolioId, patentNumber) {
-    // Capture the portfolio entry's existing notes before the search starts
     const entry = patents.find(p => p.id === portfolioId);
     setFamilyName(entry?.family_name || "");
     notesRef.current     = entry?.notes || {};
     viewingIdRef.current = portfolioId;
     setViewingId(portfolioId);
-    setViewLoading(true);
     setViewingNumber(patentNumber);
+    setViewLoading(true);
+
     try {
-      const data = await api.search(patentNumber);
-      setViewing(data);
+      // ── Cache-first: fetch from Firestore (fast) ──────────────────────────
+      setLoadingMsg("Loading dashboard…");
+      const cached = await api.getPortfolio(portfolioId);
+      const cacheTs = cached.refreshed_at || cached.saved_at;
+      const ageMs   = cacheTs ? Date.now() - new Date(cacheTs).getTime() : Infinity;
+      const MAX_AGE = 24 * 60 * 60 * 1000; // 24 hours
+
+      if (cached.dashboard_html && ageMs < MAX_AGE) {
+        // Cache hit — serve instantly, no scraping needed
+        setViewing(cached);
+        setViewLoading(false);
+        return;
+      }
+
+      // ── Cache miss / stale — run full scrape ──────────────────────────────
+      setLoadingMsg(`Generating fresh dashboard for ${patentNumber}…`);
+      await _doSearch(portfolioId, patentNumber);
     } catch (err) {
       alert(err.message);
       setViewingNumber(null);
       setViewingId(null);
-    } finally {
+      setViewLoading(false);
+    }
+  }
+
+  async function handleRefresh() {
+    if (!viewingNumber || !viewingId) return;
+    setViewing(null);
+    setViewLoading(true);
+    setLoadingMsg(`Refreshing dashboard for ${viewingNumber}…`);
+    try {
+      await _doSearch(viewingId, viewingNumber);
+    } catch (err) {
+      alert(err.message);
       setViewLoading(false);
     }
   }
@@ -194,14 +245,15 @@ export default function Portfolio() {
 
   // Full-page loading overlay while fresh search runs (30-60s)
   if (viewLoading) {
+    const isScrape = loadingMsg.startsWith("Generating") || loadingMsg.startsWith("Refresh");
     return (
       <div style={styles.page}>
         <div style={styles.loadingOverlay}>
           <div style={styles.spinner} />
-          <p style={styles.loadingText}>
-            Generating fresh dashboard for <strong>{viewingNumber}</strong>…
-          </p>
-          <p style={styles.loadingSubtext}>This may take 30–60 seconds</p>
+          <p style={styles.loadingText}>{loadingMsg || "Loading…"}</p>
+          {isScrape && (
+            <p style={styles.loadingSubtext}>This may take 30–60 seconds</p>
+          )}
         </div>
       </div>
     );
@@ -231,6 +283,18 @@ export default function Portfolio() {
             placeholder={`Name this family (e.g. "Widget Portfolio")…`}
             title="Custom name for this patent family — saved automatically"
           />
+          {(viewing?.refreshed_at || viewing?.saved_at) && (
+            <span style={styles.lastUpdated}>
+              Updated {_timeAgo(viewing.refreshed_at || viewing.saved_at)}
+            </span>
+          )}
+          <button
+            style={styles.refreshBtn}
+            onClick={handleRefresh}
+            title="Force a fresh data pull from Google Patents"
+          >
+            🔄 Refresh
+          </button>
           <button
             style={styles.alertsBtn}
             onClick={() => navigate(`/alerts?patent=${encodeURIComponent(viewingNumber)}`)}
@@ -371,6 +435,10 @@ const styles = {
   alertsBtn:   { padding: "8px 14px", borderRadius: 8, background: "#fff3e0",
     border: "1px solid #ffe0b2", color: "#e65100", cursor: "pointer",
     fontSize: 13, fontWeight: 600, whiteSpace: "nowrap" },
+  refreshBtn:  { padding: "8px 14px", borderRadius: 8, background: "#f0f4f8",
+    border: "1px solid #d0d7de", color: "#1a1a2e", cursor: "pointer",
+    fontSize: 13, fontWeight: 600, whiteSpace: "nowrap" },
+  lastUpdated: { fontSize: 12, color: "#888", whiteSpace: "nowrap", alignSelf: "center" },
   familyNameTag: { fontSize: 12, color: "#1565c0", fontWeight: 600, marginBottom: 4,
     overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
   iframeWrap:  { border: "1px solid #e0e0e0", borderRadius: 10, overflow: "hidden" },
