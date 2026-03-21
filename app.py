@@ -429,7 +429,16 @@ def search():
         return jsonify({"error": str(exc)}), 404
     except Exception as exc:
         traceback.print_exc()
-        return jsonify({"error": f"Search failed: {exc}"}), 500
+        msg = str(exc)
+        # Surface rate-limit / transient Google errors with a friendlier message
+        if "503" in msg or "429" in msg:
+            msg = (
+                "Google Patents is temporarily unavailable (rate limit / 503). "
+                "Please wait 30–60 seconds and try again."
+            )
+        elif "502" in msg or "504" in msg:
+            msg = "Google Patents returned a gateway error. Please try again in a moment."
+        return jsonify({"error": msg}), 500
 
     # Save compact record to search history (drop HTML to keep Firestore lean)
     history = {k: v for k, v in result.items() if k != "dashboard_html"}

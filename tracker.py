@@ -17,6 +17,7 @@ import base64
 import json as _json
 import time as _time
 import calendar
+import random
 import webbrowser
 import requests
 from datetime import date as _date
@@ -24,11 +25,17 @@ from typing import Optional
 
 W = 72  # output width
 
-UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
-)
+# Rotate across several realistic browser strings so repeated Cloud Run requests
+# don't all look identical to Google's bot-detection layer.
+_UA_POOL = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+]
+# Kept for any legacy callers
+UA = _UA_POOL[0]
 
 # ── Normalization ────────────────────────────────────────────────────────────
 
@@ -62,10 +69,44 @@ def build_url(patent_id: str) -> str:
 
 # ── Fetching + Parsing ───────────────────────────────────────────────────────
 
-def fetch_page(url: str) -> str:
-    resp = requests.get(url, headers={"User-Agent": UA}, timeout=20)
-    resp.raise_for_status()
-    return resp.text
+def fetch_page(url: str, *, max_retries: int = 3) -> str:
+    """
+    Fetch a Google Patents page with full browser-like headers and
+    exponential-backoff retry on 429 / 503 (rate-limit / transient errors).
+    Raises the last HTTPError if all attempts are exhausted.
+    """
+    headers = {
+        "User-Agent":                random.choice(_UA_POOL),
+        "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language":           "en-US,en;q=0.9",
+        "Accept-Encoding":           "gzip, deflate, br",
+        "Connection":                "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest":            "document",
+        "Sec-Fetch-Mode":            "navigate",
+        "Sec-Fetch-Site":            "none",
+        "Sec-Fetch-User":            "?1",
+        "Cache-Control":             "max-age=0",
+    }
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.get(url, headers=headers, timeout=25)
+            resp.raise_for_status()
+            return resp.text
+        except requests.HTTPError as exc:
+            sc = exc.response.status_code
+            if sc in (429, 503) and attempt < max_retries:
+                wait = (2 ** attempt) + random.uniform(0.5, 2.5)
+                print(f"  [fetch] HTTP {sc} on attempt {attempt + 1}/{max_retries + 1} "
+                      f"— retrying in {wait:.1f}s …")
+                _time.sleep(wait)
+                last_exc = exc
+                # Rotate UA on retry to reduce fingerprint consistency
+                headers["User-Agent"] = random.choice(_UA_POOL)
+            else:
+                raise
+    raise last_exc  # type: ignore[misc]
 
 
 def get_metas(html: str) -> dict[str, list[str]]:
