@@ -519,6 +519,30 @@ def get_portfolio(portfolio_id: str):
         return jsonify({"error": str(exc)}), 500
 
 
+@app.route("/api/portfolios/<portfolio_id>/notes", methods=["PATCH"])
+@require_auth
+def patch_portfolio_notes(portfolio_id: str):
+    """
+    Upsert the notes dict for one portfolio entry.
+    Body: { "notes": { "<pub_num>": "<text>", … } }
+    """
+    body = request.get_json(silent=True) or {}
+    notes = body.get("notes")
+    if not isinstance(notes, dict):
+        return jsonify({"error": "notes must be an object"}), 400
+    try:
+        ref = (
+            db.collection("users").document(request.uid)
+            .collection("portfolios").document(portfolio_id)
+        )
+        if not ref.get().exists:
+            return jsonify({"error": "Not found"}), 404
+        ref.update({"notes": notes})
+        return jsonify({"ok": True})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.route("/api/portfolios/<portfolio_id>", methods=["DELETE"])
 @require_auth
 def delete_portfolio(portfolio_id: str):

@@ -42,4 +42,10 @@ export const api = {
 
   getSearchHistory: (limit = 8) =>
     authFetch(`/api/searches?limit=${limit}`),
+
+  savePortfolioNotes: (id, notes) =>
+    authFetch(`/api/portfolios/${id}/notes`, {
+      method: "PATCH",
+      body: JSON.stringify({ notes }),
+    }),
 };

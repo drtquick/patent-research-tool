@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import { api } from "../api";
 import PrintBar from "../PrintBar";
 import { useIsMobile } from "../useIsMobile";
@@ -77,8 +77,12 @@ export default function Portfolio() {
   const [viewing, setViewing]             = useState(null);
   const [viewLoading, setViewLoading]     = useState(false);
   const [viewingNumber, setViewingNumber] = useState(null);
-  const [confirmTarget, setConfirmTarget] = useState(null); // { id, patent_number }
-  const iframeRef                         = useRef(null);
+  const [viewingId, setViewingId]         = useState(null);
+  const [confirmTarget, setConfirmTarget] = useState(null);
+  const iframeRef      = useRef(null);
+  const notesRef       = useRef({});   // always-current notes for the open dashboard
+  const viewingIdRef   = useRef(null); // always-current portfolio doc ID
+  const notesTimerRef  = useRef(null); // debounce handle
 
   useEffect(() => { fetchPortfolio(); }, []);
 
@@ -94,7 +98,12 @@ export default function Portfolio() {
     }
   }
 
-  async function handleView(patentNumber) {
+  async function handleView(portfolioId, patentNumber) {
+    // Capture the portfolio entry's existing notes before the search starts
+    const entry = patents.find(p => p.id === portfolioId);
+    notesRef.current     = entry?.notes || {};
+    viewingIdRef.current = portfolioId;
+    setViewingId(portfolioId);
     setViewLoading(true);
     setViewingNumber(patentNumber);
     try {
@@ -103,10 +112,48 @@ export default function Portfolio() {
     } catch (err) {
       alert(err.message);
       setViewingNumber(null);
+      setViewingId(null);
     } finally {
       setViewLoading(false);
     }
   }
+
+  // Called when the dashboard iframe finishes loading — inject saved notes and
+  // attach input listeners so changes are saved back to Firestore (debounced).
+  const handleIframeLoad = useCallback(() => {
+    const doc = iframeRef.current?.contentDocument;
+    if (!doc) return;
+
+    // Inject any previously saved notes into the textareas
+    Object.entries(notesRef.current).forEach(([pubNum, text]) => {
+      if (!text) return;
+      const ta = doc.querySelector(`.notes-ta[data-pub-num="${pubNum}"]`);
+      if (ta) ta.value = text;
+    });
+
+    // Wire up listeners — save on every keystroke (debounced 800 ms)
+    doc.querySelectorAll(".notes-ta").forEach((ta) => {
+      ta.addEventListener("input", () => {
+        const pubNum = ta.dataset.pubNum;
+        const text   = ta.value;
+        // Update the notes ref immediately (used in the save closure)
+        notesRef.current = { ...notesRef.current, [pubNum]: text };
+        // Also update local patents state so re-opening retains notes without a refetch
+        setPatents((prev) =>
+          prev.map((p) =>
+            p.id === viewingIdRef.current
+              ? { ...p, notes: notesRef.current }
+              : p
+          )
+        );
+        clearTimeout(notesTimerRef.current);
+        notesTimerRef.current = setTimeout(() => {
+          const id = viewingIdRef.current;
+          if (id) api.savePortfolioNotes(id, notesRef.current).catch(() => {});
+        }, 800);
+      });
+    });
+  }, []);
 
   function handleDelete(id, patentNumber) {
     // Show styled in-page modal instead of browser confirm()
@@ -119,7 +166,7 @@ export default function Portfolio() {
     try {
       await api.deletePortfolio(id);
       setPatents((prev) => prev.filter((p) => p.id !== id));
-      if (viewingNumber === patentNumber) { setViewing(null); setViewingNumber(null); }
+      if (viewingNumber === patentNumber) { setViewing(null); setViewingNumber(null); setViewingId(null); }
     } catch (err) {
       alert(err.message);
     }
@@ -153,7 +200,7 @@ export default function Portfolio() {
         <div style={styles.dashHeader}>
           <button
             style={styles.backBtn}
-            onClick={() => { setViewing(null); setViewingNumber(null); }}
+            onClick={() => { setViewing(null); setViewingNumber(null); setViewingId(null); }}
           >
             ← Back to Portfolio
           </button>
@@ -165,6 +212,7 @@ export default function Portfolio() {
             style={styles.iframe}
             srcDoc={viewing.dashboard_html}
             sandbox="allow-scripts allow-same-origin allow-modals"
+            onLoad={handleIframeLoad}
           />
           <PrintBar iframeRef={iframeRef} />
         </div>
@@ -233,7 +281,7 @@ export default function Portfolio() {
                 })}
               </div>
               <div style={styles.cardActions}>
-                <button style={styles.viewBtn} onClick={() => handleView(p.patent_number)}>
+                <button style={styles.viewBtn} onClick={() => handleView(p.id, p.patent_number)}>
                   View Dashboard
                 </button>
                 <button style={styles.deleteBtn} onClick={() => handleDelete(p.id, p.patent_number)}>
