@@ -88,7 +88,7 @@ export default function Navbar() {
     return (
       <>
         <nav style={s.navMobile}>
-          <div style={s.brand}>PatentQ<span style={s.version}>β 0.4</span></div>
+          <div style={s.brand}>PatentQ<span style={s.version}>β 0.5</span></div>
 
           <div style={{ ...s.searchFormMobile, position: "relative" }}>
             <form onSubmit={handleSearch} style={{ display: "flex", gap: 4, flex: 1 }}>
@@ -129,7 +129,7 @@ export default function Navbar() {
   /* ── Desktop layout ─────────────────────────────────── */
   return (
     <nav style={s.nav}>
-      <div style={s.brand}>PatentQ<span style={s.version}>β 0.4</span></div>
+      <div style={s.brand}>PatentQ<span style={s.version}>β 0.5</span></div>
 
       <div style={{ position: "relative", flex: 1, maxWidth: 420, minWidth: 180 }}>
         <form onSubmit={handleSearch} style={s.searchForm}>
