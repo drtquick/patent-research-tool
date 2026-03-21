@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { api } from "../api";
 
 const URGENCY = (daysLeft) => {
@@ -31,6 +32,9 @@ function groupByFamily(alerts) {
 }
 
 export default function Alerts() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const patentFilter = searchParams.get("patent") || "";   // e.g. "US12178560"
+
   const [alerts,  setAlerts]  = useState([]);
   const [loading, setLoading] = useState(true);
   const [error,   setError]   = useState("");
@@ -50,10 +54,15 @@ export default function Alerts() {
     }
   }
 
-  const families  = groupByFamily(alerts);
-  const feeAlerts = alerts.filter(a => a.type !== "office_action");
-  const oaAlerts  = alerts.filter(a => a.type === "office_action");
-  const totalFees = feeAlerts.reduce((s, a) => s + (a.amount_usd || 0), 0);
+  const allFamilies = groupByFamily(alerts);
+  // When a ?patent= param is present, scope the view to that family only
+  const families    = patentFilter
+    ? allFamilies.filter(f => f.patent_number === patentFilter)
+    : allFamilies;
+  const visibleAlerts = families.flatMap(f => f.rows);
+  const feeAlerts  = visibleAlerts.filter(a => a.type !== "office_action");
+  const oaAlerts   = visibleAlerts.filter(a => a.type === "office_action");
+  const totalFees  = feeAlerts.reduce((s, a) => s + (a.amount_usd || 0), 0);
 
   return (
     <div style={styles.page}>
@@ -73,12 +82,27 @@ export default function Alerts() {
         </div>
       </div>
 
+      {/* Family filter banner — shown when arriving from a dashboard's "Family Alerts" button */}
+      {patentFilter && (
+        <div style={styles.filterBanner}>
+          <span>🔍 Showing alerts for <strong>{patentFilter}</strong> only</span>
+          <button
+            style={styles.clearFilter}
+            onClick={() => setSearchParams({})}
+          >
+            ✕ Show all families
+          </button>
+        </div>
+      )}
+
       {loading && <p style={{ color: "#666" }}>Loading deadlines…</p>}
       {error   && <div style={styles.error}>{error}</div>}
 
-      {!loading && alerts.length === 0 && (
+      {!loading && families.length === 0 && (
         <div style={styles.empty}>
-          No deadlines in the next {filter} days across your portfolio.
+          {patentFilter
+            ? `No deadlines found for ${patentFilter} in the next ${filter} days.`
+            : `No deadlines in the next ${filter} days across your portfolio.`}
         </div>
       )}
 
@@ -162,7 +186,7 @@ export default function Alerts() {
         </div>
       ))}
 
-      {alerts.length > 0 && (
+      {visibleAlerts.length > 0 && (
         <div style={styles.summary}>
           {feeAlerts.length > 0 && (
             <span><strong>Total fees:</strong> ${totalFees.toLocaleString()} USD ({feeAlerts.length} payment{feeAlerts.length !== 1 ? "s" : ""}){oaAlerts.length > 0 ? " · " : ""}</span>
@@ -215,4 +239,9 @@ const styles = {
     fontSize: 11, fontWeight: 700, background: "#e8f5e9", color: "#2e7d32", marginBottom: 2 },
   summary:    { marginTop: 16, padding: "12px 16px", background: "#e3f2fd",
     borderRadius: 8, color: "#1565c0", fontSize: 14 },
+  filterBanner: { display: "flex", alignItems: "center", justifyContent: "space-between",
+    padding: "10px 16px", background: "#fff8e1", borderRadius: 8,
+    border: "1px solid #ffe082", marginBottom: 16, fontSize: 14, color: "#6d4c00" },
+  clearFilter:  { padding: "4px 12px", borderRadius: 6, border: "1px solid #ffca28",
+    background: "#fff", color: "#6d4c00", cursor: "pointer", fontSize: 13, fontWeight: 600 },
 };

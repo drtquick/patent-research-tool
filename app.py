@@ -519,6 +519,25 @@ def get_portfolio(portfolio_id: str):
         return jsonify({"error": str(exc)}), 500
 
 
+@app.route("/api/portfolios/<portfolio_id>/name", methods=["PATCH"])
+@require_auth
+def patch_portfolio_name(portfolio_id: str):
+    """Set a custom display name for a patent family dashboard."""
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    try:
+        ref = (
+            db.collection("users").document(request.uid)
+            .collection("portfolios").document(portfolio_id)
+        )
+        if not ref.get().exists:
+            return jsonify({"error": "Not found"}), 404
+        ref.update({"family_name": name})
+        return jsonify({"ok": True, "family_name": name})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.route("/api/portfolios/<portfolio_id>/notes", methods=["PATCH"])
 @require_auth
 def patch_portfolio_notes(portfolio_id: str):

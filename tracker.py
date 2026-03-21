@@ -1919,9 +1919,18 @@ def _render_card(m: dict) -> str:
                     f'<td><span class="mf-status" style="color:{fg};background:{bg}">{lbl}</span></td>'
                     f'</tr>'
                 )
+            unpaid_total = sum(
+                f["amount"] for f in fees if f["status"] != "paid"
+            )
+            total_tag = (
+                f' &nbsp;·&nbsp; ~${unpaid_total:,} remaining'
+                if unpaid_total > 0 else " &nbsp;·&nbsp; all paid"
+            )
             maint_html = (
                 f'<details class="history maint-fees">'
-                f'<summary>Maintenance fees <span class="ev-count">Small Entity</span></summary>'
+                f'<summary>Maintenance fees'
+                f'  <span class="ev-count">Small Entity{total_tag}</span>'
+                f'</summary>'
                 f'<table class="hist-table">'
                 f'<thead><tr><th>Window</th><th>Due</th><th>Fee</th><th>Status</th></tr></thead>'
                 f'<tbody>{fee_rows}</tbody>'

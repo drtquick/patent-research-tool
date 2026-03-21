@@ -100,7 +100,7 @@ export default function Search() {
             title="Patent Dashboard"
             style={styles.iframe}
             srcDoc={result.dashboard_html}
-            sandbox="allow-scripts allow-same-origin allow-modals"
+            sandbox="allow-scripts allow-same-origin allow-modals allow-popups"
           />
           <PrintBar iframeRef={iframeRef} />
         </div>

@@ -1,4 +1,5 @@
 import { useEffect, useState, useRef, useCallback } from "react";
+import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 import PrintBar from "../PrintBar";
 import { useIsMobile } from "../useIsMobile";
@@ -70,7 +71,8 @@ const STATUS_LEGEND = [
 ];
 
 export default function Portfolio() {
-  const isMobile = useIsMobile();
+  const isMobile  = useIsMobile();
+  const navigate  = useNavigate();
   const [patents, setPatents]             = useState([]);
   const [loading, setLoading]             = useState(true);
   const [error,   setError]               = useState("");
@@ -78,6 +80,8 @@ export default function Portfolio() {
   const [viewLoading, setViewLoading]     = useState(false);
   const [viewingNumber, setViewingNumber] = useState(null);
   const [viewingId, setViewingId]         = useState(null);
+  const [familyName, setFamilyName]       = useState("");
+  const [nameTimer, setNameTimer]         = useState(null);
   const [confirmTarget, setConfirmTarget] = useState(null);
   const iframeRef      = useRef(null);
   const notesRef       = useRef({});   // always-current notes for the open dashboard
@@ -101,6 +105,7 @@ export default function Portfolio() {
   async function handleView(portfolioId, patentNumber) {
     // Capture the portfolio entry's existing notes before the search starts
     const entry = patents.find(p => p.id === portfolioId);
+    setFamilyName(entry?.family_name || "");
     notesRef.current     = entry?.notes || {};
     viewingIdRef.current = portfolioId;
     setViewingId(portfolioId);
@@ -116,6 +121,21 @@ export default function Portfolio() {
     } finally {
       setViewLoading(false);
     }
+  }
+
+  function handleNameChange(e) {
+    const name = e.target.value;
+    setFamilyName(name);
+    // Update local patents list immediately so the name persists in-session
+    setPatents(prev =>
+      prev.map(p => p.id === viewingIdRef.current ? { ...p, family_name: name } : p)
+    );
+    // Debounced save
+    clearTimeout(nameTimer);
+    setNameTimer(setTimeout(() => {
+      const id = viewingIdRef.current;
+      if (id) api.updatePortfolioName(id, name).catch(() => {});
+    }, 700));
   }
 
   // Called when the dashboard iframe finishes loading — inject saved notes and
@@ -202,7 +222,21 @@ export default function Portfolio() {
             style={styles.backBtn}
             onClick={() => { setViewing(null); setViewingNumber(null); setViewingId(null); }}
           >
-            ← Back to Portfolio
+            ← Back
+          </button>
+          <input
+            style={styles.nameInput}
+            value={familyName}
+            onChange={handleNameChange}
+            placeholder={`Name this family (e.g. "Widget Portfolio")…`}
+            title="Custom name for this patent family — saved automatically"
+          />
+          <button
+            style={styles.alertsBtn}
+            onClick={() => navigate(`/alerts?patent=${encodeURIComponent(viewingNumber)}`)}
+            title="View deadline alerts for this patent family"
+          >
+            🔔 Family Alerts
           </button>
         </div>
         <div style={styles.iframeWrap}>
@@ -211,7 +245,7 @@ export default function Portfolio() {
             title="Patent Dashboard"
             style={styles.iframe}
             srcDoc={viewing.dashboard_html}
-            sandbox="allow-scripts allow-same-origin allow-modals"
+            sandbox="allow-scripts allow-same-origin allow-modals allow-popups"
             onLoad={handleIframeLoad}
           />
           <PrintBar iframeRef={iframeRef} />
@@ -268,6 +302,9 @@ export default function Portfolio() {
                   {p.family_size || "?"} members
                 </span>
               </div>
+              {p.family_name && (
+                <div style={styles.familyNameTag}>📁 {p.family_name}</div>
+              )}
               <p style={styles.title}>{p.title || "—"}</p>
               <div style={styles.jurisdictions}>
                 {countries.map(([cc, st], i) => {
@@ -325,9 +362,17 @@ const styles = {
     color: "#fff", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600 },
   deleteBtn: { padding: "8px 14px", borderRadius: 8, background: "#fff",
     color: "#d32f2f", border: "1px solid #f5c6cb", cursor: "pointer", fontSize: 13 },
-  dashHeader:  { marginBottom: 12 },
-  backBtn:     { padding: "8px 16px", borderRadius: 8, background: "#f0f4f8",
-    border: "1px solid #d0d7de", cursor: "pointer", fontSize: 14 },
+  dashHeader:  { marginBottom: 12, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" },
+  backBtn:     { padding: "8px 14px", borderRadius: 8, background: "#f0f4f8",
+    border: "1px solid #d0d7de", cursor: "pointer", fontSize: 14, whiteSpace: "nowrap" },
+  nameInput:   { flex: 1, minWidth: 160, maxWidth: 380, padding: "7px 12px", borderRadius: 8,
+    border: "1px solid #d0d7de", fontSize: 14, color: "#1a1a2e", background: "#fff",
+    fontFamily: "inherit" },
+  alertsBtn:   { padding: "8px 14px", borderRadius: 8, background: "#fff3e0",
+    border: "1px solid #ffe0b2", color: "#e65100", cursor: "pointer",
+    fontSize: 13, fontWeight: 600, whiteSpace: "nowrap" },
+  familyNameTag: { fontSize: 12, color: "#1565c0", fontWeight: 600, marginBottom: 4,
+    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
   iframeWrap:  { border: "1px solid #e0e0e0", borderRadius: 10, overflow: "hidden" },
   iframe:      { width: "100%", height: "85vh", border: "none", display: "block" },
   loadingOverlay: { display: "flex", flexDirection: "column", alignItems: "center",
