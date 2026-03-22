@@ -291,6 +291,16 @@ export default function Portfolio() {
             </span>
           )}
           <button
+            style={styles.docsBtn}
+            onClick={() => {
+              const usEntry = (viewing?.family || []).find((m) => m.country === "US");
+              setDocsPanel({ portfolioId: viewingId, patentNumber: viewingNumber, usAppNum: usEntry?.app_num || "" });
+            }}
+            title="View USPTO prosecution documents and manage files"
+          >
+            📎 Files
+          </button>
+          <button
             style={styles.refreshBtn}
             onClick={handleRefresh}
             title="Force a fresh data pull from Google Patents"

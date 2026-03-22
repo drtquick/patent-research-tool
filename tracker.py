@@ -1893,10 +1893,22 @@ def _render_card(m: dict) -> str:
     # Normalize PCT application number format: "PCT/US2020/066580" not "PC:T/..." variants
     if code == "WO" and display and not display.upper().startswith("WO"):
         display = re.sub(r'\bPC\s*[:\s]*T\s*[:/\s]+', 'PCT/', display, flags=re.IGNORECASE)
-    pnum    = (
-        f'<a href="{href}" target="_blank">{display}</a>'
-        if href else display
-    )
+    # Multi-viewer links so users on networks that block patents.google.com have alternatives
+    _esp_url = f"https://worldwide.espacenet.com/patent/search?q=pn%3D{m['pub_num'].replace(' ','')}"
+    _vl = []
+    if href:
+        _vl.append(f'<a href="{href}" class="vl vl-gp" target="_blank" title="Google Patents">GP</a>')
+    _vl.append(f'<a href="{_esp_url}" class="vl vl-esn" target="_blank" title="Espacenet">ESN</a>')
+    if code == "US":
+        _c_app = re.sub(r"[^\d]", "", app_num) if app_num else ""
+        _c_pub = re.sub(r"[^\d]", "", m["pub_num"])
+        _usp_url = (
+            f"https://patentcenter.uspto.gov/applications/{_c_app}"
+            if _c_app
+            else f"https://ppubs.uspto.gov/pubwebapp/external.html?q=pn/{_c_pub}&db=USPAT"
+        )
+        _vl.append(f'<a href="{_usp_url}" class="vl vl-usp" target="_blank" title="USPTO Patent Center">USPTO</a>')
+    pnum = f'{display}<span class="vl-row">{"".join(_vl)}</span>'
     title = (m.get("member_title") or m.get("title") or "").strip()
     filing = m.get("filing_date") or m.get("date") or "—"
     grant  = m.get("grant_date", "")
@@ -2276,6 +2288,15 @@ def generate_dashboard_html(
 
     assignee_str = "; ".join(assignees) if assignees else "N/A"
 
+    # Alternative patent viewer URLs for the hero section.
+    # Google Patents may be blocked on some corporate networks; these are fallbacks.
+    _hero_norm = number.replace(" ", "").replace(",", "")
+    _hero_esp  = f"https://worldwide.espacenet.com/patent/search?q=pn%3D{_hero_norm}"
+    _hero_usp  = (
+        f"https://ppubs.uspto.gov/pubwebapp/external.html?q=pn/{_hero_norm}&db=USPAT"
+        if _hero_norm.startswith("US") else ""
+    )
+
     epo_section_html = _render_epo_section(epo_only, discrepancies)
 
     # Abstract section — pre-computed to avoid nested f-string quoting issues
@@ -2409,6 +2430,12 @@ def generate_dashboard_html(
       display: flex; justify-content: space-between; align-items: flex-start;
     }}
     .card-pnum {{ font-size: 1rem; font-weight: 700; }}
+    .vl-row {{ display:inline-flex; gap:3px; margin-left:6px; flex-wrap:wrap; vertical-align:middle; }}
+    .vl {{ font-size:.58rem; font-weight:700; padding:1px 5px; border-radius:3px;
+           text-decoration:none; border:1px solid; line-height:1.6; }}
+    .vl-gp  {{ background:#e8f0fe; color:#1a73e8; border-color:#c5d8f8; }}
+    .vl-esn {{ background:#e8f5e9; color:#2e7d32; border-color:#c8e6c9; }}
+    .vl-usp {{ background:#fff3e0; color:#e65100; border-color:#ffe0b2; }}
     .status-badge {{
       font-size: .7rem; font-weight: 700; border-radius: 20px;
       padding: .2rem .65rem; white-space: nowrap; flex-shrink: 0;
@@ -2776,6 +2803,8 @@ def generate_dashboard_html(
       <span class="hero-chip">&#9989; Granted {grant_date}</span>
       {'<span class="hero-chip">&#127970; ' + assignee_str + '</span>' if assignees else ''}
       <span class="hero-chip"><a href="{url}" target="_blank" style="color:#93c5fd">Google Patents &#8599;</a></span>
+      <span class="hero-chip"><a href="{_hero_esp}" target="_blank" style="color:#93c5fd">Espacenet &#8599;</a></span>
+      {f'<span class="hero-chip"><a href="{_hero_usp}" target="_blank" style="color:#93c5fd">USPTO Search &#8599;</a></span>' if _hero_usp else ''}
     </div>
   </div>
 
