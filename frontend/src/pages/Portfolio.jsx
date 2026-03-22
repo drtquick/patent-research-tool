@@ -98,10 +98,20 @@ export default function Portfolio() {
   const [loadingMsg, setLoadingMsg]       = useState("");
   const [confirmTarget, setConfirmTarget] = useState(null);
   const [docsPanel,    setDocsPanel]     = useState(null); // { portfolioId, patentNumber, usAppNum }
-  const iframeRef      = useRef(null);
-  const notesRef       = useRef({});   // always-current notes for the open dashboard
-  const viewingIdRef   = useRef(null); // always-current portfolio doc ID
-  const notesTimerRef  = useRef(null); // debounce handle
+  const [refreshError, setRefreshError] = useState("");
+
+  const iframeRef         = useRef(null);
+  const notesRef          = useRef({});   // always-current notes for the open dashboard
+  const viewingIdRef      = useRef(null); // always-current portfolio doc ID
+  const viewingNumberRef  = useRef(null); // always-current patent number
+  const viewingFamilyRef  = useRef([]);   // always-current family array (for US app num lookup)
+  const setDocsPanelRef   = useRef(setDocsPanel); // stable ref so handleIframeLoad can call it
+  const notesTimerRef     = useRef(null); // debounce handle
+
+  // Keep mutable refs in sync with state
+  useEffect(() => { viewingNumberRef.current = viewingNumber; }, [viewingNumber]);
+  useEffect(() => { viewingFamilyRef.current = viewing?.family || []; }, [viewing]);
+  useEffect(() => { setDocsPanelRef.current = setDocsPanel; }, [setDocsPanel]);
 
   useEffect(() => { fetchPortfolio(); }, []);
 
@@ -182,14 +192,20 @@ export default function Portfolio() {
 
   async function handleRefresh() {
     if (!viewingNumber || !viewingId) return;
+    const prevViewing = viewing; // keep so we can restore on failure
     setViewing(null);
     setViewLoading(true);
+    setRefreshError("");
     setLoadingMsg(`Refreshing dashboard for ${viewingNumber}…`);
     try {
       await _doSearch(viewingId, viewingNumber);
     } catch (err) {
-      alert(err.message);
+      // Don't leave the user with a blank screen — put the cached dashboard back
+      setViewing(prevViewing);
       setViewLoading(false);
+      setLoadingMsg("");
+      setRefreshError(err.message);
+      setTimeout(() => setRefreshError(""), 10000);
     }
   }
 
@@ -219,6 +235,34 @@ export default function Portfolio() {
       if (!text) return;
       const ta = doc.querySelector(`.notes-ta[data-pub-num="${pubNum}"]`);
       if (ta) ta.value = text;
+    });
+
+    // Inject a Files button for any card that doesn't already have one.
+    // Older cached dashboards were generated before the button existed in tracker.py;
+    // this ensures every tile always has the button regardless of cache age.
+    doc.querySelectorAll(".card").forEach((card) => {
+      if (card.querySelector(".tile-files-btn")) return; // new HTML already has it
+      const ta = card.querySelector(".notes-ta");
+      if (!ta) return;
+      const pubNum = ta.dataset.pubNum;
+      if (!pubNum) return;
+      const btn = doc.createElement("button");
+      btn.className = "tile-files-btn";
+      btn.textContent = "📎 Files";
+      btn.style.cssText =
+        "margin-top:.6rem;padding:5px 12px;border-radius:6px;cursor:pointer;" +
+        "background:#f0f4f8;border:1px solid #d0d7de;font-size:.75rem;color:#1a1a2e;" +
+        "font-weight:600;display:inline-flex;align-items:center;gap:4px;";
+      btn.addEventListener("click", () => {
+        const usEntry = (viewingFamilyRef.current || []).find((m) => m.country === "US");
+        setDocsPanelRef.current({
+          portfolioId:  viewingIdRef.current,
+          patentNumber: viewingNumberRef.current,
+          usAppNum:     usEntry?.app_num || "",
+          tilePubNum:   pubNum,
+        });
+      });
+      card.appendChild(btn);
     });
 
     // Wire up listeners — save on every keystroke (debounced 800 ms)
@@ -341,6 +385,11 @@ export default function Portfolio() {
             🔔 Family Alerts
           </button>
         </div>
+        {refreshError && (
+          <div style={styles.refreshErrorBanner}>
+            ⚠️ Refresh failed: {refreshError} — your cached dashboard is still shown below.
+          </div>
+        )}
         <div style={styles.iframeWrap}>
           <iframe
             ref={iframeRef}
@@ -502,6 +551,11 @@ const styles = {
   familyNameTag: { fontSize: 12, color: "#1565c0", fontWeight: 600, marginBottom: 4,
     overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
   iframeWrap:  { border: "1px solid #e0e0e0", borderRadius: 10, overflow: "hidden" },
+  refreshErrorBanner: {
+    margin: "0 0 10px", padding: "10px 14px", borderRadius: 8,
+    background: "#fff3cd", border: "1px solid #ffc107",
+    color: "#856404", fontSize: 13, lineHeight: 1.5,
+  },
   iframe:      { width: "100%", height: "85vh", border: "none", display: "block" },
   loadingOverlay: { display: "flex", flexDirection: "column", alignItems: "center",
     justifyContent: "center", minHeight: "60vh", gap: 20 },
