@@ -2,6 +2,7 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 import PrintBar from "../PrintBar";
+import DocumentsPanel from "../DocumentsPanel";
 import { useIsMobile } from "../useIsMobile";
 
 /** Inline confirmation modal — replaces browser confirm() */
@@ -96,6 +97,7 @@ export default function Portfolio() {
   const [nameTimer, setNameTimer]         = useState(null);
   const [loadingMsg, setLoadingMsg]       = useState("");
   const [confirmTarget, setConfirmTarget] = useState(null);
+  const [docsPanel,    setDocsPanel]     = useState(null); // { portfolioId, patentNumber, usAppNum }
   const iframeRef      = useRef(null);
   const notesRef       = useRef({});   // always-current notes for the open dashboard
   const viewingIdRef   = useRef(null); // always-current portfolio doc ID
@@ -320,6 +322,15 @@ export default function Portfolio() {
 
   return (
     <div style={{ ...styles.page, padding: isMobile ? "1rem" : "2rem" }}>
+      {/* Documents panel modal */}
+      {docsPanel && (
+        <DocumentsPanel
+          portfolioId={docsPanel.portfolioId}
+          patentNumber={docsPanel.patentNumber}
+          usAppNum={docsPanel.usAppNum}
+          onClose={() => setDocsPanel(null)}
+        />
+      )}
       {confirmTarget && (
         <ConfirmModal
           patent={confirmTarget.patentNumber}
@@ -356,7 +367,9 @@ export default function Portfolio() {
             const cc = m.country || "??";
             if (!countryMap.has(cc)) countryMap.set(cc, m.status || "unknown");
           }
-          const countries = Array.from(countryMap.entries());
+          const countries  = Array.from(countryMap.entries());
+          const usEntry    = family.find((m) => m.country === "US");
+          const usAppNum   = usEntry?.app_num || "";
 
           return (
             <div key={p.id} style={styles.card}>
@@ -384,6 +397,13 @@ export default function Portfolio() {
               <div style={styles.cardActions}>
                 <button style={styles.viewBtn} onClick={() => handleView(p.id, p.patent_number)}>
                   View Dashboard
+                </button>
+                <button
+                  style={styles.docsBtn}
+                  onClick={() => setDocsPanel({ portfolioId: p.id, patentNumber: p.patent_number, usAppNum })}
+                  title="View USPTO prosecution documents and manage files"
+                >
+                  📎 Files
                 </button>
                 <button style={styles.deleteBtn} onClick={() => handleDelete(p.id, p.patent_number)}>
                   Remove
@@ -424,6 +444,9 @@ const styles = {
   cardActions: { display: "flex", gap: 8, marginTop: 4 },
   viewBtn:   { flex: 1, padding: "8px", borderRadius: 8, background: "#1a73e8",
     color: "#fff", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600 },
+  docsBtn:   { padding: "8px 12px", borderRadius: 8, background: "#f0f4f8",
+    border: "1px solid #d0d7de", cursor: "pointer", fontSize: 13, color: "#1a1a2e",
+    fontWeight: 500 },
   deleteBtn: { padding: "8px 14px", borderRadius: 8, background: "#fff",
     color: "#d32f2f", border: "1px solid #f5c6cb", cursor: "pointer", fontSize: 13 },
   dashHeader:  { marginBottom: 12, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" },

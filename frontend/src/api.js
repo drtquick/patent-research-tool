@@ -60,4 +60,21 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(data),
     }),
+
+  // USPTO Open Data Portal documents
+  getUsptoDocs: (appNum) =>
+    authFetch(`/api/uspto/documents/${encodeURIComponent(appNum)}`),
+
+  // Portfolio file metadata CRUD (Storage uploads handled by Firebase SDK client-side)
+  listPortfolioFiles: (id) =>
+    authFetch(`/api/portfolios/${id}/files`),
+
+  addPortfolioFile: (id, meta) =>
+    authFetch(`/api/portfolios/${id}/files`, {
+      method: "POST",
+      body: JSON.stringify(meta),
+    }),
+
+  deletePortfolioFile: (id, fileId) =>
+    authFetch(`/api/portfolios/${id}/files/${fileId}`, { method: "DELETE" }),
 };

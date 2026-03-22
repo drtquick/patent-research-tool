@@ -608,6 +608,139 @@ def patch_portfolio_notes(portfolio_id: str):
         return jsonify({"error": str(exc)}), 500
 
 
+@app.route("/api/uspto/documents/<path:app_num>", methods=["GET"])
+@require_auth
+def get_uspto_documents(app_num: str):
+    """
+    Proxy to USPTO Open Data Portal API to fetch IFW prosecution documents
+    for a US patent application.
+    Returns a document list (if ODP API key is configured) plus the viewer URL.
+    """
+    import re
+    import requests as _req
+
+    # Normalize to pure digits: "16/123,456" → "16123456"
+    clean = re.sub(r"[^\d]", "", app_num)
+    if not clean:
+        return jsonify({"error": "Invalid application number"}), 400
+
+    viewer_url      = f"https://data.uspto.gov/patent-file-wrapper/details/{clean}/documents"
+    patent_center   = f"https://patentcenter.uspto.gov/applications/{clean}"
+    odp_key         = os.environ.get("USPTO_ODP_API_KEY", "").strip()
+
+    if not odp_key:
+        return jsonify({
+            "documents":     [],
+            "viewer_url":    viewer_url,
+            "patent_center": patent_center,
+            "no_key":        True,
+        })
+
+    try:
+        resp = _req.get(
+            f"https://api.uspto.gov/api/v1/patent/applications/{clean}/documents",
+            headers={"X-API-Key": odp_key, "Accept": "application/json"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        raw  = resp.json()
+        # ODP response shape varies; normalise into a flat list
+        docs = (
+            raw.get("patentDocuments")
+            or raw.get("documents")
+            or raw.get("results")
+            or (raw if isinstance(raw, list) else [])
+        )
+        return jsonify({
+            "documents":     docs,
+            "viewer_url":    viewer_url,
+            "patent_center": patent_center,
+        })
+    except Exception as exc:
+        # Return viewer links even on API error so the UI degrades gracefully
+        return jsonify({
+            "documents":     [],
+            "viewer_url":    viewer_url,
+            "patent_center": patent_center,
+            "error":         str(exc),
+        })
+
+
+@app.route("/api/portfolios/<portfolio_id>/files", methods=["GET"])
+@require_auth
+def list_portfolio_files(portfolio_id: str):
+    """List uploaded / linked file metadata for a portfolio entry."""
+    try:
+        docs = (
+            db.collection("users").document(request.uid)
+            .collection("portfolios").document(portfolio_id)
+            .collection("files")
+            .order_by("uploaded_at", direction=firestore.Query.DESCENDING)
+            .stream()
+        )
+        files = []
+        for doc in docs:
+            f        = doc.to_dict()
+            f["id"]  = doc.id
+            ts       = f.get("uploaded_at")
+            if hasattr(ts, "isoformat"):
+                f["uploaded_at"] = ts.isoformat()
+            files.append(f)
+        return jsonify({"files": files})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/portfolios/<portfolio_id>/files", methods=["POST"])
+@require_auth
+def add_portfolio_file(portfolio_id: str):
+    """
+    Record file metadata after a Firebase Storage upload (or to save a USPTO doc link).
+    Body: { name, download_url, storage_path?, size?, type?, source? }
+    """
+    body = request.get_json(silent=True) or {}
+    if not body.get("name") or not body.get("download_url"):
+        return jsonify({"error": "name and download_url are required"}), 400
+    try:
+        port_ref = (
+            db.collection("users").document(request.uid)
+            .collection("portfolios").document(portfolio_id)
+        )
+        if not port_ref.get().exists:
+            return jsonify({"error": "Portfolio not found"}), 404
+        meta = {
+            "name":         body["name"],
+            "download_url": body["download_url"],
+            "storage_path": body.get("storage_path"),   # None for USPTO links
+            "size":         body.get("size", 0),
+            "type":         body.get("type", ""),
+            "source":       body.get("source", "local"), # "local" | "uspto"
+            "uploaded_at":  datetime.now(timezone.utc),
+        }
+        _, doc_ref = port_ref.collection("files").add(meta)
+        return jsonify({"id": doc_ref.id, **{k: v for k, v in meta.items() if k != "uploaded_at"}}), 201
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/portfolios/<portfolio_id>/files/<file_id>", methods=["DELETE"])
+@require_auth
+def delete_portfolio_file(portfolio_id: str, file_id: str):
+    """Delete file metadata from Firestore. Client handles Storage deletion."""
+    try:
+        ref = (
+            db.collection("users").document(request.uid)
+            .collection("portfolios").document(portfolio_id)
+            .collection("files").document(file_id)
+        )
+        if not ref.get().exists:
+            return jsonify({"error": "Not found"}), 404
+        ref.delete()
+        return jsonify({"deleted": file_id})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.route("/api/portfolios/<portfolio_id>", methods=["DELETE"])
 @require_auth
 def delete_portfolio(portfolio_id: str):
