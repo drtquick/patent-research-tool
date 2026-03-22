@@ -69,6 +69,8 @@ export const api = {
   listPortfolioFiles: (id) =>
     authFetch(`/api/portfolios/${id}/files`),
 
+  // meta may include tile_pub_num (e.g. "US12178560B2") to scope file to a specific tile,
+  // or omit / set null for family-level files.
   addPortfolioFile: (id, meta) =>
     authFetch(`/api/portfolios/${id}/files`, {
       method: "POST",

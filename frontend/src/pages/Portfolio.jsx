@@ -105,6 +105,23 @@ export default function Portfolio() {
 
   useEffect(() => { fetchPortfolio(); }, []);
 
+  // Listen for per-tile 📎 Files button postMessages from the dashboard iframe
+  useEffect(() => {
+    function onMessage(e) {
+      if (e.data?.type !== "open-tile-files") return;
+      const pubNum  = e.data.pubNum;
+      const usEntry = (viewing?.family || []).find((m) => m.country === "US");
+      setDocsPanel({
+        portfolioId:  viewingId,
+        patentNumber: viewingNumber,
+        usAppNum:     usEntry?.app_num || "",
+        tilePubNum:   pubNum,   // scoped to this specific tile
+      });
+    }
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [viewing, viewingId, viewingNumber]);
+
   async function fetchPortfolio() {
     setLoading(true);
     try {
@@ -294,11 +311,11 @@ export default function Portfolio() {
             style={styles.docsBtn}
             onClick={() => {
               const usEntry = (viewing?.family || []).find((m) => m.country === "US");
-              setDocsPanel({ portfolioId: viewingId, patentNumber: viewingNumber, usAppNum: usEntry?.app_num || "" });
+              setDocsPanel({ portfolioId: viewingId, patentNumber: viewingNumber, usAppNum: usEntry?.app_num || "", tilePubNum: null });
             }}
-            title="View USPTO prosecution documents and manage files"
+            title="View all files across this patent family"
           >
-            📎 Files
+            📎 All Files
           </button>
           <button
             style={styles.refreshBtn}
@@ -410,8 +427,8 @@ export default function Portfolio() {
                 </button>
                 <button
                   style={styles.docsBtn}
-                  onClick={() => setDocsPanel({ portfolioId: p.id, patentNumber: p.patent_number, usAppNum })}
-                  title="View USPTO prosecution documents and manage files"
+                  onClick={() => setDocsPanel({ portfolioId: p.id, patentNumber: p.patent_number, usAppNum, tilePubNum: null })}
+                  title="View all files for this patent family"
                 >
                   📎 Files
                 </button>

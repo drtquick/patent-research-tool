@@ -715,6 +715,7 @@ def add_portfolio_file(portfolio_id: str):
             "size":         body.get("size", 0),
             "type":         body.get("type", ""),
             "source":       body.get("source", "local"), # "local" | "uspto"
+            "tile_pub_num": body.get("tile_pub_num"),    # e.g. "US12178560B2"; None = family-level
             "uploaded_at":  datetime.now(timezone.utc),
         }
         _, doc_ref = port_ref.collection("files").add(meta)

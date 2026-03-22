@@ -1893,21 +1893,16 @@ def _render_card(m: dict) -> str:
     # Normalize PCT application number format: "PCT/US2020/066580" not "PC:T/..." variants
     if code == "WO" and display and not display.upper().startswith("WO"):
         display = re.sub(r'\bPC\s*[:\s]*T\s*[:/\s]+', 'PCT/', display, flags=re.IGNORECASE)
-    # Multi-viewer links so users on networks that block patents.google.com have alternatives
+    # Viewer pills: Espacenet (always) + ODP (US only).  GP removed — blocked on many networks.
     _esp_url = f"https://worldwide.espacenet.com/patent/search?q=pn%3D{m['pub_num'].replace(' ','')}"
-    _vl = []
-    if href:
-        _vl.append(f'<a href="{href}" class="vl vl-gp" target="_blank" title="Google Patents">GP</a>')
-    _vl.append(f'<a href="{_esp_url}" class="vl vl-esn" target="_blank" title="Espacenet">ESN</a>')
+    _vl = [f'<a href="{_esp_url}" class="vl vl-esn" target="_blank" title="Espacenet">ESN</a>']
     if code == "US":
         _c_app = re.sub(r"[^\d]", "", app_num) if app_num else ""
-        _c_pub = re.sub(r"[^\d]", "", m["pub_num"])
-        _usp_url = (
-            f"https://patentcenter.uspto.gov/applications/{_c_app}"
-            if _c_app
-            else f"https://ppubs.uspto.gov/pubwebapp/external.html?q=pn/{_c_pub}&db=USPAT"
+        _odp_url = (
+            f"https://data.uspto.gov/patent-file-wrapper/details/{_c_app}/documents"
+            if _c_app else "https://data.uspto.gov/patent-file-wrapper"
         )
-        _vl.append(f'<a href="{_usp_url}" class="vl vl-usp" target="_blank" title="USPTO Patent Center">USPTO</a>')
+        _vl.append(f'<a href="{_odp_url}" class="vl vl-usp" target="_blank" title="USPTO Open Data Portal">ODP</a>')
     pnum = f'{display}<span class="vl-row">{"".join(_vl)}</span>'
     title = (m.get("member_title") or m.get("title") or "").strip()
     filing = m.get("filing_date") or m.get("date") or "—"
@@ -2137,6 +2132,15 @@ def _render_card(m: dict) -> str:
         f'</div>'
     )
 
+    # Per-tile Files button — sends postMessage to the parent Portfolio.jsx so it can
+    # open the DocumentsPanel scoped to this specific tile (pub_num).
+    _pub_esc = pub_num_key.replace("'", "\\'")
+    tile_files_html = (
+        f'<button class="tile-files-btn" '
+        f"onclick=\"window.parent.postMessage({{type:'open-tile-files',pubNum:'{_pub_esc}'}},window.location.origin)\">"
+        f'&#128206; Files</button>'
+    )
+
     return (
         f'<div class="card" style="border-top:4px solid {border}">'
         f'  <div class="card-head">'
@@ -2152,6 +2156,7 @@ def _render_card(m: dict) -> str:
         + next_deadline_html
         + maint_html + annuity_html + latest_html + rej_html + rej_summary_html + err_html + history_html
         + notes_html
+        + tile_files_html
         + '</div>'
     )
 
@@ -2288,13 +2293,15 @@ def generate_dashboard_html(
 
     assignee_str = "; ".join(assignees) if assignees else "N/A"
 
-    # Alternative patent viewer URLs for the hero section.
-    # Google Patents may be blocked on some corporate networks; these are fallbacks.
+    # Alternative patent viewer URLs for the hero section (GP removed — often blocked).
     _hero_norm = number.replace(" ", "").replace(",", "")
     _hero_esp  = f"https://worldwide.espacenet.com/patent/search?q=pn%3D{_hero_norm}"
-    _hero_usp  = (
-        f"https://ppubs.uspto.gov/pubwebapp/external.html?q=pn/{_hero_norm}&db=USPAT"
-        if _hero_norm.startswith("US") else ""
+    # ODP link: find the US family member's application number for the file-wrapper URL
+    _hero_us_m   = next((m for m in family_details if country_code(m["pub_num"]) == "US"), None)
+    _hero_us_app = re.sub(r"[^\d]", "", _hero_us_m.get("app_num", "")) if _hero_us_m else ""
+    _hero_odp    = (
+        f"https://data.uspto.gov/patent-file-wrapper/details/{_hero_us_app}/documents"
+        if _hero_us_app else ""
     )
 
     epo_section_html = _render_epo_section(epo_only, discrepancies)
@@ -2433,9 +2440,14 @@ def generate_dashboard_html(
     .vl-row {{ display:inline-flex; gap:3px; margin-left:6px; flex-wrap:wrap; vertical-align:middle; }}
     .vl {{ font-size:.58rem; font-weight:700; padding:1px 5px; border-radius:3px;
            text-decoration:none; border:1px solid; line-height:1.6; }}
-    .vl-gp  {{ background:#e8f0fe; color:#1a73e8; border-color:#c5d8f8; }}
     .vl-esn {{ background:#e8f5e9; color:#2e7d32; border-color:#c8e6c9; }}
     .vl-usp {{ background:#fff3e0; color:#e65100; border-color:#ffe0b2; }}
+    .tile-files-btn {{
+      margin-top:.6rem; padding:5px 12px; border-radius:6px; cursor:pointer;
+      background:#f0f4f8; border:1px solid #d0d7de; font-size:.75rem;
+      color:#1a1a2e; font-weight:600; display:inline-flex; align-items:center; gap:4px;
+    }}
+    .tile-files-btn:hover {{ background:#e2e8f0; }}
     .status-badge {{
       font-size: .7rem; font-weight: 700; border-radius: 20px;
       padding: .2rem .65rem; white-space: nowrap; flex-shrink: 0;
@@ -2802,9 +2814,8 @@ def generate_dashboard_html(
       <span class="hero-chip">&#128197; Filed {filing_date}</span>
       <span class="hero-chip">&#9989; Granted {grant_date}</span>
       {'<span class="hero-chip">&#127970; ' + assignee_str + '</span>' if assignees else ''}
-      <span class="hero-chip"><a href="{url}" target="_blank" style="color:#93c5fd">Google Patents &#8599;</a></span>
       <span class="hero-chip"><a href="{_hero_esp}" target="_blank" style="color:#93c5fd">Espacenet &#8599;</a></span>
-      {f'<span class="hero-chip"><a href="{_hero_usp}" target="_blank" style="color:#93c5fd">USPTO Search &#8599;</a></span>' if _hero_usp else ''}
+      {f'<span class="hero-chip"><a href="{_hero_odp}" target="_blank" style="color:#93c5fd">USPTO ODP &#8599;</a></span>' if _hero_odp else ''}
     </div>
   </div>
 
