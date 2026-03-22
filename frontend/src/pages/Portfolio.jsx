@@ -288,6 +288,15 @@ export default function Portfolio() {
             onCancel={() => setConfirmTarget(null)}
           />
         )}
+        {docsPanel && (
+          <DocumentsPanel
+            portfolioId={docsPanel.portfolioId}
+            patentNumber={docsPanel.patentNumber}
+            usAppNum={docsPanel.usAppNum}
+            tilePubNum={docsPanel.tilePubNum}
+            onClose={() => setDocsPanel(null)}
+          />
+        )}
         <div style={styles.dashHeader}>
           <button
             style={styles.backBtn}
@@ -355,6 +364,7 @@ export default function Portfolio() {
           portfolioId={docsPanel.portfolioId}
           patentNumber={docsPanel.patentNumber}
           usAppNum={docsPanel.usAppNum}
+          tilePubNum={docsPanel.tilePubNum}
           onClose={() => setDocsPanel(null)}
         />
       )}

@@ -2137,7 +2137,7 @@ def _render_card(m: dict) -> str:
     _pub_esc = pub_num_key.replace("'", "\\'")
     tile_files_html = (
         f'<button class="tile-files-btn" '
-        f"onclick=\"window.parent.postMessage({{type:'open-tile-files',pubNum:'{_pub_esc}'}},window.location.origin)\">"
+        f"onclick=\"window.parent.postMessage({{type:'open-tile-files',pubNum:'{_pub_esc}'}},'*')\">"
         f'&#128206; Files</button>'
     )
 
