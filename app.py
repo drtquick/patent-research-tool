@@ -136,7 +136,11 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
     inventors = [i.get("inventorNameText", "").strip() for i in investors_raw if i.get("inventorNameText")]
     assignees = [a.get("applicantNameText", "").strip() for a in applicants_raw if a.get("applicantNameText")]
 
-    # Build a single-member family from ODP
+    # Build the single family member directly from the ODP data already fetched above.
+    # Do NOT call fetch_us_member_via_odp here — that would make a redundant second
+    # ODP request for the same application number and is likely to trigger a 429.
+    events    = tracker._odp_events_to_standard(bag.get("eventDataBag", []))
+    rej_codes = {"CTNF", "CTFR", "MCTNF", "MCTFR"}
     member = {
         "pub_num": pub_num,
         "app_num": clean,
@@ -144,16 +148,18 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
         "title":   title,
         "country": "US",
     }
-    family_details = [tracker.fetch_us_member_via_odp(member, api_key) or {
+    family_details = [{
         **member,
-        "status":       tracker._odp_status_to_standard(meta.get("applicationStatusDescriptionText", "")),
-        "events":       tracker._odp_events_to_standard(bag.get("eventDataBag", [])),
-        "rejections":   [],
-        "backward_refs":[],
-        "filing_date":  filing,
-        "grant_date":   grant,
-        "member_title": title,
-        "fetch_error":  None,
+        "status":        tracker._odp_status_to_standard(
+                             meta.get("applicationStatusDescriptionText", "")),
+        "events":        events,
+        "rejections":    [e["title"] for e in events if e.get("code") in rej_codes],
+        "backward_refs": [],
+        "filing_date":   filing,
+        "grant_date":    grant,
+        "member_title":  title,
+        "fetch_error":   None,
+        "lang":          "",
     }]
 
     metas = {

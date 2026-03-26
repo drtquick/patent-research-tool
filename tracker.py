@@ -878,12 +878,20 @@ def fetch_us_member_via_odp(member: dict, api_key: str) -> dict | None:
         "fetch_error":   None,
     }
     try:
-        resp = requests.get(
-            f"https://api.uspto.gov/api/v1/patent/applications/{app_num}",
-            headers={"X-API-Key": api_key},
-            timeout=20,
-        )
-        resp.raise_for_status()
+        last_exc = None
+        for attempt in range(3):
+            resp = requests.get(
+                f"https://api.uspto.gov/api/v1/patent/applications/{app_num}",
+                headers={"X-API-Key": api_key},
+                timeout=20,
+            )
+            if resp.status_code == 429 and attempt < 2:
+                wait = (2 ** attempt) + random.uniform(0.5, 2.0)
+                print(f"  ODP 429 (attempt {attempt+1}/3) — retrying in {wait:.1f}s …")
+                _time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            break
         data = resp.json()
         bag  = data["patentFileWrapperDataBag"][0]
         meta = bag.get("applicationMetaData", {})
