@@ -1337,6 +1337,194 @@ def _epo_to_family_member(em: dict) -> dict:
     }
 
 
+def fetch_epo_biblio(docdb: str, token: str) -> Optional[str]:
+    """GET biblio XML from EPO OPS for a docdb publication (CC.NUM.KIND)."""
+    url = (
+        f"https://ops.epo.org/3.2/rest-services/"
+        f"published-data/publication/docdb/{docdb}/biblio"
+    )
+    try:
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/xml"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        return resp.text
+    except requests.HTTPError as exc:
+        print(f"  EPO biblio HTTP {exc.response.status_code} for {docdb}")
+        return None
+    except Exception as exc:
+        print(f"  EPO biblio error: {exc}")
+        return None
+
+
+def fetch_epo_abstract(docdb: str, token: str) -> Optional[str]:
+    """GET abstract XML from EPO OPS for a docdb publication (CC.NUM.KIND)."""
+    url = (
+        f"https://ops.epo.org/3.2/rest-services/"
+        f"published-data/publication/docdb/{docdb}/abstract"
+    )
+    try:
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/xml"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        return resp.text
+    except requests.HTTPError as exc:
+        print(f"  EPO abstract HTTP {exc.response.status_code} for {docdb}")
+        return None
+    except Exception as exc:
+        print(f"  EPO abstract error: {exc}")
+        return None
+
+
+def parse_epo_biblio(biblio_xml: str, abstract_xml: Optional[str] = None) -> dict:
+    """
+    Parse EPO OPS biblio XML (+ optional abstract XML) into a metas-compatible dict.
+    Returns the same key structure as get_metas() so generate_dashboard_html works.
+    DC.date order: [filing_date, pub/grant_date]  (matches Google Patents convention)
+    """
+    result: dict = {
+        "DC.title":       [],
+        "DC.description": [],
+        "DC.contributor": [],
+        "DC.date":        [],
+        "DC.relation":    [],
+        "citation_patent_number":            [],
+        "citation_patent_application_number": [],
+    }
+    if not biblio_xml:
+        return result
+
+    # ── Title — prefer English, fall back to first available ─────────────────
+    titles = (
+        re.findall(r'<invention-title[^>]*lang="en"[^>]*>(.*?)</invention-title>',
+                   biblio_xml, re.DOTALL)
+        or re.findall(r'<invention-title[^>]*>(.*?)</invention-title>',
+                      biblio_xml, re.DOTALL)
+    )
+    if titles:
+        result["DC.title"] = [re.sub(r'<[^>]+>', '', titles[0]).strip()]
+
+    # ── Publication reference → pub_num + pub_date ────────────────────────────
+    pub_date = ""
+    for pub_ref in re.findall(
+        r'<publication-reference[^>]*>(.*?)</publication-reference>', biblio_xml, re.DOTALL
+    ):
+        cc  = _first(re.findall(r'<country>\s*([^<]+?)\s*</country>', pub_ref))
+        num = _first(re.findall(r'<doc-number>\s*([^<]+?)\s*</doc-number>', pub_ref))
+        knd = _first(re.findall(r'<kind>\s*([^<]+?)\s*</kind>', pub_ref))
+        dt  = _first(re.findall(r'<date>\s*([^<]+?)\s*</date>', pub_ref))
+        if cc and num:
+            pub_num = f"{cc}{num}{knd}" if knd else f"{cc}{num}"
+            result["citation_patent_number"] = [pub_num]
+            if dt:
+                pub_date = _fmt_epo_date(dt)
+        break  # first pub-ref is the canonical one
+
+    # ── Application reference → app_num + filing_date ────────────────────────
+    filing_date = ""
+    for app_ref in re.findall(
+        r'<application-reference[^>]*>(.*?)</application-reference>', biblio_xml, re.DOTALL
+    ):
+        cc  = _first(re.findall(r'<country>\s*([^<]+?)\s*</country>', app_ref))
+        num = _first(re.findall(r'<doc-number>\s*([^<]+?)\s*</doc-number>', app_ref))
+        dt  = _first(re.findall(r'<date>\s*([^<]+?)\s*</date>', app_ref))
+        if cc and num:
+            result["citation_patent_application_number"] = [f"{cc}{num}"]
+        if dt:
+            filing_date = _fmt_epo_date(dt)
+        break
+
+    # DC.date: [filing_date, pub_date]  — keep non-empty values only
+    result["DC.date"] = [d for d in [filing_date, pub_date] if d]
+
+    # ── Inventors (data-format="docdb" preferred) ─────────────────────────────
+    inv_pat = (
+        r'<inventor[^>]*data-format="docdb"[^>]*>(.*?)</inventor>'
+        if 'data-format="docdb"' in biblio_xml
+        else r'<inventor[^>]*>(.*?)</inventor>'
+    )
+    for inv in re.findall(inv_pat, biblio_xml, re.DOTALL):
+        name = _first(re.findall(r'<name>\s*([^<]+?)\s*</name>', inv))
+        if name:
+            # EPO names are often ALL-CAPS → title-case them
+            n = name.strip()
+            result["DC.contributor"].append(n.title() if n.isupper() else n)
+
+    # ── Applicants / assignees ────────────────────────────────────────────────
+    app_pat = (
+        r'<applicant[^>]*data-format="docdb"[^>]*>(.*?)</applicant>'
+        if 'data-format="docdb"' in biblio_xml
+        else r'<applicant[^>]*>(.*?)</applicant>'
+    )
+    for appl in re.findall(app_pat, biblio_xml, re.DOTALL):
+        name = _first(re.findall(r'<name>\s*([^<]+?)\s*</name>', appl))
+        if name:
+            n = name.strip()
+            result["DC.contributor"].append(n.title() if n.isupper() else n)
+
+    # ── Abstract ──────────────────────────────────────────────────────────────
+    if abstract_xml:
+        # Strip EPO pub-number preamble e.g. "( US20260059078 ) "
+        cleaned = re.sub(r'\(\s*[A-Z0-9]+\s*\)\s*', '', abstract_xml)
+        paras   = re.findall(r'<p[^>]*>(.*?)</p>', cleaned, re.DOTALL)
+        if not paras:
+            paras = re.findall(r'<abstract[^>]*>(.*?)</abstract>', cleaned, re.DOTALL)
+        if paras:
+            text = re.sub(r'<[^>]+>', '', '\n'.join(paras)).strip()
+            if text:
+                result["DC.description"] = [text]
+
+    return result
+
+
+def cross_validate_odp_epo(family_details: list, epo_members: list) -> list:
+    """
+    Compare ODP-fetched prosecution status against EPO kind-code-derived status
+    for US members.  Returns a list of discrepancy dicts when they disagree.
+    Each dict: {pub_num, odp_status, epo_status, note}
+    """
+    epo_by_norm:    dict[str, dict] = {normalize(em["pub_num"]): em for em in epo_members}
+    epo_us_members: list[dict]      = [em for em in epo_members if em["country"] == "US"]
+
+    discrepancies: list[dict] = []
+    for m in family_details:
+        cc = country_code(m["pub_num"])
+        if cc != "US":
+            continue
+        odp_status = m.get("status", "unknown")
+        if odp_status == "unknown":
+            continue
+
+        # Find corresponding EPO member — exact pub_num match first, then any US member
+        epo_m = epo_by_norm.get(normalize(m["pub_num"]))
+        if not epo_m and epo_us_members:
+            epo_m = epo_us_members[0]
+        if not epo_m:
+            continue
+
+        epo_status = _epo_member_status(epo_m.get("kind", ""))
+        if epo_status == "unknown":
+            continue
+
+        if odp_status != epo_status:
+            discrepancies.append({
+                "pub_num":    m["pub_num"],
+                "odp_status": odp_status,
+                "epo_status": epo_status,
+                "note": (
+                    f"{m['pub_num']}: USPTO ODP reports '{odp_status}' "
+                    f"but EPO kind code '{epo_m.get('kind', '')}' implies '{epo_status}'. "
+                    f"Verify current status in USPTO Patent Center."
+                ),
+            })
+    return discrepancies
+
+
 def _render_epo_section(
     epo_only: Optional[list], discrepancies: Optional[list]
 ) -> str:

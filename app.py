@@ -87,136 +87,275 @@ def require_auth(f):
 
 # ── Core search logic ─────────────────────────────────────────────────────────
 
-def _odp_resolve_app_num(raw: str) -> str | None:
-    """
-    If raw looks like a bare US application number (8 digits, optionally
-    formatted as XX/XXX,XXX), call the USPTO ODP to get the published/granted
-    patent number and return it so normal GP lookup can proceed.
-    Returns None if the input is not an app number or the lookup fails.
-    """
-    import re as _re, requests as _rq
+def _is_us_app_num(raw: str) -> bool:
+    """Return True if raw looks like a bare US application number (8 digits, XX/XXX,XXX, etc.)."""
+    import re as _re
     clean = _re.sub(r"[^\d]", "", raw)
-    # 8-digit US app number, optionally with slash separator
-    if not (_re.fullmatch(r"\d{8}", clean) and (_re.fullmatch(r"\d{8}", raw.strip()) or "/" in raw)):
-        return None
+    return bool(
+        len(clean) == 8
+        and (_re.fullmatch(r"\d{8}", raw.strip()) or "/" in raw)
+    )
+
+
+def _run_search_from_odp(app_num_raw: str) -> dict:
+    """
+    Build a complete search result directly from the USPTO Open Data Portal,
+    bypassing Google Patents entirely.  Used for bare US application number
+    inputs and as a fallback when the resolved pub number isn't on GP yet.
+    """
+    import requests as _rq
+    import re as _re
+
+    clean   = _re.sub(r"[^\d]", "", app_num_raw)
     api_key = os.environ.get("USPTO_ODP_API_KEY", "")
-    if not api_key:
-        return None
-    try:
-        resp = _rq.get(
-            f"https://api.uspto.gov/api/v1/patent/applications/{clean}",
-            headers={"X-API-Key": api_key},
-            timeout=10,
-        )
-        if not resp.ok:
-            return None
-        bag  = resp.json()["patentFileWrapperDataBag"][0]
-        meta = bag.get("applicationMetaData", {})
-        patent_num = meta.get("patentNumber")        # e.g. "11940950" (granted)
-        pg_pub     = meta.get("earliestPublicationNumber")  # e.g. "US20230126573A1"
-        if patent_num:
-            return f"US{patent_num}B2"   # candidates loop will also try B1/A1
-        if pg_pub:
-            return pg_pub
-        return f"US{clean}"              # last resort: app num as-is
-    except Exception:
-        return None
+
+    resp = _rq.get(
+        f"https://api.uspto.gov/api/v1/patent/applications/{clean}",
+        headers={"X-API-Key": api_key},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    bag  = resp.json()["patentFileWrapperDataBag"][0]
+    meta = bag.get("applicationMetaData", {})
+
+    # Canonical publication/patent number
+    patent_num = meta.get("patentNumber")
+    pg_pub     = meta.get("earliestPublicationNumber") or ""
+    if patent_num:
+        pub_num = f"US{patent_num}B2"
+    elif pg_pub:
+        pub_num = pg_pub
+    else:
+        pub_num = f"US{clean}"
+
+    title   = (meta.get("inventionTitle") or "").strip()
+    filing  = meta.get("filingDate") or ""
+    grant   = meta.get("grantDate")  or ""
+    investors_raw = meta.get("inventorBag",   [])
+    applicants_raw= meta.get("applicantBag",  [])
+    inventors = [i.get("inventorNameText", "").strip() for i in investors_raw if i.get("inventorNameText")]
+    assignees = [a.get("applicantNameText", "").strip() for a in applicants_raw if a.get("applicantNameText")]
+
+    # Build a single-member family from ODP
+    member = {
+        "pub_num": pub_num,
+        "app_num": clean,
+        "href":    f"https://patents.google.com/patent/{pub_num}/en",
+        "title":   title,
+        "country": "US",
+    }
+    family_details = [tracker.fetch_us_member_via_odp(member, api_key) or {
+        **member,
+        "status":       tracker._odp_status_to_standard(meta.get("applicationStatusDescriptionText", "")),
+        "events":       tracker._odp_events_to_standard(bag.get("eventDataBag", [])),
+        "rejections":   [],
+        "backward_refs":[],
+        "filing_date":  filing,
+        "grant_date":   grant,
+        "member_title": title,
+        "fetch_error":  None,
+    }]
+
+    metas = {
+        "DC.title":       [title],
+        "DC.description": [],
+        "DC.contributor": assignees + inventors,
+        "DC.date":        [d for d in [filing, grant] if d],
+        "citation_patent_number": [pub_num],
+    }
+
+    odp_url = f"https://data.uspto.gov/patent-file-wrapper/details/{clean}/documents"
+    dashboard_html = tracker.generate_dashboard_html(
+        metas, family_details, odp_url, pub_num
+    )
+
+    dl = tracker._get_next_deadline(family_details[0])
+    family_summary = [{
+        "pub_num":             pub_num,
+        "country":             "US",
+        "status":              family_details[0].get("status", "unknown"),
+        "filing_date":         filing,
+        "grant_date":          grant,
+        "app_num":             clean,
+        "title":               title,
+        "href":                member["href"],
+        "next_deadline_label": dl["label"] if dl else "",
+        "next_deadline_date":  dl["date"]  if dl else "",
+        "next_deadline_type":  dl["type"]  if dl else "",
+    }]
+
+    status_text = (meta.get("applicationStatusDescriptionText") or "").lower()
+    return {
+        "patent_number":       pub_num,
+        "title":               title,
+        "translated_title":    "",
+        "translated_abstract": "",
+        "filing_date":         filing,
+        "grant_date":          grant,
+        "assignees":           assignees,
+        "inventors":           inventors,
+        "family_size":         1,
+        "jurisdictions":       1,
+        "granted_count":       1 if "patent" in status_text else 0,
+        "pending_count":       0 if "patent" in status_text else 1,
+        "family":              family_summary,
+        "epo_only":            [],
+        "discrepancies":       [],
+        "dashboard_html":      dashboard_html,
+        "google_patents_url":  odp_url,
+        "main_metas":          metas,
+        "claims":              [],
+    }
 
 
 def _run_search(patent_input: str) -> dict:
     """
-    Orchestrate a full tracker search and return all results as a dict.
-    Calls tracker.py functions directly — no file writes, no browser opens.
+    Orchestrate a full search and return all results as a dict.
+
+    Data-source priority (β 1.7):
+      1. Bare US application number  → USPTO ODP only (no GP at all)
+      2. Pub number                  → EPO OPS primary (biblio + family),
+                                       ODP for US prosecution details,
+                                       GP only as last-resort fallback if EPO fails
     """
     import requests as _req
 
-    # ── Resolve bare US application numbers → publication/patent number ──────
-    resolved = _odp_resolve_app_num(patent_input)
-    if resolved:
-        patent_input = resolved
+    # ── Bare US application number → ODP directly, no GP ─────────────────────
+    if _is_us_app_num(patent_input):
+        return _run_search_from_odp(patent_input)
 
-    url = tracker.build_url(patent_input)
-    html = None
-    last_exc = None
-    # Try the primary URL first, then progressively softer kind-code fallbacks.
-    # All candidates are tried inside one unified try/except so no uncaught
-    # HTTPError can leak out as a raw "404 Client Error" string.
-    candidates = [url]
-    if "B2/en" in url:
-        candidates += [
-            url.replace("B2/en", "B1/en"),   # older-style grant
-            url.replace("B2/en", "A1/en"),   # published application
-            url.replace("B2/en", "A2/en"),   # PCT published application
-        ]
-    elif "B1/en" in url:
-        candidates += [url.replace("B1/en", "B2/en")]
-    # Always include the bare-number URL (no kind code) as a last resort
-    bare = f"https://patents.google.com/patent/{tracker.normalize(patent_input)}/en"
-    if bare not in candidates:
-        candidates.append(bare)
+    # ── Credentials ───────────────────────────────────────────────────────────
+    epo_key    = os.environ.get("EPO_CONSUMER_KEY",    "").strip()
+    epo_secret = os.environ.get("EPO_CONSUMER_SECRET", "").strip()
+    odp_key    = os.environ.get("USPTO_ODP_API_KEY",   "").strip()
 
-    for candidate in candidates:
+    # ── Try EPO OPS as primary source ─────────────────────────────────────────
+    epo_metas:   dict       = {}
+    epo_family:  list       = []   # member dicts ready for fetch_member_details
+    epo_members: list       = []   # raw parse_epo_family output (for merge/cross-val)
+    epo_ran:     bool       = False
+    docdb:       str | None = None
+
+    if epo_key and epo_secret:
+        docdb = tracker.patent_to_docdb(patent_input)
+        if docdb:
+            token = tracker.epo_get_token(epo_key, epo_secret)
+            if token:
+                # Biblio + abstract → metas dict
+                biblio_xml   = tracker.fetch_epo_biblio(docdb, token)
+                abstract_xml = tracker.fetch_epo_abstract(docdb, token)
+                if biblio_xml:
+                    epo_metas = tracker.parse_epo_biblio(biblio_xml, abstract_xml)
+                    epo_ran   = True
+
+                # INPADOC family → member list
+                family_xml = tracker.fetch_epo_family(docdb, token)
+                if family_xml:
+                    epo_members = tracker.parse_epo_family(family_xml)
+                    for em in epo_members:
+                        norm_pub = tracker.normalize(em["pub_num"])
+                        epo_family.append({
+                            "pub_num": em["pub_num"],
+                            "app_num": em.get("app_num", ""),
+                            "href":    f"https://patents.google.com/patent/{norm_pub}/en",
+                            "title":   "",
+                            "country": em["country"],
+                            "date":    em.get("pub_date", "") or em.get("app_date", ""),
+                            "lang":    "",
+                        })
+
+    # ── Decide which family list and metas to use ─────────────────────────────
+    claims: list = []
+    gp_url = f"https://patents.google.com/patent/{tracker.normalize(patent_input)}/en"
+
+    if epo_family:
+        # EPO gave us a family — use it.  Try GP just for claims (non-fatal).
+        metas  = epo_metas if epo_metas.get("citation_patent_number") else {}
+        family = epo_family
+        url    = gp_url
         try:
-            html = tracker.fetch_page(candidate)
-            url  = candidate
-            break
-        except _req.HTTPError as exc:
-            last_exc = exc
-            if exc.response.status_code != 404:
-                raise   # non-404 errors propagate immediately
-            # 404 → try next candidate
+            gp_html = tracker.fetch_page(url)
+            claims  = tracker.parse_claims(gp_html)
+            # If EPO biblio was empty, fall back to GP metas
+            if not metas:
+                gp_metas = tracker.get_metas(gp_html)
+                if gp_metas.get("citation_patent_number"):
+                    metas = gp_metas
         except Exception:
-            raise
+            pass  # claims are nice-to-have; don't fail the whole search
 
-    if html is None:
-        raise ValueError(
-            f"Patent '{patent_input}' was not found on Google Patents. "
-            "Please verify the patent number format and try again."
-        )
+    else:
+        # EPO failed entirely — fall back to GP for everything
+        url       = tracker.build_url(patent_input)
+        html      = None
+        last_exc  = None
+        candidates = [url]
+        if "B2/en" in url:
+            candidates += [
+                url.replace("B2/en", "B1/en"),
+                url.replace("B2/en", "A1/en"),
+                url.replace("B2/en", "A2/en"),
+            ]
+        elif "B1/en" in url:
+            candidates += [url.replace("B1/en", "B2/en")]
+        bare = f"https://patents.google.com/patent/{tracker.normalize(patent_input)}/en"
+        if bare not in candidates:
+            candidates.append(bare)
 
-    metas  = tracker.get_metas(html)
-    family = tracker.parse_family(html)
-    claims = tracker.parse_claims(html)
+        for candidate in candidates:
+            try:
+                html = tracker.fetch_page(candidate)
+                url  = candidate
+                break
+            except _req.HTTPError as exc:
+                last_exc = exc
+                if exc.response.status_code != 404:
+                    raise
+            except Exception:
+                raise
+
+        if html is None:
+            raise ValueError(
+                f"Patent '{patent_input}' was not found. "
+                "EPO OPS and Google Patents both failed to return data for this patent."
+            )
+
+        metas  = tracker.get_metas(html)
+        family = tracker.parse_family(html)
+        claims = tracker.parse_claims(html)
 
     if not metas.get("citation_patent_number"):
         raise ValueError(f"No patent data found for '{patent_input}'")
 
-    # Prefer the caller-supplied patent_input (normalized) as the canonical number
-    # because Google's citation_patent_number meta often omits the country code
-    # (e.g. returns "12,178,560" instead of "US12178560B2"), which breaks
-    # portfolio re-searches later.  Fall back to the meta value only when no
-    # country-code-prefixed input was given.
-    raw_meta = tracker._first(metas.get("citation_patent_number", [])) or ""
+    # ── Canonical patent number ───────────────────────────────────────────────
+    raw_meta   = tracker._first(metas.get("citation_patent_number", [])) or ""
     norm_input = tracker.normalize(patent_input)
-    # If patent_input itself looks like a bare number (no CC), the meta value
-    # (which may include the CC) is more informative.
     if norm_input and not norm_input[0].isdigit():
-        number = norm_input          # e.g. "US12178560B2" from user input
+        number = norm_input
     elif raw_meta:
-        number = tracker.normalize(raw_meta)  # use meta but at least normalize it
+        number = tracker.normalize(raw_meta)
     else:
         number = norm_input or patent_input
-    dates  = metas.get("DC.date", [])
 
-    # Fetch all family member details.
-    # For US patents with a stored app_num, uses USPTO ODP (fast, reliable).
-    # Falls back to Google Patents for non-US or first-time fetches.
-    odp_key        = os.environ.get("USPTO_ODP_API_KEY", "")
+    dates = metas.get("DC.date", [])
+
+    # ── Fetch family member prosecution details ───────────────────────────────
+    # US members → ODP (when app_num available); others → GP page scrape
     total          = len(family)
     family_details = [
         tracker.fetch_member_details(m, i + 1, total, odp_api_key=odp_key)
         for i, m in enumerate(family)
     ]
 
+    # ── ODP ↔ EPO cross-validation for US members ────────────────────────────
+    status_discrepancies: list = []
+    if epo_ran and epo_members:
+        status_discrepancies = tracker.cross_validate_odp_epo(family_details, epo_members)
+
     # ── DeepL batch translation ───────────────────────────────────────────────
-    # Collect all texts that need translation in a single API call:
-    #   slot 0: primary patent title
-    #   slot 1: primary patent abstract
-    #   slots 2+: non-English family member titles
     primary_title    = (tracker._first(metas.get("DC.title", [])) or "").strip()
     primary_abstract = (tracker._first(metas.get("DC.description", [])) or "").strip()
 
-    # Determine which family members need translation (non-English lang tag or country code)
     nonen_indices = [
         i for i, m in enumerate(family_details)
         if tracker.needs_translation(
@@ -225,17 +364,15 @@ def _run_search(patent_input: str) -> dict:
         )
     ]
 
-    primary_cc  = tracker.country_code(number)
-    deepl_key   = os.environ.get("DEEPL_API_KEY", "").strip()
+    primary_cc          = tracker.country_code(number)
+    deepl_key           = os.environ.get("DEEPL_API_KEY", "").strip()
     translated_title    = None
     translated_abstract = None
-    # Only translate the primary patent's title/abstract if it's from a non-English jurisdiction
-    translate_primary = tracker.needs_translation("", primary_cc)
+    translate_primary   = tracker.needs_translation("", primary_cc)
+
     if deepl_key:
-        # Build text list: primary title+abstract first (if non-English jurisdiction),
-        # then non-English family member titles
-        primary_texts  = [primary_title, primary_abstract] if translate_primary else []
-        member_texts   = [family_details[i].get("member_title", "") for i in nonen_indices]
+        primary_texts      = [primary_title, primary_abstract] if translate_primary else []
+        member_texts       = [family_details[i].get("member_title", "") for i in nonen_indices]
         texts_to_translate = primary_texts + member_texts
 
         if texts_to_translate:
@@ -247,7 +384,7 @@ def _run_search(patent_input: str) -> dict:
             def _tr(idx: int) -> str:
                 if idx >= len(translations):
                     return ""
-                t = translations[idx]
+                t   = translations[idx]
                 src = t.get("detected_source_language", "").upper()
                 txt = t.get("text", "").strip()
                 return txt if src not in ("EN",) else ""
@@ -262,24 +399,29 @@ def _run_search(patent_input: str) -> dict:
                 if tr:
                     family_details[family_idx]["translated_title"] = tr
 
-    # EPO OPS enrichment
-    epo_only:      list | None = None
-    discrepancies: list | None = None
-    epo_key    = os.environ.get("EPO_CONSUMER_KEY",    "").strip()
-    epo_secret = os.environ.get("EPO_CONSUMER_SECRET", "").strip()
-    if epo_key and epo_secret:
-        docdb = tracker.patent_to_docdb(patent_input)
-        if docdb:
-            token = tracker.epo_get_token(epo_key, epo_secret)
-            if token:
-                xml = tracker.fetch_epo_family(docdb, token)
-                if xml:
-                    epo_members   = tracker.parse_epo_family(xml)
-                    epo_only, discrepancies = tracker.merge_epo_with_google(
-                        family_details, epo_members
-                    )
-    if epo_only is None:
-        epo_only, discrepancies = [], []
+    # ── EPO INPADOC merge + ODP/EPO discrepancy consolidation ────────────────
+    epo_only:      list = []
+    discrepancies: list = []
+
+    if epo_ran and epo_members:
+        epo_only_raw, pub_discrepancies = tracker.merge_epo_with_google(
+            family_details, epo_members
+        )
+        epo_only = epo_only_raw or []
+
+        # Combine EPO publication discrepancies + ODP/EPO status discrepancies.
+        # Status discrepancies share the same dict shape expected by the dashboard
+        # (country, epo_pub, epo_app, google_pub, google_app, note).
+        discrepancies = list(pub_discrepancies or [])
+        for sd in status_discrepancies:
+            discrepancies.append({
+                "country":    "US",
+                "epo_pub":    sd["pub_num"],
+                "epo_app":    "",
+                "google_pub": sd["pub_num"],
+                "google_app": "",
+                "note":       sd["note"],
+            })
 
     dashboard_html = tracker.generate_dashboard_html(
         metas, family_details, url, patent_input, claims,
@@ -289,7 +431,7 @@ def _run_search(patent_input: str) -> dict:
         translated_abstract=translated_abstract or None,
     )
 
-    # Split contributors into inventors vs assignees (same heuristic as tracker.py)
+    # ── Split contributors into inventors vs assignees ────────────────────────
     contributors = metas.get("DC.contributor", [])
     assignees = [
         c.strip() for c in contributors
@@ -298,9 +440,7 @@ def _run_search(patent_input: str) -> dict:
     ]
     inventors = [c.strip() for c in contributors if c.strip() not in assignees]
 
-    # Compact family summary safe for Firestore (no huge HTML strings).
-    # next_deadline_* fields are computed now (while we still have prosecution events)
-    # so that _compute_deadlines() can generate office-action alerts later.
+    # ── Compact family summary (Firestore-safe) ───────────────────────────────
     family_summary = []
     for m in family_details:
         dl = tracker._get_next_deadline(m)
@@ -319,26 +459,25 @@ def _run_search(patent_input: str) -> dict:
         })
 
     return {
-        "patent_number":      number,
-        "title":              (tracker._first(metas.get("DC.title", [])) or "").strip(),
-        "translated_title":   translated_title or "",
+        "patent_number":       number,
+        "title":               (tracker._first(metas.get("DC.title", [])) or "").strip(),
+        "translated_title":    translated_title or "",
         "translated_abstract": translated_abstract or "",
-        "filing_date":        dates[0] if dates else "",
-        "grant_date":         dates[1] if len(dates) > 1 else "",
-        "assignees":          assignees,
-        "inventors":          inventors,
-        "family_size":        len(family_details),
-        "jurisdictions":      len({tracker.country_code(m["pub_num"]) for m in family_details}),
-        "granted_count":      sum(1 for m in family_details if m["status"] == "granted"),
-        "pending_count":      sum(1 for m in family_details if m["status"] == "pending"),
-        "family":             family_summary,
-        "epo_only":           epo_only,
-        "discrepancies":      discrepancies,
-        "dashboard_html":     dashboard_html,
-        "google_patents_url": url,
-        # Stored for GP-free refresh: regenerate HTML without re-scraping GP
-        "main_metas":         dict(metas),
-        "claims":             claims or [],
+        "filing_date":         dates[0] if dates else "",
+        "grant_date":          dates[1] if len(dates) > 1 else "",
+        "assignees":           assignees,
+        "inventors":           inventors,
+        "family_size":         len(family_details),
+        "jurisdictions":       len({tracker.country_code(m["pub_num"]) for m in family_details}),
+        "granted_count":       sum(1 for m in family_details if m["status"] == "granted"),
+        "pending_count":       sum(1 for m in family_details if m["status"] == "pending"),
+        "family":              family_summary,
+        "epo_only":            epo_only,
+        "discrepancies":       discrepancies,
+        "dashboard_html":      dashboard_html,
+        "google_patents_url":  url,
+        "main_metas":          dict(metas),
+        "claims":              claims or [],
     }
 
 
