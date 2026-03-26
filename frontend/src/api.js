@@ -55,11 +55,16 @@ export const api = {
       body: JSON.stringify({ notes }),
     }),
 
+  // Persist freshly-scraped HTML back to cache (called after full re-scrape)
   refreshPortfolio: (id, data) =>
     authFetch(`/api/portfolios/${id}/dashboard`, {
       method: "PATCH",
       body: JSON.stringify(data),
     }),
+
+  // Re-fetch prosecution data using stored app_nums via USPTO ODP — no GP re-scrape
+  dataRefreshPortfolio: (id) =>
+    authFetch(`/api/portfolios/${id}/refresh`, { method: "POST" }),
 
   // USPTO Open Data Portal documents
   getUsptoDocs: (appNum) =>

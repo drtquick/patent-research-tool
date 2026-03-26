@@ -824,10 +824,115 @@ def extract_rejection_summary(m: dict) -> Optional[dict]:
         }
 
 
-def fetch_member_details(member: dict, idx: int, total: int) -> dict:
+# ── USPTO Open Data Portal (ODP) helpers ─────────────────────────────────────
+
+def _clean_app_num(s: str) -> str:
+    """Strip non-digits so '17/508,065' → '17508065'."""
+    return re.sub(r"[^\d]", "", s or "")
+
+
+def _odp_status_to_standard(status_text: str) -> str:
+    """Map ODP applicationStatusDescriptionText to our standard status values."""
+    s = (status_text or "").lower()
+    if "patent" in s:      return "granted"    # "Patented Case", "Patent in Issue"
+    if "abandon" in s:     return "abandoned"
+    if s:                  return "pending"
+    return "unknown"
+
+
+def _odp_events_to_standard(event_bag: list) -> list:
+    """Convert ODP eventDataBag to the same dict format as parse_legal_events."""
+    events = [
+        {
+            "date":  e.get("eventDate",  ""),
+            "code":  e.get("eventCode",  ""),
+            "title": e.get("eventDescriptionText", ""),
+            "value": "",
+        }
+        for e in (event_bag or [])
+        if e.get("eventDate") or e.get("eventDescriptionText")
+    ]
+    return sorted(events, key=lambda x: x.get("date") or "")
+
+
+def fetch_us_member_via_odp(member: dict, api_key: str) -> dict | None:
+    """
+    Fetch US patent family member details from the USPTO Open Data Portal
+    instead of Google Patents.  Returns a result dict in the same format as
+    fetch_member_details, or None if app_num is missing (caller should fall
+    back to Google Patents).
+    """
+    app_num = _clean_app_num(member.get("app_num", ""))
+    if not app_num:
+        return None   # no app number stored → must fall back to GP
+
     result = {
         **member,
-        "status":        infer_status(member["pub_num"]),
+        "status":        infer_status(member.get("pub_num", "")),
+        "events":        [],
+        "rejections":    [],
+        "backward_refs": [],
+        "filing_date":   "",
+        "grant_date":    "",
+        "member_title":  member.get("member_title", "") or member.get("title", ""),
+        "fetch_error":   None,
+    }
+    try:
+        resp = requests.get(
+            f"https://api.uspto.gov/api/v1/patent/applications/{app_num}",
+            headers={"X-API-Key": api_key},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        bag  = data["patentFileWrapperDataBag"][0]
+        meta = bag.get("applicationMetaData", {})
+
+        result["filing_date"]  = meta.get("filingDate",  "") or ""
+        result["grant_date"]   = meta.get("grantDate",   "") or ""
+        result["app_num"]      = _clean_app_num(bag.get("applicationNumberText") or app_num)
+        result["member_title"] = (meta.get("inventionTitle") or "").strip() or result["member_title"]
+        result["status"]       = _odp_status_to_standard(
+                                     meta.get("applicationStatusDescriptionText", ""))
+        result["events"]       = _odp_events_to_standard(bag.get("eventDataBag", []))
+        # Rejections are inferred from event codes (CTNF / CTFR) rather than GP HTML
+        rej_codes = {"CTNF", "CTFR", "MCTNF", "MCTFR"}
+        result["rejections"] = [
+            e["title"] for e in result["events"] if e.get("code") in rej_codes
+        ]
+    except Exception as exc:
+        result["fetch_error"] = str(exc)[:80]
+
+    return result
+
+
+def fetch_member_details(member: dict, idx: int, total: int,
+                         odp_api_key: str = "") -> dict:
+    """
+    Fetch details for one family member.
+
+    For US patents when odp_api_key is set and the member already has an
+    app_num (refresh path), this uses the USPTO Open Data Portal — zero
+    Google Patents requests.  Falls back to Google Patents for non-US members
+    or when app_num is unavailable (initial search path).
+    """
+    pub_num = member.get("pub_num", "")
+
+    # ── Fast / reliable path: USPTO ODP for US patents ──────────────────────
+    if odp_api_key and pub_num.startswith("US") and member.get("app_num"):
+        print(f"  [{idx:>2}/{total}] {pub_num:<22} … (ODP) ", end="", flush=True)
+        odp_result = fetch_us_member_via_odp(member, odp_api_key)
+        if odp_result is not None and not odp_result.get("fetch_error"):
+            print("ok")
+            _time.sleep(0.05)   # tiny courtesy delay
+            return odp_result
+        err = (odp_result or {}).get("fetch_error", "unknown")
+        print(f"ODP-err({err[:40]}), falling back to GP")
+
+    # ── Standard path: Google Patents ───────────────────────────────────────
+    result = {
+        **member,
+        "status":        infer_status(pub_num),
         "events":        [],
         "rejections":    [],
         "backward_refs": [],
@@ -839,7 +944,7 @@ def fetch_member_details(member: dict, idx: int, total: int) -> dict:
     if not member.get("href"):
         return result
 
-    print(f"  [{idx:>2}/{total}] {member['pub_num']:<22} … ", end="", flush=True)
+    print(f"  [{idx:>2}/{total}] {pub_num:<22} … ", end="", flush=True)
     try:
         page  = fetch_page(member["href"])
         metas = get_metas(page)
@@ -848,7 +953,7 @@ def fetch_member_details(member: dict, idx: int, total: int) -> dict:
         result["grant_date"]    = dates[1] if len(dates) > 1 else ""
         result["app_num"]       = _first(metas.get("citation_patent_application_number", [])) or ""
         result["member_title"]  = (metas.get("DC.title", [""])[0] or member.get("title", "")).strip()
-        result["status"]        = infer_status(member["pub_num"], page)
+        result["status"]        = infer_status(pub_num, page)
         result["events"]        = parse_legal_events(page)
         result["backward_refs"] = parse_backward_refs(page)
         result["rejections"]    = (

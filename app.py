@@ -87,12 +87,53 @@ def require_auth(f):
 
 # ── Core search logic ─────────────────────────────────────────────────────────
 
+def _odp_resolve_app_num(raw: str) -> str | None:
+    """
+    If raw looks like a bare US application number (8 digits, optionally
+    formatted as XX/XXX,XXX), call the USPTO ODP to get the published/granted
+    patent number and return it so normal GP lookup can proceed.
+    Returns None if the input is not an app number or the lookup fails.
+    """
+    import re as _re, requests as _rq
+    clean = _re.sub(r"[^\d]", "", raw)
+    # 8-digit US app number, optionally with slash separator
+    if not (_re.fullmatch(r"\d{8}", clean) and (_re.fullmatch(r"\d{8}", raw.strip()) or "/" in raw)):
+        return None
+    api_key = os.environ.get("USPTO_ODP_API_KEY", "")
+    if not api_key:
+        return None
+    try:
+        resp = _rq.get(
+            f"https://api.uspto.gov/api/v1/patent/applications/{clean}",
+            headers={"X-API-Key": api_key},
+            timeout=10,
+        )
+        if not resp.ok:
+            return None
+        bag  = resp.json()["patentFileWrapperDataBag"][0]
+        meta = bag.get("applicationMetaData", {})
+        patent_num = meta.get("patentNumber")        # e.g. "11940950" (granted)
+        pg_pub     = meta.get("earliestPublicationNumber")  # e.g. "US20230126573A1"
+        if patent_num:
+            return f"US{patent_num}B2"   # candidates loop will also try B1/A1
+        if pg_pub:
+            return pg_pub
+        return f"US{clean}"              # last resort: app num as-is
+    except Exception:
+        return None
+
+
 def _run_search(patent_input: str) -> dict:
     """
     Orchestrate a full tracker search and return all results as a dict.
     Calls tracker.py functions directly — no file writes, no browser opens.
     """
     import requests as _req
+
+    # ── Resolve bare US application numbers → publication/patent number ──────
+    resolved = _odp_resolve_app_num(patent_input)
+    if resolved:
+        patent_input = resolved
 
     url = tracker.build_url(patent_input)
     html = None
@@ -157,10 +198,13 @@ def _run_search(patent_input: str) -> dict:
         number = norm_input or patent_input
     dates  = metas.get("DC.date", [])
 
-    # Fetch all family member details (slow — one HTTP request per member)
+    # Fetch all family member details.
+    # For US patents with a stored app_num, uses USPTO ODP (fast, reliable).
+    # Falls back to Google Patents for non-US or first-time fetches.
+    odp_key        = os.environ.get("USPTO_ODP_API_KEY", "")
     total          = len(family)
     family_details = [
-        tracker.fetch_member_details(m, i + 1, total)
+        tracker.fetch_member_details(m, i + 1, total, odp_api_key=odp_key)
         for i, m in enumerate(family)
     ]
 
@@ -278,6 +322,7 @@ def _run_search(patent_input: str) -> dict:
         "patent_number":      number,
         "title":              (tracker._first(metas.get("DC.title", [])) or "").strip(),
         "translated_title":   translated_title or "",
+        "translated_abstract": translated_abstract or "",
         "filing_date":        dates[0] if dates else "",
         "grant_date":         dates[1] if len(dates) > 1 else "",
         "assignees":          assignees,
@@ -291,6 +336,9 @@ def _run_search(patent_input: str) -> dict:
         "discrepancies":      discrepancies,
         "dashboard_html":     dashboard_html,
         "google_patents_url": url,
+        # Stored for GP-free refresh: regenerate HTML without re-scraping GP
+        "main_metas":         dict(metas),
+        "claims":             claims or [],
     }
 
 
@@ -563,6 +611,115 @@ def patch_portfolio_dashboard(portfolio_id: str):
         return jsonify({"ok": True})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/portfolios/<portfolio_id>/refresh", methods=["POST"])
+@require_auth
+def refresh_portfolio_data(portfolio_id: str):
+    """
+    Re-fetch prosecution data using stored app numbers and USPTO ODP — no
+    full Google Patents re-scrape needed.  Falls back to GP only for non-US
+    members or members whose app_num is missing from stored data.
+    """
+    try:
+        doc = (
+            db.collection("users").document(request.uid)
+            .collection("portfolios").document(portfolio_id).get()
+        )
+        if not doc.exists:
+            return jsonify({"error": "Not found"}), 404
+        stored      = doc.to_dict()
+        stored["id"] = portfolio_id
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    patent_number = stored.get("patent_number", "")
+    stored_family = stored.get("family", [])
+    stored_metas  = stored.get("main_metas") or {}
+    odp_key       = os.environ.get("USPTO_ODP_API_KEY", "")
+
+    if not stored_family:
+        return jsonify({"error": "No stored family data — try Force Re-scrape instead"}), 400
+
+    # Reconstruct member dicts from stored compact family summary
+    members = [
+        {
+            "pub_num": m.get("pub_num", ""),
+            "app_num": m.get("app_num", ""),
+            "href":    m.get("href") or f"https://patents.google.com/patent/{m.get('pub_num','')}/en",
+            "title":   m.get("title", "") or m.get("member_title", ""),
+            "country": m.get("country", ""),
+        }
+        for m in stored_family
+    ]
+
+    total = len(members)
+    family_details = [
+        tracker.fetch_member_details(m, i + 1, total, odp_api_key=odp_key)
+        for i, m in enumerate(members)
+    ]
+
+    # If we have main_metas from the initial scrape, use those.
+    # Otherwise reconstruct a minimal version from stored fields.
+    if not stored_metas:
+        stored_metas = {
+            "DC.title":       [stored.get("title", "")],
+            "DC.description": [stored.get("translated_abstract", "")],
+            "DC.contributor": stored.get("assignees", []) + stored.get("inventors", []),
+            "DC.date":        [stored.get("filing_date", ""), stored.get("grant_date", "")],
+            "citation_patent_number": [patent_number],
+        }
+
+    dashboard_html = tracker.generate_dashboard_html(
+        stored_metas, family_details,
+        stored.get("google_patents_url", ""),
+        patent_number,
+        stored.get("claims") or None,
+        epo_only=stored.get("epo_only") or None,
+        discrepancies=stored.get("discrepancies") or None,
+        translated_title=stored.get("translated_title") or None,
+        translated_abstract=stored.get("translated_abstract") or None,
+    )
+
+    # Rebuild compact family summary with fresh data
+    family_summary = []
+    for m in family_details:
+        dl = tracker._get_next_deadline(m)
+        family_summary.append({
+            "pub_num":             m["pub_num"],
+            "country":             tracker.country_code(m["pub_num"]),
+            "status":              m.get("status", "unknown"),
+            "filing_date":         m.get("filing_date") or m.get("date") or "",
+            "grant_date":          m.get("grant_date", ""),
+            "app_num":             m.get("app_num", ""),
+            "title":               m.get("member_title", ""),
+            "href":                m.get("href", ""),
+            "next_deadline_label": dl["label"] if dl else "",
+            "next_deadline_date":  dl["date"]  if dl else "",
+            "next_deadline_type":  dl["type"]  if dl else "",
+        })
+
+    ref = (
+        db.collection("users").document(request.uid)
+        .collection("portfolios").document(portfolio_id)
+    )
+    ref.update({
+        "dashboard_html": dashboard_html,
+        "family":         family_summary,
+        "refreshed_at":   datetime.now(timezone.utc),
+    })
+
+    result = {
+        **stored,
+        "dashboard_html": dashboard_html,
+        "family":         family_summary,
+    }
+    for k in ("saved_at", "refreshed_at"):
+        v = result.get(k)
+        if hasattr(v, "isoformat"):
+            result[k] = v.isoformat()
+    result["refreshed_at"] = datetime.now(timezone.utc).isoformat()
+    return jsonify(result)
 
 
 @app.route("/api/portfolios/<portfolio_id>/name", methods=["PATCH"])

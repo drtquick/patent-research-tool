@@ -190,22 +190,45 @@ export default function Portfolio() {
     }
   }
 
+  // Primary refresh — pulls fresh data from USPTO ODP (no Google Patents needed).
+  // Falls back to a full GP re-scrape only if the ODP refresh itself fails.
   async function handleRefresh() {
     if (!viewingNumber || !viewingId) return;
-    const prevViewing = viewing; // keep so we can restore on failure
+    const prevViewing = viewing;
     setViewing(null);
     setViewLoading(true);
     setRefreshError("");
-    setLoadingMsg(`Refreshing dashboard for ${viewingNumber}…`);
+    setLoadingMsg(`Refreshing data from USPTO for ${viewingNumber}…`);
     try {
-      await _doSearch(viewingId, viewingNumber);
+      const data = await api.dataRefreshPortfolio(viewingId);
+      setViewing(data);
+      setViewLoading(false);
     } catch (err) {
-      // Don't leave the user with a blank screen — put the cached dashboard back
+      // ODP refresh failed — restore cached dashboard, show error
       setViewing(prevViewing);
       setViewLoading(false);
       setLoadingMsg("");
-      setRefreshError(err.message);
-      setTimeout(() => setRefreshError(""), 10000);
+      setRefreshError(`Refresh failed: ${err.message}`);
+      setTimeout(() => setRefreshError(""), 12000);
+    }
+  }
+
+  // Force full re-scrape from Google Patents (use when ODP refresh misses family data)
+  async function handleForceScrape() {
+    if (!viewingNumber || !viewingId) return;
+    const prevViewing = viewing;
+    setViewing(null);
+    setViewLoading(true);
+    setRefreshError("");
+    setLoadingMsg(`Re-scraping from source for ${viewingNumber}…`);
+    try {
+      await _doSearch(viewingId, viewingNumber);
+    } catch (err) {
+      setViewing(prevViewing);
+      setViewLoading(false);
+      setLoadingMsg("");
+      setRefreshError(`Re-scrape failed: ${err.message}`);
+      setTimeout(() => setRefreshError(""), 12000);
     }
   }
 
@@ -373,9 +396,16 @@ export default function Portfolio() {
           <button
             style={styles.refreshBtn}
             onClick={handleRefresh}
-            title="Force a fresh data pull from Google Patents"
+            title="Refresh prosecution data from USPTO patent office records"
           >
             🔄 Refresh
+          </button>
+          <button
+            style={{...styles.refreshBtn, fontSize: 11, opacity: 0.7}}
+            onClick={handleForceScrape}
+            title="Force full re-scrape (slower, uses Google Patents as source)"
+          >
+            ↺ Re-scrape
           </button>
           <button
             style={styles.alertsBtn}
