@@ -269,7 +269,7 @@ def _run_search(patent_input: str) -> dict:
                             "href":    f"https://patents.google.com/patent/{norm_pub}/en",
                             "title":   "",
                             "country": em["country"],
-                            "date":    em.get("pub_date", "") or em.get("app_date", ""),
+                            "date":    (em.get("pub_date", "") or em.get("app_date", "")) if em["country"] != "US" else "",
                             "lang":    "",
                         })
 

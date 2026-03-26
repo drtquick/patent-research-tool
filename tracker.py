@@ -827,8 +827,16 @@ def extract_rejection_summary(m: dict) -> Optional[dict]:
 # ── USPTO Open Data Portal (ODP) helpers ─────────────────────────────────────
 
 def _clean_app_num(s: str) -> str:
-    """Strip non-digits so '17/508,065' → '17508065'."""
-    return re.sub(r"[^\d]", "", s or "")
+    """Strip non-digits so '17/508,065' → '17508065'.
+    Handles EPO year-prefix format '2023/18383898' → '18383898'."""
+    s = (s or "").strip()
+    if not s:
+        return ""
+    if "/" in s:
+        after_slash = re.sub(r"[^\d]", "", s.rsplit("/", 1)[-1])
+        if len(after_slash) == 8:
+            return after_slash
+    return re.sub(r"[^\d]", "", s)
 
 
 def _odp_status_to_standard(status_text: str) -> str:
@@ -959,9 +967,9 @@ def fetch_us_member_via_odp(member: dict, api_key: str) -> dict | None:
                 headers={"X-API-Key": api_key},
                 timeout=20,
             )
-            if resp.status_code == 429 and attempt < 2:
+            if resp.status_code in (429, 503) and attempt < 2:
                 wait = (2 ** attempt) + random.uniform(0.5, 2.0)
-                print(f"  ODP 429 (attempt {attempt+1}/3) — retrying in {wait:.1f}s …")
+                print(f"  ODP {resp.status_code} (attempt {attempt+1}/3) — retrying in {wait:.1f}s …")
                 _time.sleep(wait)
                 continue
             resp.raise_for_status()
@@ -1377,7 +1385,10 @@ def parse_epo_family(xml: str) -> list[dict]:
         if not pub_docs:
             continue
 
-        pub = pub_docs[0]
+        # Prefer standard 1-2 char kind codes (A1, B2, etc.); skip EPO internal
+        # codes like ESNODP that appear for recent/unpublished applications.
+        valid_pub_docs = [p for p in pub_docs if not p["kind"] or re.match(r'^[A-Z]\d?$', p["kind"])]
+        pub = (valid_pub_docs or pub_docs)[0]
         app = app_docs[0] if app_docs else {}
         pub_num = f"{pub['cc']}{pub['num']}{pub['kind']}" if pub['kind'] else f"{pub['cc']}{pub['num']}"
         app_num = f"{app.get('cc','')}{app.get('num','')}" if app else ""
