@@ -148,6 +148,8 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
         "title":   title,
         "country": "US",
     }
+    oa_documents = tracker.fetch_odp_documents(clean, api_key)
+
     family_details = [{
         **member,
         "status":        tracker._odp_status_to_standard(
@@ -160,6 +162,7 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
         "member_title":  title,
         "fetch_error":   None,
         "lang":          "",
+        "oa_documents":  oa_documents,
     }]
 
     metas = {

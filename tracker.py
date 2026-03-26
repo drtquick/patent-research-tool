@@ -855,6 +855,80 @@ def _odp_events_to_standard(event_bag: list) -> list:
     return sorted(events, key=lambda x: x.get("date") or "")
 
 
+# ODP document codes worth surfacing as "office actions & key events"
+_OA_CODES: frozenset[str] = frozenset({
+    "CTNF",  "MCTNF",   # Non-Final Rejection (mail)
+    "CTFR",  "MCTFR",   # Final Rejection (mail)
+    "CTAV",             # Advisory Action
+    "NOA",   "NOAP",    # Notice of Allowance
+    "RSTR",  "MCTR",    # Restriction / Election Requirement
+    "CTEXA",            # Examiner's Answer to Appeal Brief
+    "EXAB",             # Examiner's Answer to Brief on Appeal
+    "SRNT",             # Search Report (Non-PCT)
+    "RAN",              # Response After Non-Final
+    "RAF",              # Response After Final
+    "WFEE",             # Issue Fee Payment
+})
+
+
+def fetch_odp_documents(app_num: str, api_key: str) -> list[dict]:
+    """
+    Fetch prosecution documents for a US application from the ODP documents endpoint.
+    Filters to office actions and key prosecution events (codes in _OA_CODES).
+    Returns a list of {code, description, date, pages, pc_url} sorted newest-first.
+    Non-fatal: returns [] on any error or 429 (after retry).
+    """
+    clean = _clean_app_num(app_num)
+    if not clean:
+        return []
+
+    pc_url = f"https://patentcenter.uspto.gov/applications/{clean}/ifw/docs"
+
+    try:
+        for attempt in range(3):
+            resp = requests.get(
+                f"https://api.uspto.gov/api/v1/patent/applications/{clean}/documents",
+                headers={"X-API-Key": api_key, "Accept": "application/json"},
+                timeout=20,
+            )
+            if resp.status_code == 429 and attempt < 2:
+                wait = (2 ** attempt) + random.uniform(0.5, 2.0)
+                print(f"  ODP docs 429 (attempt {attempt+1}/3) — retry in {wait:.1f}s …")
+                _time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            break
+        else:
+            return []
+
+        raw  = resp.json()
+        docs = (
+            raw.get("patentDocuments")
+            or raw.get("documents")
+            or raw.get("results")
+            or (raw if isinstance(raw, list) else [])
+        )
+
+        result: list[dict] = []
+        for d in (docs or []):
+            code = (d.get("documentCode") or "").strip().upper()
+            if code not in _OA_CODES:
+                continue
+            result.append({
+                "code":        code,
+                "description": (d.get("documentDescription") or d.get("description") or code).strip(),
+                "date":        (d.get("mailDate") or d.get("officialDate") or d.get("date") or "").strip(),
+                "pages":       d.get("pageTotalQuantity") or d.get("pageCount") or 0,
+                "pc_url":      pc_url,
+            })
+
+        return sorted(result, key=lambda x: x["date"] or "", reverse=True)
+
+    except Exception as exc:
+        print(f"  ODP documents error for {clean}: {str(exc)[:60]}")
+        return []
+
+
 def fetch_us_member_via_odp(member: dict, api_key: str) -> dict | None:
     """
     Fetch US patent family member details from the USPTO Open Data Portal
@@ -908,6 +982,8 @@ def fetch_us_member_via_odp(member: dict, api_key: str) -> dict | None:
         result["rejections"] = [
             e["title"] for e in result["events"] if e.get("code") in rej_codes
         ]
+        # Fetch prosecution documents (office actions etc.) — non-fatal
+        result["oa_documents"] = fetch_odp_documents(result["app_num"], api_key)
     except Exception as exc:
         result["fetch_error"] = str(exc)[:80]
 
@@ -979,6 +1055,51 @@ def fetch_member_details(member: dict, idx: int, total: int,
 
     _time.sleep(0.5)
     return result
+
+
+# ── OA documents renderer ────────────────────────────────────────────────────
+
+def _render_oa_documents(oa_docs: list, app_num: str = "") -> str:
+    """
+    Render a collapsible table of ODP prosecution documents (office actions, etc.).
+    Each row links out to the Patent Center IFW viewer.
+    """
+    if not oa_docs:
+        return ""
+
+    clean   = _clean_app_num(app_num)
+    pc_base = (
+        f"https://patentcenter.uspto.gov/applications/{clean}/ifw/docs"
+        if clean else "#"
+    )
+
+    rows = ""
+    for d in oa_docs:
+        pages_str = f'<span class="oa-pages">&nbsp;·&nbsp;{d["pages"]}p</span>' if d.get("pages") else ""
+        rows += (
+            f'<tr>'
+            f'<td class="oa-date">{d.get("date","")}</td>'
+            f'<td class="oa-desc">'
+            f'  <a href="{d["pc_url"]}" target="_blank" class="oa-link">'
+            f'  {d.get("description", d.get("code",""))}'
+            f'  </a>{pages_str}'
+            f'</td>'
+            f'</tr>'
+        )
+
+    return (
+        f'<details class="history oa-details" open>'
+        f'<summary class="oa-summary">'
+        f'Office Actions &amp; Key Events'
+        f'<span class="ev-count">{len(oa_docs)}</span>'
+        f'<a href="{pc_base}" target="_blank" class="oa-all-link">All IFW docs ↗</a>'
+        f'</summary>'
+        f'<table class="hist-table oa-table">'
+        f'<thead><tr><th>Date</th><th>Document</th></tr></thead>'
+        f'<tbody>{rows}</tbody>'
+        f'</table>'
+        f'</details>'
+    )
 
 
 # ── Rejection summary renderer ───────────────────────────────────────────────
@@ -2358,6 +2479,11 @@ def _render_card(m: dict) -> str:
         if rej_summary:
             rej_summary_html = _render_rejection_summary(rej_summary)
 
+    # Office action documents from ODP (shown for all statuses when available)
+    oa_docs_html = _render_oa_documents(
+        m.get("oa_documents", []), m.get("app_num", "")
+    )
+
     # Fetch error notice
     err_html = ""
     if m.get("fetch_error"):
@@ -2455,7 +2581,7 @@ def _render_card(m: dict) -> str:
         + translated_html
         + f'  <div class="card-dates">{date_items}</div>'
         + next_deadline_html
-        + maint_html + annuity_html + latest_html + rej_html + rej_summary_html + err_html + history_html
+        + maint_html + annuity_html + latest_html + rej_html + rej_summary_html + oa_docs_html + err_html + history_html
         + notes_html
         + tile_files_html
         + '</div>'
@@ -2820,6 +2946,15 @@ def generate_dashboard_html(
       font-size: .75rem; color: #0f172a;
     }}
     .no-hist {{ font-size: .8rem; color: #9ca3af; padding: .5rem 0; }}
+    .oa-details {{ margin-top: .6rem; }}
+    .oa-summary {{ display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }}
+    .oa-summary .ev-count {{ margin-left: .1rem; }}
+    .oa-all-link {{ margin-left: auto; font-size: .72rem; font-weight: 500;
+                    color: #1a73e8; text-decoration: none; white-space: nowrap; }}
+    .oa-all-link:hover {{ text-decoration: underline; }}
+    .oa-link {{ color: #1a73e8; text-decoration: none; }}
+    .oa-link:hover {{ text-decoration: underline; }}
+    .oa-pages {{ color: #6b7280; font-size: .72rem; }}
     .mf-status {{
       font-size: .7rem; font-weight: 700; border-radius: 4px;
       padding: .15rem .45rem; white-space: nowrap;
