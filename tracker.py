@@ -972,6 +972,11 @@ def fetch_us_member_via_odp(member: dict, api_key: str) -> dict | None:
                 print(f"  ODP {resp.status_code} (attempt {attempt+1}/3) — retrying in {wait:.1f}s …")
                 _time.sleep(wait)
                 continue
+            if resp.status_code == 404:
+                # Application not yet indexed in ODP (common for recent filings).
+                # Return whatever EPO gave us without flagging an error.
+                print(f"  ODP 404 — {app_num} not in ODP yet; using EPO bibliographic data")
+                return result
             resp.raise_for_status()
             break
         data = resp.json()
