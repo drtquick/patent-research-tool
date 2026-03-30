@@ -828,7 +828,10 @@ def extract_rejection_summary(m: dict) -> Optional[dict]:
 
 def _clean_app_num(s: str) -> str:
     """Strip non-digits so '17/508,065' → '17508065'.
-    Handles EPO year-prefix format '2023/18383898' → '18383898'."""
+    Handles EPO year-prefix formats:
+      'US2023/18383898' → '18383898'  (slash format)
+      'US202318383898'  → '18383898'  (12-digit no-slash format)
+    """
     s = (s or "").strip()
     if not s:
         return ""
@@ -836,7 +839,11 @@ def _clean_app_num(s: str) -> str:
         after_slash = re.sub(r"[^\d]", "", s.rsplit("/", 1)[-1])
         if len(after_slash) == 8:
             return after_slash
-    return re.sub(r"[^\d]", "", s)
+    digits = re.sub(r"[^\d]", "", s)
+    # Strip EPO year prefix: 4-digit year + 8-digit serial = 12 digits
+    if len(digits) == 12:
+        return digits[4:]
+    return digits
 
 
 def _odp_status_to_standard(status_text: str) -> str:
@@ -881,10 +888,12 @@ _OA_CODES: frozenset[str] = frozenset({
 
 def fetch_odp_documents(app_num: str, api_key: str) -> list[dict]:
     """
-    Fetch prosecution documents for a US application from the ODP documents endpoint.
-    Filters to office actions and key prosecution events (codes in _OA_CODES).
-    Returns a list of {code, description, date, pages, pc_url} sorted newest-first.
-    Non-fatal: returns [] on any error or 429 (after retry).
+    Fetch ALL prosecution documents for a US application from the ODP documents endpoint.
+    Returns a list of {code, description, date, pages, download_url, pc_url, direction}
+    sorted newest-first. Non-fatal: returns [] on any error.
+
+    ODP response key: documentBag (not patentDocuments).
+    Download URLs live inside each document's downloadOptionBag[].downloadUrl.
     """
     clean = _clean_app_num(app_num)
     if not clean:
@@ -899,35 +908,50 @@ def fetch_odp_documents(app_num: str, api_key: str) -> list[dict]:
                 headers={"X-API-Key": api_key, "Accept": "application/json"},
                 timeout=20,
             )
-            if resp.status_code == 429 and attempt < 2:
+            if resp.status_code in (429, 503) and attempt < 2:
                 wait = (2 ** attempt) + random.uniform(0.5, 2.0)
-                print(f"  ODP docs 429 (attempt {attempt+1}/3) — retry in {wait:.1f}s …")
+                print(f"  ODP docs {resp.status_code} (attempt {attempt+1}/3) — retry in {wait:.1f}s …")
                 _time.sleep(wait)
                 continue
+            if resp.status_code in (404, 403):
+                print(f"  ODP docs {resp.status_code} for {clean} — no documents available")
+                return []
             resp.raise_for_status()
             break
         else:
             return []
 
         raw  = resp.json()
-        docs = (
-            raw.get("patentDocuments")
-            or raw.get("documents")
-            or raw.get("results")
-            or (raw if isinstance(raw, list) else [])
-        )
+        docs = raw.get("documentBag") or []
 
         result: list[dict] = []
-        for d in (docs or []):
+        for d in docs:
             code = (d.get("documentCode") or "").strip().upper()
-            if code not in _OA_CODES:
-                continue
+            desc = (d.get("documentCodeDescriptionText") or code).strip()
+
+            # officialDate is ISO-8601: "2024-03-26T00:00:00.000-0400" → keep YYYY-MM-DD
+            date_raw = (d.get("officialDate") or "").strip()
+            date = date_raw[:10] if date_raw else ""
+
+            # Direct PDF download URL from downloadOptionBag
+            dl_bag = d.get("downloadOptionBag") or []
+            pdf_entry = next(
+                (x for x in dl_bag if (x.get("mimeTypeIdentifier") or "").upper() == "PDF"),
+                dl_bag[0] if dl_bag else {}
+            )
+            download_url = pdf_entry.get("downloadUrl", "")
+            pages        = pdf_entry.get("pageTotalQuantity") or 0
+
+            direction = (d.get("directionCategory") or "").upper()  # INCOMING / OUTGOING
+
             result.append({
-                "code":        code,
-                "description": (d.get("documentDescription") or d.get("description") or code).strip(),
-                "date":        (d.get("mailDate") or d.get("officialDate") or d.get("date") or "").strip(),
-                "pages":       d.get("pageTotalQuantity") or d.get("pageCount") or 0,
-                "pc_url":      pc_url,
+                "code":         code,
+                "description":  desc,
+                "date":         date,
+                "pages":        pages,
+                "download_url": download_url,
+                "pc_url":       pc_url,
+                "direction":    direction,
             })
 
         return sorted(result, key=lambda x: x["date"] or "", reverse=True)
@@ -972,10 +996,11 @@ def fetch_us_member_via_odp(member: dict, api_key: str) -> dict | None:
                 print(f"  ODP {resp.status_code} (attempt {attempt+1}/3) — retrying in {wait:.1f}s …")
                 _time.sleep(wait)
                 continue
-            if resp.status_code == 404:
-                # Application not yet indexed in ODP (common for recent filings).
-                # Return whatever EPO gave us without flagging an error.
-                print(f"  ODP 404 — {app_num} not in ODP yet; using EPO bibliographic data")
+            if resp.status_code in (404, 403):
+                # 404: not yet indexed in ODP (common for recent filings).
+                # 403: ODP rejects the app number format (e.g. bad digit count).
+                # Either way, return whatever EPO gave us without flagging an error.
+                print(f"  ODP {resp.status_code} — {app_num}; using EPO bibliographic data")
                 return result
             resp.raise_for_status()
             break
@@ -1074,8 +1099,8 @@ def fetch_member_details(member: dict, idx: int, total: int,
 
 def _render_oa_documents(oa_docs: list, app_num: str = "") -> str:
     """
-    Render a collapsible table of ODP prosecution documents (office actions, etc.).
-    Each row links out to the Patent Center IFW viewer.
+    Render a collapsible prosecution history table with per-document PDF download links.
+    Sorted newest-first. Each row has date, direction arrow, description, and a download button.
     """
     if not oa_docs:
         return ""
@@ -1088,27 +1113,38 @@ def _render_oa_documents(oa_docs: list, app_num: str = "") -> str:
 
     rows = ""
     for d in oa_docs:
-        pages_str = f'<span class="oa-pages">&nbsp;·&nbsp;{d["pages"]}p</span>' if d.get("pages") else ""
+        direction = d.get("direction", "")
+        arrow = "→" if direction == "OUTGOING" else "←" if direction == "INCOMING" else "·"
+        arrow_cls = "oa-arrow-out" if direction == "OUTGOING" else "oa-arrow-in"
+
+        pages_str = f'<span class="oa-pages">{d["pages"]}p</span>' if d.get("pages") else ""
+
+        dl_url = d.get("download_url", "")
+        if dl_url:
+            dl_btn = (
+                f'<a href="{dl_url}" target="_blank" class="oa-dl-btn" title="Download PDF">PDF ↓</a>'
+            )
+        else:
+            dl_btn = f'<a href="{pc_base}" target="_blank" class="oa-dl-btn oa-dl-viewer" title="Open IFW viewer">IFW ↗</a>'
+
         rows += (
             f'<tr>'
             f'<td class="oa-date">{d.get("date","")}</td>'
-            f'<td class="oa-desc">'
-            f'  <a href="{d["pc_url"]}" target="_blank" class="oa-link">'
-            f'  {d.get("description", d.get("code",""))}'
-            f'  </a>{pages_str}'
-            f'</td>'
+            f'<td class="oa-dir"><span class="{arrow_cls}">{arrow}</span></td>'
+            f'<td class="oa-desc">{d.get("description", d.get("code",""))}{pages_str}</td>'
+            f'<td class="oa-action">{dl_btn}</td>'
             f'</tr>'
         )
 
     return (
         f'<details class="history oa-details" open>'
         f'<summary class="oa-summary">'
-        f'Office Actions &amp; Key Events'
+        f'Prosecution History'
         f'<span class="ev-count">{len(oa_docs)}</span>'
-        f'<a href="{pc_base}" target="_blank" class="oa-all-link">All IFW docs ↗</a>'
+        f'<a href="{pc_base}" target="_blank" class="oa-all-link">Full IFW ↗</a>'
         f'</summary>'
         f'<table class="hist-table oa-table">'
-        f'<thead><tr><th>Date</th><th>Document</th></tr></thead>'
+        f'<thead><tr><th>Date</th><th></th><th>Document</th><th></th></tr></thead>'
         f'<tbody>{rows}</tbody>'
         f'</table>'
         f'</details>'
@@ -2968,9 +3004,17 @@ def generate_dashboard_html(
     .oa-all-link {{ margin-left: auto; font-size: .72rem; font-weight: 500;
                     color: #1a73e8; text-decoration: none; white-space: nowrap; }}
     .oa-all-link:hover {{ text-decoration: underline; }}
-    .oa-link {{ color: #1a73e8; text-decoration: none; }}
-    .oa-link:hover {{ text-decoration: underline; }}
-    .oa-pages {{ color: #6b7280; font-size: .72rem; }}
+    .oa-pages {{ color: #6b7280; font-size: .72rem; margin-left: .3rem; }}
+    .oa-dir {{ width: 1.2rem; text-align: center; font-size: .85rem; }}
+    .oa-arrow-out {{ color: #dc2626; }}
+    .oa-arrow-in  {{ color: #1a73e8; }}
+    .oa-action {{ width: 4rem; text-align: right; white-space: nowrap; }}
+    .oa-dl-btn {{ display: inline-block; font-size: .68rem; font-weight: 600;
+                  padding: .1rem .35rem; border-radius: 3px;
+                  background: #1a73e8; color: #fff; text-decoration: none; }}
+    .oa-dl-btn:hover {{ background: #1558b0; }}
+    .oa-dl-viewer {{ background: #6b7280; }}
+    .oa-dl-viewer:hover {{ background: #4b5563; }}
     .mf-status {{
       font-size: .7rem; font-weight: 700; border-radius: 4px;
       padding: .15rem .45rem; white-space: nowrap;
