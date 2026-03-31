@@ -1518,6 +1518,41 @@ def _epo_to_family_member(em: dict) -> dict:
     }
 
 
+def extract_us_app_num_from_biblio(biblio_xml: str) -> str:
+    """
+    Extract the clean 8-digit US application number from an EPO biblio XML response.
+
+    EPO stores the application number in three document-id-type formats:
+      docdb   → "202318383898"  (year + serial, 12 digits)
+      epodoc  → "US202318383898"
+      original → "18383898"     ← this is what ODP uses
+
+    We prefer 'original'; fall back to any doc-number that cleans to 8 digits.
+    """
+    for ar in re.findall(
+        r'<application-reference[^>]*>(.*?)</application-reference>',
+        biblio_xml, re.DOTALL
+    ):
+        if not re.search(r'<country>\s*US\s*</country>', ar):
+            continue
+        # Prefer document-id-type="original" — gives the bare 8-digit serial
+        for doc_id in re.findall(
+            r'<document-id[^"]*document-id-type="original"[^>]*>(.*?)</document-id>',
+            ar, re.DOTALL
+        ):
+            for n in re.findall(r'<doc-number>\s*([^<]+?)\s*</doc-number>', doc_id):
+                clean = _clean_app_num(n.strip())
+                if len(clean) == 8:
+                    return clean
+        # Fallback: any doc-number in this application-reference that cleans to 8 digits
+        for doc_id in re.findall(r'<document-id[^>]*>(.*?)</document-id>', ar, re.DOTALL):
+            for n in re.findall(r'<doc-number>\s*([^<]+?)\s*</doc-number>', doc_id):
+                clean = _clean_app_num(n.strip())
+                if len(clean) == 8:
+                    return clean
+    return ""
+
+
 def fetch_epo_biblio(docdb: str, token: str) -> Optional[str]:
     """GET biblio XML from EPO OPS for a docdb publication (CC.NUM.KIND)."""
     url = (

@@ -221,15 +221,16 @@ def _run_search(patent_input: str) -> dict:
     """
     Orchestrate a full search and return all results as a dict.
 
-    Data-source priority (β 1.7):
-      1. Bare US application number  → USPTO ODP only (no GP at all)
-      2. Pub number                  → EPO OPS primary (biblio + family),
-                                       ODP for US prosecution details,
-                                       GP only as last-resort fallback if EPO fails
+    Data-source priority (β 1.13):
+      1. Bare US application number  → USPTO ODP only
+      2. US pub number               → EPO biblio (to resolve app number) → ODP
+      3. Non-US pub number           → EPO OPS primary (biblio + family),
+                                       ODP for any US family members,
+                                       GP only as last-resort for non-US if EPO fails
     """
     import requests as _req
 
-    # ── Bare US application number → ODP directly, no GP ─────────────────────
+    # ── Bare US application number → ODP directly ────────────────────────────
     if _is_us_app_num(patent_input):
         return _run_search_from_odp(patent_input)
 
@@ -240,8 +241,8 @@ def _run_search(patent_input: str) -> dict:
 
     # ── Try EPO OPS as primary source ─────────────────────────────────────────
     epo_metas:   dict       = {}
-    epo_family:  list       = []   # member dicts ready for fetch_member_details
-    epo_members: list       = []   # raw parse_epo_family output (for merge/cross-val)
+    epo_family:  list       = []
+    epo_members: list       = []
     epo_ran:     bool       = False
     docdb:       str | None = None
 
@@ -257,7 +258,17 @@ def _run_search(patent_input: str) -> dict:
                     epo_metas = tracker.parse_epo_biblio(biblio_xml, abstract_xml)
                     epo_ran   = True
 
-                # INPADOC family → member list
+                    # ── US pub number: resolve app number from EPO biblio → ODP ──
+                    # EPO biblio's document-id-type="original" gives the clean
+                    # 8-digit serial ODP uses (e.g. "18383898"), regardless of
+                    # whether INPADOC family has any members yet.
+                    if patent_input.upper().startswith("US") and odp_key:
+                        us_app_num = tracker.extract_us_app_num_from_biblio(biblio_xml)
+                        if us_app_num:
+                            print(f"  US pub {patent_input} → app {us_app_num} via EPO biblio → ODP")
+                            return _run_search_from_odp(us_app_num)
+
+                # INPADOC family → member list (non-US patents, or US pub fallback)
                 family_xml = tracker.fetch_epo_family(docdb, token)
                 if family_xml:
                     epo_members = tracker.parse_epo_family(family_xml)
