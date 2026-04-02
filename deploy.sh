@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
-# Deploy Flask backend to Cloud Run (taskq-80ce7 project — billing already enabled).
-# Frontend stays on Firebase Hosting under patent-research-tool.
+# Deploy PatentQ backend to Cloud Run under the patent-research-tool project.
+# All secrets are stored in Secret Manager (patent-research-tool project).
 set -euo pipefail
 
-PROJECT="taskq-80ce7"
+PROJECT="patent-research-tool"
 REGION="us-central1"
 SERVICE="patent-api"
 IMAGE="gcr.io/${PROJECT}/${SERVICE}"
+
+echo "==> Fetching secrets from Secret Manager..."
+EPO_KEY=$(gcloud secrets versions access latest --secret=EPO_CONSUMER_KEY --project="${PROJECT}")
+EPO_SECRET=$(gcloud secrets versions access latest --secret=EPO_CONSUMER_SECRET --project="${PROJECT}")
+USPTO_KEY=$(gcloud secrets versions access latest --secret=USPTO_ODP_API_KEY --project="${PROJECT}")
+SA_JSON=$(gcloud secrets versions access latest --secret=FIREBASE_SERVICE_ACCOUNT_JSON --project="${PROJECT}")
 
 echo "==> Building and pushing Docker image to ${IMAGE}..."
 gcloud builds submit \
   --tag "${IMAGE}" \
   --project "${PROJECT}" \
   .
-
-echo "==> Reading service account JSON..."
-SA_JSON=$(python3 -c "import json,sys; print(json.dumps(json.load(open('firebase-service-account.json'))))")
 
 echo "==> Deploying ${SERVICE} to Cloud Run (${REGION})..."
 gcloud run deploy "${SERVICE}" \
@@ -27,14 +30,24 @@ gcloud run deploy "${SERVICE}" \
   --memory 1Gi \
   --timeout 300 \
   --set-env-vars "FIREBASE_SERVICE_ACCOUNT_JSON=${SA_JSON}" \
-  --set-env-vars "EPO_CONSUMER_KEY=$(grep ^EPO_CONSUMER_KEY .env | cut -d= -f2-)" \
-  --set-env-vars "EPO_CONSUMER_SECRET=$(grep ^EPO_CONSUMER_SECRET .env | cut -d= -f2-)" \
-  --set-env-vars "DEEPL_API_KEY=$(grep ^DEEPL_API_KEY .env | cut -d= -f2-)" \
+  --set-env-vars "EPO_CONSUMER_KEY=${EPO_KEY}" \
+  --set-env-vars "EPO_CONSUMER_SECRET=${EPO_SECRET}" \
+  --set-env-vars "USPTO_ODP_API_KEY=${USPTO_KEY}" \
   --set-env-vars "FLASK_DEBUG=false"
 
-echo ""
-echo "==> Service URL:"
-gcloud run services describe "${SERVICE}" \
+# Get the new service URL and set PATENT_DOC_PROXY_BASE
+SERVICE_URL=$(gcloud run services describe "${SERVICE}" \
   --region "${REGION}" \
   --project "${PROJECT}" \
-  --format "value(status.url)"
+  --format "value(status.url)")
+
+echo "==> Updating PATENT_DOC_PROXY_BASE to ${SERVICE_URL}..."
+gcloud run services update "${SERVICE}" \
+  --region "${REGION}" \
+  --project "${PROJECT}" \
+  --update-env-vars "PATENT_DOC_PROXY_BASE=${SERVICE_URL}"
+
+echo ""
+echo "==> Deployment complete!"
+echo "    Service URL: ${SERVICE_URL}"
+echo "    Project:     ${PROJECT}"

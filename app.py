@@ -221,17 +221,42 @@ def _run_search(patent_input: str) -> dict:
     """
     Orchestrate a full search and return all results as a dict.
 
-    Data-source priority (β 1.13):
-      1. Bare US application number  → USPTO ODP only
-      2. US pub number               → EPO biblio (to resolve app number) → ODP
-      3. Non-US pub number           → EPO OPS primary (biblio + family),
-                                       ODP for any US family members,
-                                       GP only as last-resort for non-US if EPO fails
+    Data-source priority (β 1.14):
+      1. 8-digit bare number         → try ODP as application number first
+                                       → if ODP 404, fall through to EPO as patent number
+      2. 11-digit bare US pub serial → prepend 'US' + 'A1', EPO biblio → ODP
+      3. Slash-format app number     → ODP directly (e.g. 18/383,898)
+      4. Full pub/patent number      → EPO biblio (to resolve app number) → ODP
+      5. Non-US                      → EPO OPS (biblio + family), ODP for US members
+         GP only as absolute last resort when EPO fails entirely
     """
     import requests as _req
+    import re as _re2
 
-    # ── Bare US application number → ODP directly ────────────────────────────
-    if _is_us_app_num(patent_input):
+    _stripped = patent_input.strip()
+
+    # ── 8-digit bare number: app number OR patent number ─────────────────────
+    # Try ODP as an application number first; if ODP returns 404 the digits are
+    # a patent number (not an app number) — fall through to the EPO path below
+    # treating the input as "US{num}" (a granted patent).
+    if _re2.fullmatch(r"\d{8}", _stripped):
+        try:
+            return _run_search_from_odp(_stripped)
+        except _req.HTTPError as _odp_exc:
+            if _odp_exc.response.status_code != 404:
+                raise
+            print(f"  ODP 404 for '{_stripped}' — not an app number, routing as US patent via EPO")
+            patent_input = "US" + _stripped   # re-route to EPO as a US patent number
+        # fall through to EPO path below
+
+    # ── 11-digit bare US publication serial (e.g. 20260059078) ───────────────
+    # Publication numbers have an 11-digit year-prefixed format without country code.
+    # Prepend "US" and "A1" so EPO biblio can find it, then resolve app → ODP.
+    elif _re2.fullmatch(r"\d{11}", _stripped) and _stripped.startswith("2"):
+        patent_input = "US" + _stripped + "A1"
+
+    # ── Slash-format US application number (e.g. 18/383,898) → ODP directly ──
+    elif _is_us_app_num(patent_input):
         return _run_search_from_odp(patent_input)
 
     # ── Credentials ───────────────────────────────────────────────────────────
@@ -924,6 +949,53 @@ def patch_portfolio_notes(portfolio_id: str):
         return jsonify({"error": str(exc)}), 500
 
 
+@app.route("/api/patent-doc", methods=["GET"])
+def patent_doc_proxy():
+    """
+    Public proxy endpoint that fetches a single ODP document PDF and adds the
+    required X-API-Key header.  Browsers cannot send custom headers via a plain
+    <a href>, so all PDF download buttons in the dashboard route through here.
+
+    Usage: GET /api/patent-doc?url=<encoded-odp-download-url>
+    Only allows URLs whose prefix matches https://api.uspto.gov/api/v1/download/
+    """
+    import requests as _req
+    from flask import Response as _Resp
+    import urllib.parse as _up
+
+    raw_url = request.args.get("url", "").strip()
+    if not raw_url.startswith("https://api.uspto.gov/api/v1/download/"):
+        return jsonify({"error": "URL not permitted"}), 400
+
+    odp_key = os.environ.get("USPTO_ODP_API_KEY", "").strip()
+    if not odp_key:
+        return jsonify({"error": "ODP API key not configured"}), 503
+
+    try:
+        upstream = _req.get(
+            raw_url,
+            headers={"X-API-Key": odp_key, "Accept": "application/pdf"},
+            timeout=60,
+            stream=True,
+        )
+        upstream.raise_for_status()
+        content_type = upstream.headers.get("Content-Type", "application/pdf")
+        # Suggest a filename from the URL for the browser's save-as dialog
+        filename = raw_url.rstrip("/").rsplit("/", 1)[-1] or "document.pdf"
+        resp = _Resp(
+            upstream.content,
+            status=200,
+            content_type=content_type,
+        )
+        resp.headers["Content-Disposition"] = f'inline; filename="{filename}"'
+        resp.headers["Cache-Control"] = "private, max-age=3600"
+        return resp
+    except _req.HTTPError as exc:
+        return jsonify({"error": f"ODP returned {exc.response.status_code}"}), 502
+    except Exception as exc:
+        return jsonify({"error": str(exc)[:120]}), 502
+
+
 @app.route("/api/uspto/documents/<path:app_num>", methods=["GET"])
 @require_auth
 def get_uspto_documents(app_num: str):
@@ -941,7 +1013,7 @@ def get_uspto_documents(app_num: str):
         return jsonify({"error": "Invalid application number"}), 400
 
     viewer_url      = f"https://data.uspto.gov/patent-file-wrapper/details/{clean}/documents"
-    patent_center   = f"https://patentcenter.uspto.gov/applications/{clean}"
+    patent_center   = f"https://data.uspto.gov/patent-file-wrapper/details/{clean}/documents"
     odp_key         = os.environ.get("USPTO_ODP_API_KEY", "").strip()
 
     if not odp_key:

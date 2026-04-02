@@ -784,11 +784,11 @@ def extract_rejection_summary(m: dict) -> Optional[dict]:
         examiner_refs = [r for r in b_refs if r.get("examiner")]
         all_refs      = b_refs  # show all; examiner-cited flagged separately
 
-        # Patent Center link
+        # ODP file wrapper link (public — no account required)
         clean_app = re.sub(r"[^0-9]", "", app_num)
         pc_url = (
-            f"https://patentcenter.uspto.gov/applications/{clean_app}"
-            if clean_app else "https://patentcenter.uspto.gov"
+            f"https://data.uspto.gov/patent-file-wrapper/details/{clean_app}/documents"
+            if clean_app else "https://data.uspto.gov/patent-file-wrapper"
         )
 
         return {
@@ -871,6 +871,13 @@ def _odp_events_to_standard(event_bag: list) -> list:
 
 
 # ODP document codes worth surfacing as "office actions & key events"
+# Base URL of the backend API (used when generating proxy links for ODP PDF downloads).
+# In production this is the Cloud Run service URL.
+_PATENT_DOC_PROXY = os.environ.get(
+    "PATENT_DOC_PROXY_BASE",
+    "https://patent-api-614008966022.us-central1.run.app",
+)
+
 _OA_CODES: frozenset[str] = frozenset({
     "CTNF",  "MCTNF",   # Non-Final Rejection (mail)
     "CTFR",  "MCTFR",   # Final Rejection (mail)
@@ -899,7 +906,7 @@ def fetch_odp_documents(app_num: str, api_key: str) -> list[dict]:
     if not clean:
         return []
 
-    pc_url = f"https://patentcenter.uspto.gov/applications/{clean}/ifw/docs"
+    pc_url = f"https://data.uspto.gov/patent-file-wrapper/details/{clean}/documents"
 
     try:
         for attempt in range(3):
@@ -1101,31 +1108,40 @@ def _render_oa_documents(oa_docs: list, app_num: str = "") -> str:
     """
     Render a collapsible prosecution history table with per-document PDF download links.
     Sorted newest-first. Each row has date, direction arrow, description, and a download button.
+    PDF downloads are proxied through the backend so the ODP X-API-Key header is added
+    server-side (browsers can't send custom headers via plain <a href>).
+    IFW viewer links go to the USPTO Open Data Portal (no account required).
     """
     if not oa_docs:
         return ""
 
-    clean   = _clean_app_num(app_num)
-    pc_base = (
-        f"https://patentcenter.uspto.gov/applications/{clean}/ifw/docs"
-        if clean else "#"
+    import urllib.parse as _up
+    clean    = _clean_app_num(app_num)
+    odp_base = (
+        f"https://data.uspto.gov/patent-file-wrapper/details/{clean}/documents"
+        if clean else "https://data.uspto.gov/patent-file-wrapper"
     )
 
     rows = ""
     for d in oa_docs:
         direction = d.get("direction", "")
-        arrow = "→" if direction == "OUTGOING" else "←" if direction == "INCOMING" else "·"
+        arrow     = "→" if direction == "OUTGOING" else "←" if direction == "INCOMING" else "·"
         arrow_cls = "oa-arrow-out" if direction == "OUTGOING" else "oa-arrow-in"
 
         pages_str = f'<span class="oa-pages">{d["pages"]}p</span>' if d.get("pages") else ""
 
         dl_url = d.get("download_url", "")
         if dl_url:
-            dl_btn = (
-                f'<a href="{dl_url}" target="_blank" class="oa-dl-btn" title="Download PDF">PDF ↓</a>'
+            # Proxy through our backend so X-API-Key is injected server-side
+            proxy_url = f"{_PATENT_DOC_PROXY}/api/patent-doc?url={_up.quote(dl_url, safe='')}"
+            dl_btn    = (
+                f'<a href="{proxy_url}" target="_blank" class="oa-dl-btn" title="Download PDF">PDF ↓</a>'
             )
         else:
-            dl_btn = f'<a href="{pc_base}" target="_blank" class="oa-dl-btn oa-dl-viewer" title="Open IFW viewer">IFW ↗</a>'
+            dl_btn = (
+                f'<a href="{odp_base}" target="_blank" class="oa-dl-btn oa-dl-viewer" '
+                f'title="Open file wrapper on USPTO ODP">ODP ↗</a>'
+            )
 
         rows += (
             f'<tr>'
@@ -1141,7 +1157,7 @@ def _render_oa_documents(oa_docs: list, app_num: str = "") -> str:
         f'<summary class="oa-summary">'
         f'Prosecution History'
         f'<span class="ev-count">{len(oa_docs)}</span>'
-        f'<a href="{pc_base}" target="_blank" class="oa-all-link">Full IFW ↗</a>'
+        f'<a href="{odp_base}" target="_blank" class="oa-all-link">Full IFW on ODP ↗</a>'
         f'</summary>'
         f'<table class="hist-table oa-table">'
         f'<thead><tr><th>Date</th><th></th><th>Document</th><th></th></tr></thead>'
@@ -1192,12 +1208,12 @@ def _render_rejection_summary(summary: dict) -> str:
             f'</div>'
         )
     elif cc == "US":
-        pc_url = summary.get("pc_url", "https://patentcenter.uspto.gov")
+        pc_url = summary.get("pc_url", "https://data.uspto.gov/patent-file-wrapper")
         grounds_html = (
             f'<p class="rej-grounds-note">'
             f'  Specific grounds (§101 / §102 / §103 / §112) are in the office action '
             f'  document. '
-            f'  <a href="{pc_url}" target="_blank">View full prosecution history in USPTO Patent Center ↗</a>'
+            f'  <a href="{pc_url}" target="_blank">View full prosecution history on USPTO ODP ↗</a>'
             f'</p>'
         )
     else:
@@ -2394,6 +2410,14 @@ def _get_next_deadline(m: dict) -> dict | None:
 def _render_card(m: dict) -> str:
     code   = country_code(m["pub_num"])
     status = m.get("status", "unknown")
+
+    # Safety override: a pub number ending in A/A1/A2 is a pre-grant publication —
+    # it cannot be "granted" regardless of what a stale cache or EPO kind-code says.
+    if status == "granted":
+        _kc = re.search(r'([A-Z])(\d?)$', re.sub(r'[^A-Z0-9]', '', m["pub_num"].upper()))
+        if _kc and _kc.group(1) == "A":
+            status = "pending"
+
     border = STATUS_META.get(status, STATUS_META["unknown"])["border"]
     href    = m.get("href", "")
     app_num = m.get("app_num", "").strip()
@@ -2668,7 +2692,12 @@ def _render_card(m: dict) -> str:
         + translated_html
         + f'  <div class="card-dates">{date_items}</div>'
         + next_deadline_html
-        + maint_html + annuity_html + latest_html + rej_html + rej_summary_html + oa_docs_html + err_html + history_html
+        # When ODP documents are present they already show the full prosecution record —
+        # suppress the EPO/GP-derived rejection summary and history to avoid duplication.
+        + maint_html + annuity_html + latest_html + rej_html
+        + (rej_summary_html if not m.get("oa_documents") else "")
+        + oa_docs_html + err_html
+        + (history_html if not m.get("oa_documents") else "")
         + notes_html
         + tile_files_html
         + '</div>'
@@ -2686,6 +2715,11 @@ def generate_dashboard_html(
     number   = _first(main_metas.get("citation_patent_number", [])) or "N/A"
     title    = (_first(main_metas.get("DC.title", [])) or "").strip()
     abstract = (_first(main_metas.get("DC.description", [])) or "").strip()
+    # Strip any stray publication-number preambles that EPO sometimes prepends,
+    # e.g. "( US20260059078 ) " or bare "US20260059078A1 " at the very start.
+    abstract = re.sub(r'^\s*\(\s*[A-Z]{2}[A-Z0-9]+\s*\)\s*', '', abstract)
+    abstract = re.sub(r'^\s*[A-Z]{2}\d{8,11}[A-Z0-9]*\s+', '', abstract)
+    abstract = abstract.strip()
     relations = main_metas.get("DC.relation", [])
     dates       = main_metas.get("DC.date", [])
     filing_date = dates[0] if dates else "N/A"
