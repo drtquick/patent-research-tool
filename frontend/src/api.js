@@ -118,4 +118,24 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ portfolio_ids, name }),
     }),
+
+  // ── AI Analysis (Claude-powered prosecution assistant) ───────────────────
+
+  aiAnalyze: (portfolioId, pubNum) =>
+    authFetch("/api/ai/analyze", {
+      method: "POST",
+      body: JSON.stringify({ portfolio_id: portfolioId, pub_num: pubNum }),
+    }),
+
+  aiAnalyzeOA: (portfolioId, pubNum) =>
+    authFetch("/api/ai/analyze-oa", {
+      method: "POST",
+      body: JSON.stringify({ portfolio_id: portfolioId, pub_num: pubNum }),
+    }),
+
+  aiGetCachedAnalysis: (portfolioId, pubNum) =>
+    authFetch(`/api/ai/analyze/${portfolioId}/${encodeURIComponent(pubNum)}`),
+
+  aiPortfolioSummary: () =>
+    authFetch("/api/ai/portfolio-summary", { method: "POST" }),
 };

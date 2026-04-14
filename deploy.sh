@@ -12,6 +12,7 @@ echo "==> Fetching secrets from Secret Manager..."
 EPO_KEY=$(gcloud secrets versions access latest --secret=EPO_CONSUMER_KEY --project="${PROJECT}")
 EPO_SECRET=$(gcloud secrets versions access latest --secret=EPO_CONSUMER_SECRET --project="${PROJECT}")
 USPTO_KEY=$(gcloud secrets versions access latest --secret=USPTO_ODP_API_KEY --project="${PROJECT}")
+ANTHROPIC_KEY=$(gcloud secrets versions access latest --secret=ANTHROPIC_API_KEY --project="${PROJECT}")
 SA_JSON=$(gcloud secrets versions access latest --secret=FIREBASE_SERVICE_ACCOUNT_JSON --project="${PROJECT}")
 
 echo "==> Building and pushing Docker image to ${IMAGE}..."
@@ -19,6 +20,31 @@ gcloud builds submit \
   --tag "${IMAGE}" \
   --project "${PROJECT}" \
   .
+
+# Build env-vars YAML — avoids gcloud choking on JSON special chars
+ENV_YAML="/tmp/cloudrun-env.yaml"
+python3 -c "
+import json, sys
+
+sa_json_raw = sys.argv[1]
+# Compact JSON, no whitespace
+compact = json.dumps(json.loads(sa_json_raw), separators=(',', ':'))
+# YAML single-quote escaping: double any internal single quotes
+def yq(v):
+    return \"'\" + v.replace(\"'\", \"''\") + \"'\"
+
+lines = [
+    'FIREBASE_SERVICE_ACCOUNT_JSON: ' + yq(compact),
+    'EPO_CONSUMER_KEY: ' + yq(sys.argv[2]),
+    'EPO_CONSUMER_SECRET: ' + yq(sys.argv[3]),
+    'USPTO_ODP_API_KEY: ' + yq(sys.argv[4]),
+    'ANTHROPIC_API_KEY: ' + yq(sys.argv[5]),
+    'FLASK_DEBUG: \"false\"',
+]
+with open(sys.argv[6], 'w') as f:
+    f.write('\n'.join(lines) + '\n')
+print('Wrote', sys.argv[6])
+" "${SA_JSON}" "${EPO_KEY}" "${EPO_SECRET}" "${USPTO_KEY}" "${ANTHROPIC_KEY}" "${ENV_YAML}"
 
 echo "==> Deploying ${SERVICE} to Cloud Run (${REGION})..."
 gcloud run deploy "${SERVICE}" \
@@ -29,11 +55,7 @@ gcloud run deploy "${SERVICE}" \
   --allow-unauthenticated \
   --memory 1Gi \
   --timeout 300 \
-  --set-env-vars "FIREBASE_SERVICE_ACCOUNT_JSON=${SA_JSON}" \
-  --set-env-vars "EPO_CONSUMER_KEY=${EPO_KEY}" \
-  --set-env-vars "EPO_CONSUMER_SECRET=${EPO_SECRET}" \
-  --set-env-vars "USPTO_ODP_API_KEY=${USPTO_KEY}" \
-  --set-env-vars "FLASK_DEBUG=false"
+  --env-vars-file "${ENV_YAML}"
 
 # Get the new service URL and set PATENT_DOC_PROXY_BASE
 SERVICE_URL=$(gcloud run services describe "${SERVICE}" \

@@ -2326,26 +2326,37 @@ def _pending_app_deadline(m: dict) -> tuple[str, str]:
     ev_title  = (last_ev.get("title") or last_ev.get("value") or "").upper()
     date_str  = last_ev.get("date", "")
 
-    _OA_DEADLINES: dict[str, tuple[str, int]] = {
-        "NON FINAL ACTION MAILED":        ("Response to Non-Final Office Action", 3),
-        "NON-FINAL ACTION MAILED":        ("Response to Non-Final Office Action", 3),
-        "FINAL ACTION MAILED":            ("Response to Final Office Action", 2),
-        "FINAL REJECTION MAILED":         ("Response to Final Rejection", 2),
-        "RESTRICTION REQUIREMENT MAILED": ("Response to Restriction Requirement", 2),
-        "NOTICE OF ALLOWANCE MAILED":     ("Issue fee payment", 3),
-        "NOTICE OF ALLOWANCE":            ("Issue fee payment", 3),
+    # (label, short_months, max_months) — short = without extension, max = with extension
+    _OA_DEADLINES: dict[str, tuple[str, int, int]] = {
+        "NON FINAL ACTION MAILED":        ("Response to Non-Final Office Action", 3, 6),
+        "NON-FINAL ACTION MAILED":        ("Response to Non-Final Office Action", 3, 6),
+        "FINAL ACTION MAILED":            ("Response to Final Office Action", 2, 5),
+        "FINAL REJECTION MAILED":         ("Response to Final Rejection", 2, 5),
+        "RESTRICTION REQUIREMENT MAILED": ("Response to Restriction Requirement", 2, 5),
+        "NOTICE OF ALLOWANCE MAILED":     ("Issue fee payment", 3, 3),
+        "NOTICE OF ALLOWANCE":            ("Issue fee payment", 3, 3),
     }
-    for key, (label, months) in _OA_DEADLINES.items():
+    for key, (label, short_mo, max_mo) in _OA_DEADLINES.items():
         if key in ev_title:
             if date_str:
                 try:
-                    oa_date   = _dt.fromisoformat(date_str)
-                    due_month = oa_date.month + months
-                    due_year  = oa_date.year + (due_month - 1) // 12
-                    due_month = ((due_month - 1) % 12) + 1
-                    due_date  = oa_date.replace(year=due_year, month=due_month)
-                    due_str   = due_date.strftime("%B %-d, %Y")
-                    return f"{label} due {due_str}", due_date.isoformat()
+                    oa_date = _dt.fromisoformat(date_str)
+                    def _add_mo(d, mo):
+                        m = d.month + mo
+                        y = d.year + (m - 1) // 12
+                        m = ((m - 1) % 12) + 1
+                        return d.replace(year=y, month=m)
+                    short_date = _add_mo(oa_date, short_mo)
+                    max_date   = _add_mo(oa_date, max_mo)
+                    short_str  = short_date.strftime("%B %-d, %Y")
+                    if short_mo == max_mo:
+                        return f"{label} due {short_str}", short_date.isoformat()
+                    max_str = max_date.strftime("%B %-d, %Y")
+                    return (
+                        f"{label} due {short_str} without extension"
+                        f" and {max_str} with extension",
+                        short_date.isoformat(),
+                    )
                 except (ValueError, TypeError, OverflowError):
                     pass
             return label, ""
@@ -2679,6 +2690,30 @@ def _render_card(m: dict) -> str:
         f'&#128206; Files</button>'
     )
 
+    # Analyze OA button — sends postMessage to parent for Claude-powered office action analysis
+    tile_ai_html = (
+        f'<button class="tile-ai-btn" '
+        f"onclick=\"window.parent.postMessage({{type:'open-tile-ai',pubNum:'{_pub_esc}'}},'*')\">"
+        f'Analyze OA</button>'
+    )
+
+    # PDF download button — resolves PDF via backend proxy (avoids Google Patents blocking)
+    _clean_pnum = re.sub(r"[^A-Z0-9]", "", pub_num_key.upper())
+    _proxy_base = os.environ.get("PATENT_DOC_PROXY_BASE", "")
+    _pdf_api = f"{_proxy_base}/api/pdf/{_clean_pnum}" if _proxy_base else f"/api/pdf/{_clean_pnum}"
+    tile_pdf_html = (
+        f'<button class="tile-pdf-btn" '
+        f"onclick=\"window.open('{_pdf_api}','_blank')\">"
+        f'PDF</button>'
+    )
+
+    # Action bar with Analyze OA + PDF buttons — placed above "Latest event"
+    action_bar_html = (
+        f'<div class="tile-action-bar">'
+        f'{tile_ai_html}{tile_pdf_html}'
+        f'</div>'
+    )
+
     return (
         f'<div class="card" style="border-top:4px solid {border}">'
         f'  <div class="card-head">'
@@ -2692,14 +2727,15 @@ def _render_card(m: dict) -> str:
         + translated_html
         + f'  <div class="card-dates">{date_items}</div>'
         + next_deadline_html
+        + action_bar_html
         # When ODP documents are present they already show the full prosecution record —
         # suppress the EPO/GP-derived rejection summary and history to avoid duplication.
-        + maint_html + annuity_html + latest_html + rej_html
+        + latest_html + maint_html + annuity_html + rej_html
         + (rej_summary_html if not m.get("oa_documents") else "")
         + oa_docs_html + err_html
         + (history_html if not m.get("oa_documents") else "")
         + notes_html
-        + tile_files_html
+        + f'<div class="tile-btn-row">{tile_files_html}</div>'
         + '</div>'
     )
 
@@ -2990,12 +3026,31 @@ def generate_dashboard_html(
            text-decoration:none; border:1px solid; line-height:1.6; }}
     .vl-esn {{ background:#e8f5e9; color:#2e7d32; border-color:#c8e6c9; }}
     .vl-usp {{ background:#fff3e0; color:#e65100; border-color:#ffe0b2; }}
+    .tile-action-bar {{
+      display:flex; gap:6px; flex-wrap:wrap; margin-top:.2rem; margin-bottom:.4rem;
+      padding:6px 0;
+    }}
+    .tile-btn-row {{
+      display:flex; gap:6px; flex-wrap:wrap; margin-top:.6rem;
+    }}
     .tile-files-btn {{
-      margin-top:.6rem; padding:5px 12px; border-radius:6px; cursor:pointer;
+      padding:5px 12px; border-radius:6px; cursor:pointer;
       background:#f0f4f8; border:1px solid #d0d7de; font-size:.75rem;
       color:#1a1a2e; font-weight:600; display:inline-flex; align-items:center; gap:4px;
     }}
     .tile-files-btn:hover {{ background:#e2e8f0; }}
+    .tile-ai-btn {{
+      padding:5px 12px; border-radius:6px; cursor:pointer;
+      background:#ede7f6; border:1px solid #ce93d8; font-size:.75rem;
+      color:#6a1b9a; font-weight:600; display:inline-flex; align-items:center; gap:4px;
+    }}
+    .tile-ai-btn:hover {{ background:#e1d5f0; }}
+    .tile-pdf-btn {{
+      padding:5px 12px; border-radius:6px; cursor:pointer;
+      background:#fff3e0; border:1px solid #ffb74d; font-size:.75rem;
+      color:#e65100; font-weight:600; display:inline-flex; align-items:center; gap:4px;
+    }}
+    .tile-pdf-btn:hover {{ background:#ffe0b2; }}
     .status-badge {{
       font-size: .7rem; font-weight: 700; border-radius: 20px;
       padding: .2rem .65rem; white-space: nowrap; flex-shrink: 0;

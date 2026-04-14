@@ -1584,6 +1584,217 @@ def preview_patentee_group():
         return jsonify({"error": str(exc)}), 500
 
 
+# ── AI prosecution assistant ─────────────────────────────────────────────────
+
+def _find_family_member(portfolio_id: str, pub_num: str) -> tuple[object, dict | None]:
+    """Return (portfolio_ref, member_dict) or (portfolio_ref, None) if not found."""
+    port_ref = (
+        db.collection("users").document(request.uid)
+          .collection("portfolios").document(portfolio_id)
+    )
+    snap = port_ref.get()
+    if not snap.exists:
+        return port_ref, None
+    data = snap.to_dict() or {}
+    family = data.get("family", []) or []
+    member = next((m for m in family if m.get("pub_num") == pub_num), None)
+    return port_ref, member
+
+
+def _download_oa_text(member: dict) -> tuple[str, dict | None]:
+    """
+    Download the most recent office-action PDF for this family member via the
+    USPTO ODP and extract the text. Returns (text, doc_meta). Empty text
+    string if no OA is available or extraction fails.
+    """
+    import io as _io
+    import requests as _rq
+
+    OA_CODES = {"CTNF", "CTFR", "MCTNF", "MCTFR"}
+    oa_docs  = member.get("oa_documents") or []
+    oa_doc   = next(
+        (d for d in sorted(oa_docs, key=lambda x: x.get("date", ""), reverse=True)
+         if (d.get("code") or "").upper() in OA_CODES and d.get("download_url")),
+        None,
+    )
+    if not oa_doc:
+        return "", None
+
+    try:
+        resp = _rq.get(
+            oa_doc["download_url"],
+            headers={"X-API-Key": os.environ.get("USPTO_ODP_API_KEY", "")},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        pdf_bytes = resp.content
+    except Exception as exc:
+        print(f"  OA PDF download failed: {exc}")
+        return "", oa_doc
+
+    # Extract text with pypdf (lightweight, pure-python)
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(_io.BytesIO(pdf_bytes))
+        text   = "\n".join((page.extract_text() or "") for page in reader.pages)
+        return text.strip(), oa_doc
+    except Exception as exc:
+        print(f"  OA PDF text extraction failed: {exc}")
+        return "", oa_doc
+
+
+@app.route("/api/ai/analyze", methods=["POST"])
+@require_auth
+def ai_analyze():
+    """
+    Run AI prosecution analysis on one family member.
+    Body: { "portfolio_id": "...", "pub_num": "..." }
+    Cached at users/{uid}/portfolios/{pid}/ai_analysis/{pub_num}.
+    """
+    body = request.get_json(silent=True) or {}
+    portfolio_id = (body.get("portfolio_id") or "").strip()
+    pub_num      = (body.get("pub_num") or "").strip()
+    if not portfolio_id or not pub_num:
+        return jsonify({"error": "portfolio_id and pub_num are required"}), 400
+
+    try:
+        from ai_engine import PatentAI
+    except ImportError as exc:
+        return jsonify({"error": f"AI engine unavailable: {exc}"}), 500
+
+    port_ref, member = _find_family_member(portfolio_id, pub_num)
+    if member is None:
+        return jsonify({"error": "portfolio or family member not found"}), 404
+
+    try:
+        ai     = PatentAI()
+        result = ai.analyze_prosecution(member)
+        doc_id = pub_num.replace("/", "_")
+        port_ref.collection("ai_analysis").document(doc_id).set({
+            **result,
+            "analyzed_at": datetime.now(timezone.utc),
+            "pub_num":     pub_num,
+            "kind":        "prosecution",
+        })
+        return jsonify(result)
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"error": f"AI analysis failed: {exc}"}), 500
+
+
+@app.route("/api/ai/analyze-oa", methods=["POST"])
+@require_auth
+def ai_analyze_oa():
+    """
+    Download the most recent office action, extract text, run Claude's OA schema.
+    Body: { "portfolio_id": "...", "pub_num": "..." }
+    """
+    body = request.get_json(silent=True) or {}
+    portfolio_id = (body.get("portfolio_id") or "").strip()
+    pub_num      = (body.get("pub_num") or "").strip()
+    if not portfolio_id or not pub_num:
+        return jsonify({"error": "portfolio_id and pub_num are required"}), 400
+
+    try:
+        from ai_engine import PatentAI
+    except ImportError as exc:
+        return jsonify({"error": f"AI engine unavailable: {exc}"}), 500
+
+    port_ref, member = _find_family_member(portfolio_id, pub_num)
+    if member is None:
+        return jsonify({"error": "portfolio or family member not found"}), 404
+
+    oa_text, oa_doc = _download_oa_text(member)
+    if not oa_text:
+        return jsonify({"error": "No office action PDF available for analysis"}), 404
+
+    try:
+        ai     = PatentAI()
+        result = ai.analyze_office_action(member, oa_text, oa_doc)
+        doc_id = pub_num.replace("/", "_")
+        port_ref.collection("ai_analysis").document(f"{doc_id}__oa").set({
+            **result,
+            "analyzed_at": datetime.now(timezone.utc),
+            "pub_num":     pub_num,
+            "kind":        "office_action",
+            "oa_code":     (oa_doc or {}).get("code", ""),
+            "oa_date":     (oa_doc or {}).get("date", ""),
+        })
+        return jsonify(result)
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"error": f"OA analysis failed: {exc}"}), 500
+
+
+@app.route("/api/ai/analyze/<portfolio_id>/<path:pub_num>", methods=["GET"])
+@require_auth
+def ai_get_cached_analysis(portfolio_id, pub_num):
+    """Return the cached AI analysis (prosecution kind) for this family member."""
+    try:
+        doc_id = pub_num.replace("/", "_")
+        snap = (
+            db.collection("users").document(request.uid)
+              .collection("portfolios").document(portfolio_id)
+              .collection("ai_analysis").document(doc_id).get()
+        )
+        if not snap.exists:
+            return jsonify({"error": "no cached analysis"}), 404
+        return jsonify(snap.to_dict())
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/ai/portfolio-summary", methods=["POST"])
+@require_auth
+def ai_portfolio_summary():
+    """AI portfolio-wide summary: urgent items, patterns, recommendations."""
+    try:
+        from ai_engine import PatentAI
+    except ImportError as exc:
+        return jsonify({"error": f"AI engine unavailable: {exc}"}), 500
+    try:
+        docs = (
+            db.collection("users").document(request.uid)
+              .collection("portfolios").stream()
+        )
+        entries = []
+        for d in docs:
+            entry = d.to_dict() or {}
+            entry["id"] = d.id
+            entries.append(entry)
+        if not entries:
+            return jsonify({
+                "executive_summary": "Portfolio is empty.",
+                "urgent_items": [],
+                "portfolio_health": {"total_active": 0, "needs_attention": 0, "on_track": 0},
+                "patterns": [],
+                "recommendations": [],
+            })
+        ai     = PatentAI()
+        result = ai.analyze_portfolio(entries)
+        return jsonify(result)
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"error": f"Portfolio summary failed: {exc}"}), 500
+
+
+# ── PDF passthrough (used by per-tile PDF button) ─────────────────────────────
+
+@app.route("/api/pdf/<patent_num>", methods=["GET"])
+def pdf_proxy(patent_num):
+    """
+    Redirect to a best-effort PDF source for a granted US patent number.
+    Google Patents reliably hosts the full patent document.
+    """
+    import re as _re
+    from flask import redirect
+
+    clean = _re.sub(r"[^A-Z0-9]", "", (patent_num or "").upper())
+    if not clean:
+        return jsonify({"error": "invalid patent number"}), 400
+    return redirect(f"https://patents.google.com/patent/{clean}/en")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

@@ -98,6 +98,10 @@ export default function Portfolio() {
   const [loadingMsg, setLoadingMsg]       = useState("");
   const [confirmTarget, setConfirmTarget] = useState(null);
   const [docsPanel,    setDocsPanel]     = useState(null); // { portfolioId, patentNumber, usAppNum }
+  const [aiPanel,      setAiPanel]       = useState(null); // { portfolioId, pubNum, patentNumber }
+  const [aiResult,     setAiResult]      = useState(null);
+  const [aiLoading,    setAiLoading]     = useState(false);
+  const [aiError,      setAiError]       = useState("");
   const [refreshError, setRefreshError] = useState("");
 
   // ── Combine mode (multi-family dashboards) ──────────────────────────────
@@ -196,18 +200,22 @@ export default function Portfolio() {
     }
   }
 
-  // Listen for per-tile 📎 Files button postMessages from the dashboard iframe
+  // Listen for per-tile postMessages from the dashboard iframe (Files + AI)
   useEffect(() => {
     function onMessage(e) {
-      if (e.data?.type !== "open-tile-files") return;
-      const pubNum  = e.data.pubNum;
-      const usEntry = (viewing?.family || []).find((m) => m.country === "US");
-      setDocsPanel({
-        portfolioId:  viewingId,
-        patentNumber: viewingNumber,
-        usAppNum:     usEntry?.app_num || "",
-        tilePubNum:   pubNum,   // scoped to this specific tile
-      });
+      if (e.data?.type === "open-tile-files") {
+        const pubNum  = e.data.pubNum;
+        const usEntry = (viewing?.family || []).find((m) => m.country === "US");
+        setDocsPanel({
+          portfolioId:  viewingId,
+          patentNumber: viewingNumber,
+          usAppNum:     usEntry?.app_num || "",
+          tilePubNum:   pubNum,
+        });
+      } else if (e.data?.type === "open-tile-ai") {
+        const pubNum = e.data.pubNum;
+        handleAiAnalyze(viewingId, pubNum, viewingNumber);
+      }
     }
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
@@ -410,6 +418,37 @@ export default function Portfolio() {
     }
   }
 
+  // ── AI Office Action Analysis ─────────────────────────────────────────
+  async function handleAiAnalyze(portfolioId, pubNum, patentNumber) {
+    setAiPanel({ portfolioId, pubNum, patentNumber: patentNumber || pubNum });
+    setAiResult(null);
+    setAiError("");
+    setAiLoading(true);
+    try {
+      const result = await api.aiAnalyzeOA(portfolioId, pubNum);
+      setAiResult(result);
+    } catch (err) {
+      setAiError(err.message || "OA analysis failed");
+    } finally {
+      setAiLoading(false);
+    }
+  }
+
+  async function handleRefreshAi() {
+    if (!aiPanel) return;
+    setAiResult(null);
+    setAiError("");
+    setAiLoading(true);
+    try {
+      const result = await api.aiAnalyzeOA(aiPanel.portfolioId, aiPanel.pubNum);
+      setAiResult(result);
+    } catch (err) {
+      setAiError(err.message || "OA analysis failed");
+    } finally {
+      setAiLoading(false);
+    }
+  }
+
   // Full-page loading overlay while fresh search runs (30-60s)
   if (viewLoading) {
     const isScrape = loadingMsg.startsWith("Generating") || loadingMsg.startsWith("Refresh");
@@ -496,6 +535,140 @@ export default function Portfolio() {
             tilePubNum={docsPanel.tilePubNum}
             onClose={() => setDocsPanel(null)}
           />
+        )}
+        {/* AI Office Action Analysis Panel */}
+        {aiPanel && (
+          <div style={aiStyles.overlay} onClick={() => { setAiPanel(null); setAiResult(null); setAiError(""); }}>
+            <div style={aiStyles.panel} onClick={(e) => e.stopPropagation()}>
+              <div style={aiStyles.header}>
+                <h3 style={aiStyles.title}>Office Action Analysis</h3>
+                <span style={aiStyles.subtitle}>{aiPanel.pubNum}</span>
+                <button style={aiStyles.closeBtn} onClick={() => { setAiPanel(null); setAiResult(null); setAiError(""); }}>✕</button>
+              </div>
+              {aiLoading && (
+                <div style={aiStyles.loadingWrap}>
+                  <div style={styles.spinner} />
+                  <p style={{ margin: 0, color: "#555", fontSize: 14 }}>Fetching and analyzing office action...</p>
+                  <p style={{ margin: 0, color: "#999", fontSize: 12 }}>Downloading OA from USPTO, extracting text, running AI analysis. This may take 20-30 seconds.</p>
+                </div>
+              )}
+              {aiError && (
+                <div style={aiStyles.errorBox}>
+                  <strong>Analysis failed:</strong> {aiError}
+                  <button style={aiStyles.retryBtn} onClick={handleRefreshAi}>Retry</button>
+                </div>
+              )}
+              {aiResult && (
+                <div style={aiStyles.resultWrap}>
+                  {/* OA Type + Deadlines */}
+                  <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 16 }}>
+                    {aiResult.oa_type && (
+                      <span style={{ ...aiStyles.urgencyTag, background: "#e3f2fd", color: "#1565c0", fontSize: 12, padding: "4px 12px" }}>
+                        {aiResult.oa_type.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase())}
+                      </span>
+                    )}
+                    {aiResult.mailing_date && (
+                      <span style={{ fontSize: 12, color: "#666", alignSelf: "center" }}>Mailed: {aiResult.mailing_date}</span>
+                    )}
+                  </div>
+                  {(aiResult.response_deadline_short || aiResult.response_deadline_extended) && (
+                    <div style={{ background: "#fff7ed", border: "1px solid #fed7aa", borderRadius: 8, padding: "10px 14px", marginBottom: 16, fontSize: 13, color: "#c2410c" }}>
+                      <strong>Response due:</strong> {aiResult.response_deadline_short} without extension
+                      {aiResult.response_deadline_extended && aiResult.response_deadline_extended !== aiResult.response_deadline_short
+                        ? ` and ${aiResult.response_deadline_extended} with extension` : ""}
+                    </div>
+                  )}
+
+                  {/* Overview */}
+                  {aiResult.overview && (
+                    <div style={aiStyles.section}>
+                      <div style={aiStyles.sectionLabel}>Overview</div>
+                      <p style={aiStyles.summaryText}>{aiResult.overview}</p>
+                    </div>
+                  )}
+
+                  {/* Rejections */}
+                  {aiResult.rejections && aiResult.rejections.length > 0 && (
+                    <div style={aiStyles.section}>
+                      <div style={aiStyles.sectionLabel}>Rejections ({aiResult.rejections.length})</div>
+                      {aiResult.rejections.map((rej, i) => (
+                        <div key={i} style={{ ...aiStyles.actionItem, borderLeft: "4px solid #c62828" }}>
+                          <div style={aiStyles.actionHeader}>
+                            <span style={aiStyles.actionTitle}>{rej.section || rej.type}</span>
+                            {rej.claims_affected && <span style={{ fontSize: 11, color: "#666" }}>{rej.claims_affected}</span>}
+                          </div>
+                          <p style={aiStyles.actionDetails}>{rej.summary}</p>
+                          {rej.key_argument && (
+                            <p style={{ ...aiStyles.actionDetails, fontStyle: "italic", color: "#777", marginTop: 4 }}>
+                              Examiner's argument: {rej.key_argument}
+                            </p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Cited Prior Art */}
+                  {aiResult.cited_prior_art && aiResult.cited_prior_art.length > 0 && (
+                    <div style={aiStyles.section}>
+                      <div style={aiStyles.sectionLabel}>Cited Prior Art ({aiResult.cited_prior_art.length})</div>
+                      {aiResult.cited_prior_art.map((ref, i) => (
+                        <div key={i} style={{ ...aiStyles.actionItem, borderLeft: "4px solid #1a73e8" }}>
+                          <div style={{ fontWeight: 600, fontSize: 13, color: "#1a1a2e", marginBottom: 4 }}>
+                            {ref.reference}
+                            {ref.citation_type && (
+                              <span style={{ ...aiStyles.urgencyTag, background: "#e8f0fe", color: "#1a73e8", marginLeft: 8 }}>
+                                {ref.citation_type === "non-patent-literature" ? "NPL" : "Patent"}
+                              </span>
+                            )}
+                          </div>
+                          {ref.relevance && <p style={aiStyles.actionDetails}>{ref.relevance}</p>}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Suggested Response Strategies */}
+                  {aiResult.suggested_response_strategies && aiResult.suggested_response_strategies.length > 0 && (
+                    <div style={aiStyles.section}>
+                      <div style={aiStyles.sectionLabel}>Response Strategies</div>
+                      {aiResult.suggested_response_strategies.map((s, i) => (
+                        <div key={i} style={{
+                          ...aiStyles.actionItem,
+                          borderLeft: `4px solid ${s.likelihood_of_success === "high" ? "#2e7d32" : s.likelihood_of_success === "medium" ? "#f57c00" : "#c62828"}`,
+                        }}>
+                          <div style={aiStyles.actionHeader}>
+                            <span style={aiStyles.actionTitle}>{s.strategy}</span>
+                            <span style={{
+                              ...aiStyles.urgencyTag,
+                              background: s.likelihood_of_success === "high" ? "#e8f5e9" : s.likelihood_of_success === "medium" ? "#fff3e0" : "#fdecea",
+                              color: s.likelihood_of_success === "high" ? "#2e7d32" : s.likelihood_of_success === "medium" ? "#e65100" : "#c62828",
+                            }}>{s.likelihood_of_success}</span>
+                          </div>
+                          <p style={aiStyles.actionDetails}>{s.details}</p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Attorney Flags */}
+                  {aiResult.attorney_flags && aiResult.attorney_flags.length > 0 && (
+                    <div style={{ background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 8, padding: "12px 16px", marginBottom: 16 }}>
+                      <div style={{ ...aiStyles.sectionLabel, color: "#991b1b", marginBottom: 6 }}>Attorney Attention Required</div>
+                      {aiResult.attorney_flags.map((flag, i) => (
+                        <p key={i} style={{ margin: "4px 0", fontSize: 13, color: "#991b1b", lineHeight: 1.5 }}>{flag}</p>
+                      ))}
+                    </div>
+                  )}
+
+                  <div style={aiStyles.footer}>
+                    <span style={aiStyles.footerNote}>AI-generated analysis. Attorney review required.</span>
+                    <button style={aiStyles.refreshBtn} onClick={handleRefreshAi}>Re-analyze</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
         )}
         <div style={styles.dashHeader}>
           <button
@@ -788,6 +961,9 @@ const styles = {
   docsBtn:   { padding: "8px 12px", borderRadius: 8, background: "#f0f4f8",
     border: "1px solid #d0d7de", cursor: "pointer", fontSize: 13, color: "#1a1a2e",
     fontWeight: 500 },
+  aiBtn:     { padding: "8px 12px", borderRadius: 8, background: "#ede7f6",
+    border: "1px solid #ce93d8", cursor: "pointer", fontSize: 13, color: "#6a1b9a",
+    fontWeight: 600 },
   deleteBtn: { padding: "8px 14px", borderRadius: 8, background: "#fff",
     color: "#d32f2f", border: "1px solid #f5c6cb", cursor: "pointer", fontSize: 13 },
   dashHeader:  { marginBottom: 12, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" },
@@ -837,4 +1013,45 @@ const styles = {
     animation: "spin 1s linear infinite" },
   loadingText:    { fontSize: 18, color: "#1a1a2e", margin: 0, textAlign: "center" },
   loadingSubtext: { fontSize: 14, color: "#888", margin: 0 },
+};
+
+const aiStyles = {
+  overlay: { position: "fixed", inset: 0, background: "rgba(0,0,0,.45)",
+    display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 },
+  panel: { background: "#fff", borderRadius: 14, padding: 0, width: "90%", maxWidth: 620,
+    maxHeight: "85vh", overflow: "hidden", display: "flex", flexDirection: "column",
+    boxShadow: "0 20px 60px rgba(0,0,0,.25)" },
+  header: { display: "flex", alignItems: "center", gap: 10, padding: "18px 24px 14px",
+    borderBottom: "1px solid #e0e0e0", flexShrink: 0 },
+  title: { margin: 0, fontSize: 17, color: "#1a1a2e", fontWeight: 700 },
+  subtitle: { fontSize: 13, color: "#1a73e8", fontWeight: 600 },
+  closeBtn: { marginLeft: "auto", background: "none", border: "none", fontSize: 20,
+    cursor: "pointer", color: "#888", padding: "4px 8px", lineHeight: 1 },
+  loadingWrap: { display: "flex", flexDirection: "column", alignItems: "center",
+    gap: 14, padding: "3rem 2rem" },
+  errorBox: { margin: "1.5rem", padding: "14px 18px", borderRadius: 8, background: "#fdecea",
+    color: "#c62828", fontSize: 14, lineHeight: 1.5 },
+  retryBtn: { marginLeft: 12, padding: "4px 14px", borderRadius: 6, border: "1px solid #c62828",
+    background: "#fff", color: "#c62828", cursor: "pointer", fontSize: 13, fontWeight: 600 },
+  resultWrap: { overflowY: "auto", padding: "20px 24px" },
+  section: { marginBottom: 20 },
+  sectionLabel: { fontSize: 12, fontWeight: 700, textTransform: "uppercase",
+    letterSpacing: "0.05em", color: "#888", marginBottom: 8 },
+  summaryText: { margin: 0, fontSize: 14, color: "#333", lineHeight: 1.65 },
+  riskBadge: { display: "inline-block", padding: "5px 14px", borderRadius: 20,
+    fontSize: 13, fontWeight: 700, marginBottom: 16 },
+  actionItem: { background: "#f8f9fa", borderRadius: 8, padding: "12px 16px",
+    marginBottom: 10 },
+  actionHeader: { display: "flex", justifyContent: "space-between", alignItems: "center",
+    gap: 10, marginBottom: 4 },
+  actionTitle: { fontWeight: 600, fontSize: 14, color: "#1a1a2e" },
+  urgencyTag: { fontSize: 11, fontWeight: 700, padding: "2px 10px", borderRadius: 12,
+    textTransform: "uppercase", flexShrink: 0 },
+  actionMeta: { fontSize: 12, color: "#666", marginTop: 2 },
+  actionDetails: { margin: "8px 0 0", fontSize: 13, color: "#555", lineHeight: 1.55 },
+  footer: { display: "flex", alignItems: "center", justifyContent: "space-between",
+    paddingTop: 16, borderTop: "1px solid #eee", marginTop: 8 },
+  footerNote: { fontSize: 11, color: "#999", fontStyle: "italic" },
+  refreshBtn: { padding: "6px 16px", borderRadius: 8, border: "1px solid #ce93d8",
+    background: "#ede7f6", color: "#6a1b9a", cursor: "pointer", fontSize: 13, fontWeight: 600 },
 };
