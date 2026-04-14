@@ -100,6 +100,14 @@ export default function Portfolio() {
   const [docsPanel,    setDocsPanel]     = useState(null); // { portfolioId, patentNumber, usAppNum }
   const [refreshError, setRefreshError] = useState("");
 
+  // ── Combine mode (multi-family dashboards) ──────────────────────────────
+  const [groups, setGroups]             = useState([]);
+  const [combineMode, setCombineMode]   = useState(false);
+  const [selectedIds, setSelectedIds]   = useState([]);      // ad-hoc selection
+  const [viewingGroup, setViewingGroup] = useState(null);    // { id, name, dashboard_html } or ad-hoc preview
+  const [groupSaveName, setGroupSaveName] = useState("");
+  const groupIframeRef = useRef(null);
+
   const iframeRef         = useRef(null);
   const notesRef          = useRef({});   // always-current notes for the open dashboard
   const viewingIdRef      = useRef(null); // always-current portfolio doc ID
@@ -113,7 +121,80 @@ export default function Portfolio() {
   useEffect(() => { viewingFamilyRef.current = viewing?.family || []; }, [viewing]);
   useEffect(() => { setDocsPanelRef.current = setDocsPanel; }, [setDocsPanel]);
 
-  useEffect(() => { fetchPortfolio(); }, []);
+  useEffect(() => { fetchPortfolio(); fetchGroups(); }, []);
+
+  async function fetchGroups() {
+    try {
+      const data = await api.listPatenteeGroups();
+      setGroups(data.groups || []);
+    } catch { /* groups are optional; ignore */ }
+  }
+
+  function toggleSelected(id) {
+    setSelectedIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    );
+  }
+
+  async function handleCombinePreview() {
+    if (selectedIds.length < 2) {
+      alert("Select at least two patent families to combine.");
+      return;
+    }
+    setViewLoading(true);
+    setLoadingMsg(`Combining ${selectedIds.length} families…`);
+    try {
+      const data = await api.previewPatenteeGroup(selectedIds, "Combined preview");
+      setViewingGroup({ id: null, name: data.name, dashboard_html: data.dashboard_html,
+                        portfolio_ids: data.portfolio_ids });
+      setViewLoading(false);
+    } catch (err) {
+      setViewLoading(false);
+      alert(err.message);
+    }
+  }
+
+  async function handleSaveGroup() {
+    const name = (groupSaveName || "").trim();
+    if (!name) { alert("Give the group a name first."); return; }
+    const ids = viewingGroup?.portfolio_ids?.length ? viewingGroup.portfolio_ids : selectedIds;
+    if (!ids || ids.length < 2) { alert("Select at least two families to save."); return; }
+    try {
+      const created = await api.createPatenteeGroup(name, ids);
+      setGroups((prev) => [{
+        id: created.id, name: created.name, portfolio_ids: created.portfolio_ids,
+        updated_at: new Date().toISOString(),
+      }, ...prev]);
+      setGroupSaveName("");
+      alert(`Saved group "${name}".`);
+    } catch (err) {
+      alert(err.message);
+    }
+  }
+
+  async function handleOpenGroup(groupId) {
+    setViewLoading(true);
+    setLoadingMsg("Loading combined dashboard…");
+    try {
+      const data = await api.getPatenteeGroupDashboard(groupId);
+      setViewingGroup({ id: groupId, name: data.name, dashboard_html: data.dashboard_html,
+                        portfolio_ids: data.portfolio_ids });
+      setViewLoading(false);
+    } catch (err) {
+      setViewLoading(false);
+      alert(err.message);
+    }
+  }
+
+  async function handleDeleteGroup(groupId) {
+    if (!confirm("Delete this group? (Does not delete the underlying patents.)")) return;
+    try {
+      await api.deletePatenteeGroup(groupId);
+      setGroups((prev) => prev.filter((g) => g.id !== groupId));
+    } catch (err) {
+      alert(err.message);
+    }
+  }
 
   // Listen for per-tile 📎 Files button postMessages from the dashboard iframe
   useEffect(() => {
@@ -345,6 +426,58 @@ export default function Portfolio() {
     );
   }
 
+  if (viewingGroup) {
+    return (
+      <div style={styles.page}>
+        <div style={styles.dashHeader}>
+          <button
+            style={styles.backBtn}
+            onClick={() => setViewingGroup(null)}
+          >
+            ← Back
+          </button>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <strong style={{ fontSize: 15 }}>{viewingGroup.name}</strong>
+            <span style={{ marginLeft: 8, color: "#666", fontSize: 13 }}>
+              ({viewingGroup.portfolio_ids?.length || 0} families)
+            </span>
+          </div>
+          {!viewingGroup.id && (
+            <>
+              <input
+                style={styles.nameInput}
+                placeholder="Name this group to save it…"
+                value={groupSaveName}
+                onChange={(e) => setGroupSaveName(e.target.value)}
+              />
+              <button style={styles.viewBtn} onClick={handleSaveGroup}>
+                💾 Save Group
+              </button>
+            </>
+          )}
+          {viewingGroup.id && (
+            <button
+              style={{ ...styles.deleteBtn }}
+              onClick={() => handleDeleteGroup(viewingGroup.id).then(() => setViewingGroup(null))}
+              title="Delete this saved group"
+            >
+              Delete Group
+            </button>
+          )}
+        </div>
+        <div style={styles.iframeWrap}>
+          <iframe
+            ref={groupIframeRef}
+            title="Combined Dashboard"
+            style={styles.iframe}
+            srcDoc={viewingGroup.dashboard_html}
+            sandbox="allow-scripts allow-same-origin allow-modals allow-popups"
+          />
+        </div>
+      </div>
+    );
+  }
+
   if (viewing) {
     return (
       <div style={styles.page}>
@@ -456,6 +589,81 @@ export default function Portfolio() {
       )}
       <h2 style={styles.heading}>My Portfolio</h2>
 
+      {/* ── Saved Patentee Groups ─────────────────────────────────────────── */}
+      {groups.length > 0 && (
+        <div style={styles.groupsWrap}>
+          <div style={styles.groupsHeader}>
+            <span style={{ fontWeight: 700, color: "#1a1a2e" }}>Saved Groups</span>
+            <span style={{ fontSize: 12, color: "#888" }}>
+              Combined multi-family dashboards
+            </span>
+          </div>
+          <div style={styles.groupsRow}>
+            {groups.map((g) => (
+              <div key={g.id} style={styles.groupChip}>
+                <button
+                  style={styles.groupOpenBtn}
+                  onClick={() => handleOpenGroup(g.id)}
+                  title={`Open combined dashboard — ${g.portfolio_ids?.length || 0} families`}
+                >
+                  📚 {g.name}{" "}
+                  <span style={{ color: "#888", fontWeight: 400 }}>
+                    ({g.portfolio_ids?.length || 0})
+                  </span>
+                </button>
+                <button
+                  style={styles.groupDelBtn}
+                  onClick={() => handleDeleteGroup(g.id)}
+                  title="Delete group (patents are not deleted)"
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── Combine mode toolbar ─────────────────────────────────────────── */}
+      {patents.length >= 2 && (
+        <div style={styles.combineBar}>
+          <label style={styles.combineToggleWrap}>
+            <input
+              type="checkbox"
+              checked={combineMode}
+              onChange={(e) => {
+                setCombineMode(e.target.checked);
+                if (!e.target.checked) setSelectedIds([]);
+              }}
+            />
+            <span style={{ fontWeight: 600 }}>Combine mode</span>
+            <span style={{ fontSize: 12, color: "#666" }}>
+              — select multiple families to view together
+            </span>
+          </label>
+          {combineMode && (
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              <span style={{ fontSize: 13, color: "#444" }}>
+                {selectedIds.length} selected
+              </span>
+              <button
+                style={styles.viewBtn}
+                disabled={selectedIds.length < 2}
+                onClick={handleCombinePreview}
+              >
+                Combine Selected
+              </button>
+              <button
+                style={styles.backBtn}
+                onClick={() => setSelectedIds([])}
+              >
+                Clear
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Status color legend */}
       <div style={styles.legend}>
         <span style={styles.legendTitle}>Status:</span>
@@ -487,8 +695,25 @@ export default function Portfolio() {
           const usEntry    = family.find((m) => m.country === "US");
           const usAppNum   = usEntry?.app_num || "";
 
+          const isSelected = selectedIds.includes(p.id);
           return (
-            <div key={p.id} style={styles.card}>
+            <div
+              key={p.id}
+              style={{
+                ...styles.card,
+                ...(combineMode && isSelected ? { outline: "3px solid #1a73e8", outlineOffset: -1 } : {}),
+              }}
+            >
+              {combineMode && (
+                <label style={styles.tileCheckbox}>
+                  <input
+                    type="checkbox"
+                    checked={isSelected}
+                    onChange={() => toggleSelected(p.id)}
+                  />
+                  <span style={{ fontSize: 12 }}>Include in combined view</span>
+                </label>
+              )}
               <div style={styles.cardHeader}>
                 <span style={styles.number}>{p.patent_number}</span>
                 <span style={{ ...styles.badge, background: "#e3f2fd", color: "#1565c0" }}>
@@ -587,6 +812,24 @@ const styles = {
     color: "#856404", fontSize: 13, lineHeight: 1.5,
   },
   iframe:      { width: "100%", height: "85vh", border: "none", display: "block" },
+  groupsWrap:  { marginBottom: 20, padding: "12px 16px", background: "#f8f9fa",
+    borderRadius: 10, border: "1px solid #e0e0e0" },
+  groupsHeader:{ display: "flex", alignItems: "baseline", justifyContent: "space-between",
+    gap: 10, marginBottom: 8, flexWrap: "wrap" },
+  groupsRow:   { display: "flex", flexWrap: "wrap", gap: 8 },
+  groupChip:   { display: "inline-flex", alignItems: "stretch", borderRadius: 8,
+    background: "#fff", border: "1px solid #d0d7de", overflow: "hidden" },
+  groupOpenBtn:{ padding: "7px 12px", border: "none", background: "#fff",
+    cursor: "pointer", fontSize: 13, fontWeight: 600, color: "#1a1a2e" },
+  groupDelBtn: { padding: "7px 9px", border: "none", borderLeft: "1px solid #e0e0e0",
+    background: "#fff", cursor: "pointer", color: "#d32f2f", fontSize: 13 },
+  combineBar:  { display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap",
+    padding: "10px 14px", marginBottom: 14, background: "#fff3e0",
+    border: "1px solid #ffe0b2", borderRadius: 10 },
+  combineToggleWrap: { display: "flex", alignItems: "center", gap: 8, cursor: "pointer" },
+  tileCheckbox: { display: "flex", alignItems: "center", gap: 6, marginBottom: 8,
+    padding: "4px 8px", background: "#e8f0fe", borderRadius: 6, cursor: "pointer",
+    color: "#1565c0", fontWeight: 500 },
   loadingOverlay: { display: "flex", flexDirection: "column", alignItems: "center",
     justifyContent: "center", minHeight: "60vh", gap: 20 },
   spinner: { width: 48, height: 48, border: "5px solid #e0e0e0",

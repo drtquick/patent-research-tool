@@ -15,19 +15,21 @@ export default function Search() {
   const ranQuery  = useRef(null);
   const iframeRef = useRef(null);
 
-  // Run search whenever ?q= param changes (including on first load)
+  // Run search whenever ?q= or ?type= param changes (including on first load)
   useEffect(() => {
     const q = searchParams.get("q") || "";
-    if (!q.trim() || q === ranQuery.current) return;
-    ranQuery.current = q;
-    runSearch(q.trim());
+    const t = searchParams.get("type") || "auto";
+    const key = `${q}::${t}`;
+    if (!q.trim() || key === ranQuery.current) return;
+    ranQuery.current = key;
+    runSearch(q.trim(), t);
   }, [searchParams]);
 
-  async function runSearch(q) {
+  async function runSearch(q, searchType) {
     setError(""); setResult(null); setSaved(false);
     setLoading(true);
     try {
-      const data = await api.search(q);
+      const data = await api.search(q, searchType || "auto");
       setResult(data);
     } catch (err) {
       setError(err.message);

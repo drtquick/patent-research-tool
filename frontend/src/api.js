@@ -18,10 +18,14 @@ async function authFetch(path, opts = {}) {
 }
 
 export const api = {
-  search: (patent_number) =>
+  // search_type may be "auto" (default), "patent_number",
+  // "application_number", or "publication_number". The server uses this to
+  // disambiguate inputs that could parse as either an app number or a patent
+  // number (e.g. 8-digit bare numbers).
+  search: (patent_number, search_type = "auto") =>
     authFetch("/api/search", {
       method: "POST",
-      body: JSON.stringify({ patent_number }),
+      body: JSON.stringify({ patent_number, search_type }),
     }),
 
   listPortfolios: () => authFetch("/api/portfolios"),
@@ -84,4 +88,34 @@ export const api = {
 
   deletePortfolioFile: (id, fileId) =>
     authFetch(`/api/portfolios/${id}/files/${fileId}`, { method: "DELETE" }),
+
+  // ── Patentee groups (combined multi-family dashboards) ───────────────────
+
+  listPatenteeGroups: () => authFetch("/api/patentee-groups"),
+
+  createPatenteeGroup: (name, portfolio_ids) =>
+    authFetch("/api/patentee-groups", {
+      method: "POST",
+      body: JSON.stringify({ name, portfolio_ids }),
+    }),
+
+  getPatenteeGroup: (id) => authFetch(`/api/patentee-groups/${id}`),
+
+  updatePatenteeGroup: (id, patch) =>
+    authFetch(`/api/patentee-groups/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+
+  deletePatenteeGroup: (id) =>
+    authFetch(`/api/patentee-groups/${id}`, { method: "DELETE" }),
+
+  getPatenteeGroupDashboard: (id) =>
+    authFetch(`/api/patentee-groups/${id}/dashboard`),
+
+  previewPatenteeGroup: (portfolio_ids, name = "Combined preview") =>
+    authFetch("/api/patentee-groups/preview", {
+      method: "POST",
+      body: JSON.stringify({ portfolio_ids, name }),
+    }),
 };

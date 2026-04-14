@@ -15,17 +15,30 @@ function timeAgo(iso) {
   return `${Math.floor(h / 24)}d ago`;
 }
 
+/* ── Search type options shown in the dropdown ──────────────────────────────
+   The placeholder for the input swaps based on the current selection so the
+   user can see the expected format before typing. */
+const SEARCH_TYPES = [
+  { value: "auto",               label: "Auto-detect",     placeholder: "Patent number\u2026",          shortLabel: "Auto"         },
+  { value: "patent_number",      label: "Patent Number",   placeholder: "e.g. US 10,123,456 B2",        shortLabel: "Patent"       },
+  { value: "application_number", label: "Application No.", placeholder: "e.g. 16/123,456 or 16123456",  shortLabel: "Application"  },
+  { value: "publication_number", label: "Publication No.", placeholder: "e.g. US 2020/0123456 A1",      shortLabel: "Publication"  },
+];
+
 export default function Navbar() {
   const { user, logout } = useAuth();
   const navigate  = useNavigate();
   const isMobile  = useIsMobile(720);
 
   const [q, setQ]                     = useState("");
+  const [searchType, setSearchType]   = useState("auto");
   const [menuOpen, setMenuOpen]       = useState(false);
   const [history, setHistory]         = useState([]);
   const [histOpen, setHistOpen]       = useState(false);
   const [histLoaded, setHistLoaded]   = useState(false);
   const blurTimer = useRef(null);
+
+  const currentType = SEARCH_TYPES.find((t) => t.value === searchType) || SEARCH_TYPES[0];
 
   const loadHistory = useCallback(async () => {
     if (histLoaded) return;
@@ -51,7 +64,8 @@ export default function Navbar() {
     e.preventDefault();
     const trimmed = q.trim();
     if (!trimmed) return;
-    navigate(`/search?q=${encodeURIComponent(trimmed)}`);
+    const typeParam = searchType && searchType !== "auto" ? `&type=${searchType}` : "";
+    navigate(`/search?q=${encodeURIComponent(trimmed)}${typeParam}`);
     setQ("");
     setHistOpen(false);
     setMenuOpen(false);
@@ -83,18 +97,46 @@ export default function Navbar() {
     </div>
   );
 
+  const typeSelectDesktop = (
+    <select
+      aria-label="Search type"
+      title="Search type — pick a format so the server routes your input correctly"
+      value={searchType}
+      onChange={(e) => setSearchType(e.target.value)}
+      style={s.typeSelect}
+    >
+      {SEARCH_TYPES.map((t) => (
+        <option key={t.value} value={t.value}>{t.label}</option>
+      ))}
+    </select>
+  );
+
+  const typeSelectMobile = (
+    <select
+      aria-label="Search type"
+      value={searchType}
+      onChange={(e) => setSearchType(e.target.value)}
+      style={s.typeSelectMobile}
+    >
+      {SEARCH_TYPES.map((t) => (
+        <option key={t.value} value={t.value}>{t.shortLabel}</option>
+      ))}
+    </select>
+  );
+
   /* ── Mobile layout ─────────────────────────────────── */
   if (isMobile) {
     return (
       <>
         <nav style={s.navMobile}>
-          <button style={s.brandBtn} onClick={() => navigate("/portfolio")}>PatentQ<span style={s.version}>β 1.14</span></button>
+          <button style={s.brandBtn} onClick={() => navigate("/portfolio")}>PatentQ<span style={s.version}>β 1.17</span></button>
 
           <div style={{ ...s.searchFormMobile, position: "relative" }}>
             <form onSubmit={handleSearch} style={{ display: "flex", gap: 4, flex: 1 }}>
+              {typeSelectMobile}
               <input
                 style={s.searchInputMobile}
-                placeholder="Patent number…"
+                placeholder={currentType.placeholder}
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
                 onFocus={handleFocus}
@@ -129,13 +171,14 @@ export default function Navbar() {
   /* ── Desktop layout ─────────────────────────────────── */
   return (
     <nav style={s.nav}>
-      <button style={s.brandBtn} onClick={() => navigate("/portfolio")}>PatentQ<span style={s.version}>β 1.14</span></button>
+      <button style={s.brandBtn} onClick={() => navigate("/portfolio")}>PatentQ<span style={s.version}>β 1.17</span></button>
 
-      <div style={{ position: "relative", flex: 1, maxWidth: 420, minWidth: 180 }}>
+      <div style={{ position: "relative", flex: 1, maxWidth: 520, minWidth: 220 }}>
         <form onSubmit={handleSearch} style={s.searchForm}>
+          {typeSelectDesktop}
           <input
             style={s.searchInput}
-            placeholder="Patent number…"
+            placeholder={currentType.placeholder}
             value={q}
             onChange={(e) => setQ(e.target.value)}
             onFocus={handleFocus}
@@ -233,8 +276,20 @@ const s = {
     letterSpacing: "0.03em",
   },
   searchForm: { display: "flex", gap: 6, width: "100%" },
+  typeSelect: {
+    padding: "6px 8px", borderRadius: 7,
+    border: "1px solid rgba(255,255,255,.25)", background: "rgba(255,255,255,.12)",
+    color: "#fff", fontSize: 13, outline: "none", cursor: "pointer",
+    flexShrink: 0, maxWidth: 150,
+  },
+  typeSelectMobile: {
+    padding: "6px 4px", borderRadius: 7,
+    border: "1px solid rgba(255,255,255,.25)", background: "rgba(255,255,255,.12)",
+    color: "#fff", fontSize: 12, outline: "none", cursor: "pointer",
+    flexShrink: 0, maxWidth: 98,
+  },
   searchInput: {
-    flex: 1, padding: "6px 12px", borderRadius: 7,
+    flex: 1, padding: "6px 12px", borderRadius: 7, minWidth: 0,
     border: "1px solid rgba(255,255,255,.25)", background: "rgba(255,255,255,.1)",
     color: "#fff", fontSize: 14, outline: "none",
   },
