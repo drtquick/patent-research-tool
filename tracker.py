@@ -2489,9 +2489,11 @@ def _render_card(m: dict) -> str:
             f'</div>'
         )
 
-    # Maintenance fees (granted patents only)
+    # Maintenance fees — US granted patents only. Foreign jurisdictions use
+    # annual renewal fees (rendered below as the annuity block), not USPTO
+    # maintenance fees, so we never render this section for non-US tiles.
     maint_html = ""
-    if status == "granted" and grant:
+    if status == "granted" and grant and code == "US":
         fees = calc_maintenance_fees(grant)
         if fees:
             _status_styles = {

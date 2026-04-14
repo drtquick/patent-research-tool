@@ -1851,6 +1851,58 @@ def _epo_fullimage_pdf(docdb: str) -> bytes | None:
     return None
 
 
+def _google_patents_pdf(pub_num_clean: str) -> bytes | None:
+    """
+    Fallback PDF source that works for most jurisdictions (JP, EP, CN, DE, KR, etc.).
+    Google Patents embeds a <meta name="citation_pdf_url"> tag on each patent page
+    pointing at a publicly hosted PDF on patentimages.storage.googleapis.com.
+    We scrape that URL once, then fetch the PDF.
+    """
+    import re as _re
+    import requests as _rq
+
+    clean = _re.sub(r"[^A-Z0-9]", "", (pub_num_clean or "").upper())
+    if not clean:
+        return None
+
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/120.0 Safari/537.36"),
+        "Accept-Language": "en",
+    }
+
+    # Candidate URLs — try with and without kind code in case GP normalized it away
+    _no_kind = _re.sub(r"[A-Z]+\d*$", "", clean)
+    candidates = [
+        f"https://patents.google.com/patent/{clean}/en",
+        f"https://patents.google.com/patent/{_no_kind}/en",
+    ]
+    seen = set()
+    for page_url in candidates:
+        if page_url in seen:
+            continue
+        seen.add(page_url)
+        try:
+            page = _rq.get(page_url, headers=headers, timeout=15, allow_redirects=True)
+            if page.status_code != 200:
+                continue
+            m = _re.search(
+                r'<meta\s+name="citation_pdf_url"\s+content="([^"]+)"',
+                page.text, _re.IGNORECASE,
+            )
+            if not m:
+                continue
+            pdf_url = m.group(1)
+            resp = _rq.get(pdf_url, headers=headers, timeout=60, allow_redirects=True)
+            if resp.status_code == 200 and resp.content[:4] == b"%PDF":
+                return resp.content
+        except Exception as exc:
+            print(f"  Google Patents PDF lookup error for {page_url}: {exc}")
+            continue
+    return None
+
+
 def _uspto_pdf(pub_num_clean: str) -> bytes | None:
     """
     Fallback PDF source for US documents via USPTO PatentsView imagewrapper CDN.
@@ -1904,12 +1956,17 @@ def pdf_proxy(pub_num):
     pdf   = _epo_fullimage_pdf(docdb) if docdb else None
     if not pdf and clean.startswith("US"):
         pdf = _uspto_pdf(clean)
+    # Google Patents mirror — covers most jurisdictions where EPO OPS full-image
+    # isn't available (JP, CN, KR, etc.) and where USPTO doesn't apply.
+    if not pdf:
+        pdf = _google_patents_pdf(clean)
 
     if not pdf:
         return jsonify({
             "error": (
-                f"No PDF available for {clean}. EPO OPS and USPTO both failed to "
-                f"return a PDF. The document may not have a published image yet."
+                f"No PDF available for {clean}. EPO OPS, USPTO, and Google Patents "
+                f"all failed to return a PDF. The document may not have a "
+                f"published image yet."
             )
         }), 404
 
