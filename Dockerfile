@@ -9,7 +9,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Only copy application code — secrets are injected via env vars at runtime
-COPY app.py tracker.py ./
+COPY app.py tracker.py ai_engine.py ./
 
 ENV PORT=8080
 ENV FLASK_DEBUG=false

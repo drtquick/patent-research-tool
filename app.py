@@ -174,26 +174,87 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
     }
 
     odp_url = f"https://data.uspto.gov/patent-file-wrapper/details/{clean}/documents"
+
+    # ── Enrich with EPO INPADOC family (foreign counterparts) ────────────────
+    # Previously this path returned only the single US family member, so the
+    # dashboard never showed DE/JP/CN/WO counterparts when the user searched by
+    # US application number.  Now we attempt to pull the INPADOC family via EPO
+    # OPS using the resolved US pub number as the docdb key, then fetch details
+    # for each non-US member via the normal Google Patents scrape path.
+    epo_key    = os.environ.get("EPO_CONSUMER_KEY",    "").strip()
+    epo_secret = os.environ.get("EPO_CONSUMER_SECRET", "").strip()
+    epo_only:      list = []
+    discrepancies: list = []
+
+    if epo_key and epo_secret:
+        docdb = tracker.patent_to_docdb(pub_num)
+        if docdb:
+            token = tracker.epo_get_token(epo_key, epo_secret)
+            if token:
+                family_xml = tracker.fetch_epo_family(docdb, token)
+                if family_xml:
+                    epo_members = tracker.parse_epo_family(family_xml)
+                    if epo_members:
+                        # Build a family list of non-US members; fetch details
+                        # via GP/EPO for each so they render as normal tiles.
+                        non_us = [em for em in epo_members if em.get("country") != "US"]
+                        extra_family_raw = []
+                        for em in non_us:
+                            norm_pub = tracker.normalize(em["pub_num"])
+                            extra_family_raw.append({
+                                "pub_num": em["pub_num"],
+                                "app_num": em.get("app_num", ""),
+                                "href":    f"https://patents.google.com/patent/{norm_pub}/en",
+                                "title":   "",
+                                "country": em["country"],
+                                "date":    em.get("pub_date", "") or em.get("app_date", ""),
+                                "lang":    "",
+                            })
+
+                        total = len(extra_family_raw)
+                        for i, m in enumerate(extra_family_raw):
+                            try:
+                                details = tracker.fetch_member_details(
+                                    m, i + 1, total, odp_api_key=api_key
+                                )
+                                family_details.append(details)
+                            except Exception as exc:
+                                print(f"  family enrichment skipped {m.get('pub_num')}: {exc}")
+
+                        # Discrepancy / epo-only merge (same as _run_search path)
+                        try:
+                            epo_only_raw, pub_discrepancies = tracker.merge_epo_with_google(
+                                family_details, epo_members
+                            )
+                            epo_only      = epo_only_raw or []
+                            discrepancies = list(pub_discrepancies or [])
+                        except Exception as exc:
+                            print(f"  family merge skipped: {exc}")
+
+    # ── Build summaries + dashboard from (possibly enriched) family ──────────
     dashboard_html = tracker.generate_dashboard_html(
-        metas, family_details, odp_url, pub_num
+        metas, family_details, odp_url, pub_num,
+        epo_only=epo_only or None,
+        discrepancies=discrepancies or None,
     )
 
-    dl = tracker._get_next_deadline(family_details[0])
-    family_summary = [{
-        "pub_num":             pub_num,
-        "country":             "US",
-        "status":              family_details[0].get("status", "unknown"),
-        "filing_date":         filing,
-        "grant_date":          grant,
-        "app_num":             clean,
-        "title":               title,
-        "href":                member["href"],
-        "next_deadline_label": dl["label"] if dl else "",
-        "next_deadline_date":  dl["date"]  if dl else "",
-        "next_deadline_type":  dl["type"]  if dl else "",
-    }]
+    family_summary = []
+    for m in family_details:
+        dl_ = tracker._get_next_deadline(m)
+        family_summary.append({
+            "pub_num":             m.get("pub_num", ""),
+            "country":             tracker.country_code(m.get("pub_num", "")),
+            "status":              m.get("status", "unknown"),
+            "filing_date":         m.get("filing_date") or m.get("date") or "",
+            "grant_date":          m.get("grant_date", ""),
+            "app_num":             m.get("app_num", ""),
+            "title":               m.get("member_title", "") or m.get("title", ""),
+            "href":                m.get("href", ""),
+            "next_deadline_label": dl_["label"] if dl_ else "",
+            "next_deadline_date":  dl_["date"]  if dl_ else "",
+            "next_deadline_type":  dl_["type"]  if dl_ else "",
+        })
 
-    status_text = (meta.get("applicationStatusDescriptionText") or "").lower()
     return {
         "patent_number":       pub_num,
         "title":               title,
@@ -203,13 +264,13 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
         "grant_date":          grant,
         "assignees":           assignees,
         "inventors":           inventors,
-        "family_size":         1,
-        "jurisdictions":       1,
-        "granted_count":       1 if "patent" in status_text else 0,
-        "pending_count":       0 if "patent" in status_text else 1,
+        "family_size":         len(family_details),
+        "jurisdictions":       len({tracker.country_code(m.get("pub_num", "")) for m in family_details}),
+        "granted_count":       sum(1 for m in family_details if m.get("status") == "granted"),
+        "pending_count":       sum(1 for m in family_details if m.get("status") == "pending"),
         "family":              family_summary,
-        "epo_only":            [],
-        "discrepancies":       [],
+        "epo_only":            epo_only,
+        "discrepancies":       discrepancies,
         "dashboard_html":      dashboard_html,
         "google_patents_url":  odp_url,
         "main_metas":          metas,
@@ -217,11 +278,21 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
     }
 
 
-def _run_search(patent_input: str) -> dict:
+def _run_search(patent_input: str, search_type: str = "auto") -> dict:
     """
     Orchestrate a full search and return all results as a dict.
 
-    Data-source priority (β 1.14):
+    search_type lets callers disambiguate inputs that could parse either as an
+    application number or a granted patent number.  Values:
+      "auto"               — heuristic routing (legacy behavior, below)
+      "patent_number"      — treat input as a granted patent (e.g. US10123456 B2)
+                             → EPO biblio → ODP (no ODP-as-app-num attempt)
+      "application_number" — treat input as a US application serial
+                             → ODP directly
+      "publication_number" — treat input as a US publication (e.g. US20200123456A1)
+                             → EPO biblio → ODP app resolution
+
+    Data-source priority for "auto" (β 1.14):
       1. 8-digit bare number         → try ODP as application number first
                                        → if ODP 404, fall through to EPO as patent number
       2. 11-digit bare US pub serial → prepend 'US' + 'A1', EPO biblio → ODP
@@ -234,12 +305,39 @@ def _run_search(patent_input: str) -> dict:
     import re as _re2
 
     _stripped = patent_input.strip()
+    search_type = (search_type or "auto").strip().lower()
 
-    # ── 8-digit bare number: app number OR patent number ─────────────────────
-    # Try ODP as an application number first; if ODP returns 404 the digits are
-    # a patent number (not an app number) — fall through to the EPO path below
-    # treating the input as "US{num}" (a granted patent).
-    if _re2.fullmatch(r"\d{8}", _stripped):
+    # ── Explicit search_type: bypass heuristics entirely ─────────────────────
+    # application_number: caller knows this is an application serial; go to ODP.
+    if search_type == "application_number":
+        return _run_search_from_odp(_stripped)
+
+    # patent_number: caller knows this is a granted patent. Force the EPO
+    # biblio path with an explicit country+kind prefix so we never mis-route to
+    # ODP-as-app-num and return a different patent that happens to share digits.
+    if search_type == "patent_number":
+        norm = _re2.sub(r"[^\w]", "", _stripped).upper()
+        if _re2.fullmatch(r"\d+", norm):
+            patent_input = "US" + norm
+        else:
+            patent_input = _stripped
+        # fall through to EPO path below (skip all auto-routing branches)
+
+    # publication_number: explicit US publication. Prepend US+A1 when bare.
+    elif search_type == "publication_number":
+        norm = _re2.sub(r"[^\w]", "", _stripped).upper()
+        if _re2.fullmatch(r"\d{11}", norm) or _re2.fullmatch(r"\d+", norm):
+            patent_input = "US" + norm + "A1"
+        else:
+            patent_input = _stripped
+        # fall through to EPO path below
+
+    # ── Auto routing (legacy heuristics) ─────────────────────────────────────
+    elif _re2.fullmatch(r"\d{8}", _stripped):
+        # 8-digit bare number: ambiguous (could be app number OR patent number).
+        # Try ODP as an application number first; if ODP returns 404 the digits
+        # are a patent number (not an app number) — fall through to the EPO path
+        # below treating the input as "US{num}" (a granted patent).
         try:
             return _run_search_from_odp(_stripped)
         except _req.HTTPError as _odp_exc:
@@ -249,14 +347,12 @@ def _run_search(patent_input: str) -> dict:
             patent_input = "US" + _stripped   # re-route to EPO as a US patent number
         # fall through to EPO path below
 
-    # ── 11-digit bare US publication serial (e.g. 20260059078) ───────────────
-    # Publication numbers have an 11-digit year-prefixed format without country code.
-    # Prepend "US" and "A1" so EPO biblio can find it, then resolve app → ODP.
     elif _re2.fullmatch(r"\d{11}", _stripped) and _stripped.startswith("2"):
+        # 11-digit bare US publication serial (e.g. 20260059078)
         patent_input = "US" + _stripped + "A1"
 
-    # ── Slash-format US application number (e.g. 18/383,898) → ODP directly ──
     elif _is_us_app_num(patent_input):
+        # Slash-format US application number (e.g. 18/383,898) → ODP directly
         return _run_search_from_odp(patent_input)
 
     # ── Credentials ───────────────────────────────────────────────────────────
@@ -627,11 +723,12 @@ def search_local():
 
     body         = request.get_json(silent=True) or {}
     patent_input = (body.get("patent_number") or "").strip()
+    search_type  = (body.get("search_type") or "auto").strip().lower()
     if not patent_input:
         return jsonify({"error": "patent_number is required"}), 400
 
     try:
-        result = _run_search(patent_input)
+        result = _run_search(patent_input, search_type=search_type)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 404
     except Exception as exc:
@@ -646,17 +743,21 @@ def search_local():
 def search():
     """
     Run a full patent search.
-    Body: { "patent_number": "US 12,178,560" }
+    Body: {
+        "patent_number": "US 12,178,560",
+        "search_type":   "auto" | "patent_number" | "application_number" | "publication_number"
+    }
     Returns all patent data including dashboard_html.
     Also saves a compact record to the user's search history in Firestore.
     """
     body         = request.get_json(silent=True) or {}
     patent_input = (body.get("patent_number") or "").strip()
+    search_type  = (body.get("search_type") or "auto").strip().lower()
     if not patent_input:
         return jsonify({"error": "patent_number is required"}), 400
 
     try:
-        result = _run_search(patent_input)
+        result = _run_search(patent_input, search_type=search_type)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 404
     except Exception as exc:
@@ -676,6 +777,7 @@ def search():
     history = {k: v for k, v in result.items() if k != "dashboard_html"}
     history["searched_at"] = datetime.now(timezone.utc)
     history["query"]       = patent_input
+    history["search_type"] = search_type
     try:
         db.collection("users").document(request.uid) \
           .collection("searches").add(history)
@@ -1222,6 +1324,475 @@ def list_searches():
         return jsonify({"searches": results})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
+
+
+# ── Patentee groups (combined multi-family dashboards) ───────────────────────
+
+def _render_combined_dashboard(group_name: str, members: list[dict]) -> str:
+    """
+    Stitch together the saved dashboard_html from several portfolio entries
+    into one combined view with a sticky table of contents.
+
+    members is a list of dicts from the user's portfolios collection, each
+    expected to have: id, patent_number, title, dashboard_html.
+    """
+    import html as _html
+
+    # Sticky TOC + section separators. Each family's dashboard HTML is wrapped
+    # in an isolated <article> with a unique anchor so the TOC can jump there.
+    # We intentionally leave the inner dashboard HTML untouched — it's already
+    # a self-contained fragment that renders correctly inline.
+    toc_items = []
+    sections  = []
+    for m in members:
+        pid   = m.get("id", "")
+        pnum  = m.get("patent_number", "") or "—"
+        title = (m.get("title", "") or "").strip()
+        dash  = m.get("dashboard_html", "") or "<p style=\"color:#888\">No cached dashboard.</p>"
+        anchor = f"fam-{_html.escape(pid)}"
+        toc_items.append(
+            f'<a href="#{anchor}" style="display:inline-block;padding:6px 12px;'
+            f'border-radius:16px;background:#e8f0fe;color:#1a73e8;text-decoration:none;'
+            f'font-size:13px;font-weight:600;margin:4px;">'
+            f'{_html.escape(pnum)}</a>'
+        )
+        sections.append(
+            f'<section id="{anchor}" style="margin-top:24px;border-top:3px solid #1a73e8;'
+            f'padding-top:14px;">'
+            f'<header style="padding:10px 14px;background:#f8f9fa;border-radius:8px;'
+            f'margin-bottom:10px;">'
+            f'<h2 style="margin:0;color:#1a1a2e;font-size:18px;">'
+            f'{_html.escape(pnum)}'
+            f'{(" — " + _html.escape(title)) if title else ""}'
+            f'</h2></header>'
+            f'{dash}'
+            f'</section>'
+        )
+
+    return (
+        '<!doctype html><html><head><meta charset="utf-8">'
+        '<style>'
+        'body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;'
+        'margin:0;background:#fff;color:#1a1a2e;}'
+        '.combined-header{position:sticky;top:0;z-index:50;background:#fff;'
+        'border-bottom:1px solid #e0e0e0;padding:14px 20px;}'
+        '.combined-title{margin:0 0 10px;color:#1a1a2e;font-size:20px;}'
+        '.combined-body{padding:0 20px 40px;}'
+        '</style></head><body>'
+        '<div class="combined-header">'
+        f'<h1 class="combined-title">{_html.escape(group_name or "Combined dashboard")}'
+        f' <span style="font-weight:400;color:#888;font-size:14px;">'
+        f'({len(members)} families)</span></h1>'
+        '<div>' + "".join(toc_items) + '</div>'
+        '</div>'
+        '<div class="combined-body">'
+        + "".join(sections) +
+        '</div>'
+        '</body></html>'
+    )
+
+
+def _load_portfolios_by_ids(uid: str, ids: list[str]) -> list[dict]:
+    """Batch-fetch portfolio entries for the combined dashboard renderer."""
+    out: list[dict] = []
+    coll = db.collection("users").document(uid).collection("portfolios")
+    for pid in ids:
+        if not pid:
+            continue
+        snap = coll.document(pid).get()
+        if not snap.exists:
+            continue
+        entry = snap.to_dict() or {}
+        entry["id"] = snap.id
+        out.append(entry)
+    return out
+
+
+@app.route("/api/patentee-groups", methods=["GET"])
+@require_auth
+def list_patentee_groups():
+    """List all saved patentee groups for the current user."""
+    try:
+        docs = (
+            db.collection("users").document(request.uid)
+            .collection("patentee_groups")
+            .order_by("updated_at", direction=firestore.Query.DESCENDING)
+            .stream()
+        )
+        groups = []
+        for d in docs:
+            g = d.to_dict() or {}
+            g["id"] = d.id
+            groups.append(g)
+        return jsonify({"groups": groups})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/patentee-groups", methods=["POST"])
+@require_auth
+def create_patentee_group():
+    """
+    Create a new patentee group.
+    Body: { "name": "Acme Corp — All Families", "portfolio_ids": ["abc","def"] }
+    """
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    pids = body.get("portfolio_ids") or []
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    if not isinstance(pids, list):
+        return jsonify({"error": "portfolio_ids must be an array"}), 400
+    pids = [str(p) for p in pids if p]
+    now  = datetime.now(timezone.utc)
+    try:
+        ref = (
+            db.collection("users").document(request.uid)
+            .collection("patentee_groups").document()
+        )
+        ref.set({
+            "name":          name,
+            "portfolio_ids": pids,
+            "created_at":    now,
+            "updated_at":    now,
+        })
+        return jsonify({"id": ref.id, "name": name, "portfolio_ids": pids}), 201
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/patentee-groups/<group_id>", methods=["GET"])
+@require_auth
+def get_patentee_group(group_id):
+    """Return one group's metadata."""
+    try:
+        ref = (
+            db.collection("users").document(request.uid)
+            .collection("patentee_groups").document(group_id)
+        )
+        snap = ref.get()
+        if not snap.exists:
+            return jsonify({"error": "Not found"}), 404
+        g = snap.to_dict() or {}
+        g["id"] = snap.id
+        return jsonify(g)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/patentee-groups/<group_id>", methods=["PATCH"])
+@require_auth
+def update_patentee_group(group_id):
+    """
+    Update a patentee group (partial).
+    Body may include: { "name": "...", "portfolio_ids": [...] }
+    """
+    body  = request.get_json(silent=True) or {}
+    patch = {}
+    if "name" in body:
+        nm = (body.get("name") or "").strip()
+        if not nm:
+            return jsonify({"error": "name cannot be empty"}), 400
+        patch["name"] = nm
+    if "portfolio_ids" in body:
+        pids = body.get("portfolio_ids") or []
+        if not isinstance(pids, list):
+            return jsonify({"error": "portfolio_ids must be an array"}), 400
+        patch["portfolio_ids"] = [str(p) for p in pids if p]
+    if not patch:
+        return jsonify({"error": "nothing to update"}), 400
+    patch["updated_at"] = datetime.now(timezone.utc)
+    try:
+        ref = (
+            db.collection("users").document(request.uid)
+            .collection("patentee_groups").document(group_id)
+        )
+        if not ref.get().exists:
+            return jsonify({"error": "Not found"}), 404
+        ref.update(patch)
+        return jsonify({"id": group_id, **patch})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/patentee-groups/<group_id>", methods=["DELETE"])
+@require_auth
+def delete_patentee_group(group_id):
+    """Delete a patentee group (does not delete the underlying portfolio entries)."""
+    try:
+        ref = (
+            db.collection("users").document(request.uid)
+            .collection("patentee_groups").document(group_id)
+        )
+        if not ref.get().exists:
+            return jsonify({"error": "Not found"}), 404
+        ref.delete()
+        return jsonify({"deleted": group_id})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/patentee-groups/<group_id>/dashboard", methods=["GET"])
+@require_auth
+def get_patentee_group_dashboard(group_id):
+    """Return the merged dashboard HTML for a saved group."""
+    try:
+        ref = (
+            db.collection("users").document(request.uid)
+            .collection("patentee_groups").document(group_id)
+        )
+        snap = ref.get()
+        if not snap.exists:
+            return jsonify({"error": "Not found"}), 404
+        g = snap.to_dict() or {}
+        ids = g.get("portfolio_ids") or []
+        members = _load_portfolios_by_ids(request.uid, ids)
+        html = _render_combined_dashboard(g.get("name", "Combined"), members)
+        return jsonify({
+            "id":             group_id,
+            "name":           g.get("name", ""),
+            "portfolio_ids":  ids,
+            "member_count":   len(members),
+            "dashboard_html": html,
+        })
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/patentee-groups/preview", methods=["POST"])
+@require_auth
+def preview_patentee_group():
+    """
+    Ad-hoc combined dashboard: render without persisting.
+    Body: { "portfolio_ids": [...], "name": "Preview" }
+    """
+    body = request.get_json(silent=True) or {}
+    pids = body.get("portfolio_ids") or []
+    name = (body.get("name") or "Combined preview").strip()
+    if not isinstance(pids, list) or not pids:
+        return jsonify({"error": "portfolio_ids is required"}), 400
+    try:
+        members = _load_portfolios_by_ids(request.uid, [str(p) for p in pids if p])
+        html    = _render_combined_dashboard(name, members)
+        return jsonify({
+            "name":           name,
+            "portfolio_ids":  [m["id"] for m in members],
+            "member_count":   len(members),
+            "dashboard_html": html,
+        })
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+# ── AI prosecution assistant ─────────────────────────────────────────────────
+
+def _find_family_member(portfolio_id: str, pub_num: str) -> tuple[object, dict | None]:
+    """Return (portfolio_ref, member_dict) or (portfolio_ref, None) if not found."""
+    port_ref = (
+        db.collection("users").document(request.uid)
+          .collection("portfolios").document(portfolio_id)
+    )
+    snap = port_ref.get()
+    if not snap.exists:
+        return port_ref, None
+    data = snap.to_dict() or {}
+    family = data.get("family", []) or []
+    member = next((m for m in family if m.get("pub_num") == pub_num), None)
+    return port_ref, member
+
+
+def _download_oa_text(member: dict) -> tuple[str, dict | None]:
+    """
+    Download the most recent office-action PDF for this family member via the
+    USPTO ODP and extract the text. Returns (text, doc_meta). Empty text
+    string if no OA is available or extraction fails.
+    """
+    import io as _io
+    import requests as _rq
+
+    OA_CODES = {"CTNF", "CTFR", "MCTNF", "MCTFR"}
+    oa_docs  = member.get("oa_documents") or []
+    oa_doc   = next(
+        (d for d in sorted(oa_docs, key=lambda x: x.get("date", ""), reverse=True)
+         if (d.get("code") or "").upper() in OA_CODES and d.get("download_url")),
+        None,
+    )
+    if not oa_doc:
+        return "", None
+
+    try:
+        resp = _rq.get(
+            oa_doc["download_url"],
+            headers={"X-API-Key": os.environ.get("USPTO_ODP_API_KEY", "")},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        pdf_bytes = resp.content
+    except Exception as exc:
+        print(f"  OA PDF download failed: {exc}")
+        return "", oa_doc
+
+    # Extract text with pypdf (lightweight, pure-python)
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(_io.BytesIO(pdf_bytes))
+        text   = "\n".join((page.extract_text() or "") for page in reader.pages)
+        return text.strip(), oa_doc
+    except Exception as exc:
+        print(f"  OA PDF text extraction failed: {exc}")
+        return "", oa_doc
+
+
+@app.route("/api/ai/analyze", methods=["POST"])
+@require_auth
+def ai_analyze():
+    """
+    Run AI prosecution analysis on one family member.
+    Body: { "portfolio_id": "...", "pub_num": "..." }
+    Cached at users/{uid}/portfolios/{pid}/ai_analysis/{pub_num}.
+    """
+    body = request.get_json(silent=True) or {}
+    portfolio_id = (body.get("portfolio_id") or "").strip()
+    pub_num      = (body.get("pub_num") or "").strip()
+    if not portfolio_id or not pub_num:
+        return jsonify({"error": "portfolio_id and pub_num are required"}), 400
+
+    try:
+        from ai_engine import PatentAI
+    except ImportError as exc:
+        return jsonify({"error": f"AI engine unavailable: {exc}"}), 500
+
+    port_ref, member = _find_family_member(portfolio_id, pub_num)
+    if member is None:
+        return jsonify({"error": "portfolio or family member not found"}), 404
+
+    try:
+        ai     = PatentAI()
+        result = ai.analyze_prosecution(member)
+        doc_id = pub_num.replace("/", "_")
+        port_ref.collection("ai_analysis").document(doc_id).set({
+            **result,
+            "analyzed_at": datetime.now(timezone.utc),
+            "pub_num":     pub_num,
+            "kind":        "prosecution",
+        })
+        return jsonify(result)
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"error": f"AI analysis failed: {exc}"}), 500
+
+
+@app.route("/api/ai/analyze-oa", methods=["POST"])
+@require_auth
+def ai_analyze_oa():
+    """
+    Download the most recent office action, extract text, run Claude's OA schema.
+    Body: { "portfolio_id": "...", "pub_num": "..." }
+    """
+    body = request.get_json(silent=True) or {}
+    portfolio_id = (body.get("portfolio_id") or "").strip()
+    pub_num      = (body.get("pub_num") or "").strip()
+    if not portfolio_id or not pub_num:
+        return jsonify({"error": "portfolio_id and pub_num are required"}), 400
+
+    try:
+        from ai_engine import PatentAI
+    except ImportError as exc:
+        return jsonify({"error": f"AI engine unavailable: {exc}"}), 500
+
+    port_ref, member = _find_family_member(portfolio_id, pub_num)
+    if member is None:
+        return jsonify({"error": "portfolio or family member not found"}), 404
+
+    oa_text, oa_doc = _download_oa_text(member)
+    if not oa_text:
+        return jsonify({"error": "No office action PDF available for analysis"}), 404
+
+    try:
+        ai     = PatentAI()
+        result = ai.analyze_office_action(member, oa_text, oa_doc)
+        doc_id = pub_num.replace("/", "_")
+        port_ref.collection("ai_analysis").document(f"{doc_id}__oa").set({
+            **result,
+            "analyzed_at": datetime.now(timezone.utc),
+            "pub_num":     pub_num,
+            "kind":        "office_action",
+            "oa_code":     (oa_doc or {}).get("code", ""),
+            "oa_date":     (oa_doc or {}).get("date", ""),
+        })
+        return jsonify(result)
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"error": f"OA analysis failed: {exc}"}), 500
+
+
+@app.route("/api/ai/analyze/<portfolio_id>/<path:pub_num>", methods=["GET"])
+@require_auth
+def ai_get_cached_analysis(portfolio_id, pub_num):
+    """Return the cached AI analysis (prosecution kind) for this family member."""
+    try:
+        doc_id = pub_num.replace("/", "_")
+        snap = (
+            db.collection("users").document(request.uid)
+              .collection("portfolios").document(portfolio_id)
+              .collection("ai_analysis").document(doc_id).get()
+        )
+        if not snap.exists:
+            return jsonify({"error": "no cached analysis"}), 404
+        return jsonify(snap.to_dict())
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/ai/portfolio-summary", methods=["POST"])
+@require_auth
+def ai_portfolio_summary():
+    """AI portfolio-wide summary: urgent items, patterns, recommendations."""
+    try:
+        from ai_engine import PatentAI
+    except ImportError as exc:
+        return jsonify({"error": f"AI engine unavailable: {exc}"}), 500
+    try:
+        docs = (
+            db.collection("users").document(request.uid)
+              .collection("portfolios").stream()
+        )
+        entries = []
+        for d in docs:
+            entry = d.to_dict() or {}
+            entry["id"] = d.id
+            entries.append(entry)
+        if not entries:
+            return jsonify({
+                "executive_summary": "Portfolio is empty.",
+                "urgent_items": [],
+                "portfolio_health": {"total_active": 0, "needs_attention": 0, "on_track": 0},
+                "patterns": [],
+                "recommendations": [],
+            })
+        ai     = PatentAI()
+        result = ai.analyze_portfolio(entries)
+        return jsonify(result)
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"error": f"Portfolio summary failed: {exc}"}), 500
+
+
+# ── PDF passthrough (used by per-tile PDF button) ─────────────────────────────
+
+@app.route("/api/pdf/<patent_num>", methods=["GET"])
+def pdf_proxy(patent_num):
+    """
+    Redirect to a best-effort PDF source for a granted US patent number.
+    Google Patents reliably hosts the full patent document.
+    """
+    import re as _re
+    from flask import redirect
+
+    clean = _re.sub(r"[^A-Z0-9]", "", (patent_num or "").upper())
+    if not clean:
+        return jsonify({"error": "invalid patent number"}), 400
+    return redirect(f"https://patents.google.com/patent/{clean}/en")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
