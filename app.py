@@ -1778,21 +1778,146 @@ def ai_portfolio_summary():
         return jsonify({"error": f"Portfolio summary failed: {exc}"}), 500
 
 
-# ── PDF passthrough (used by per-tile PDF button) ─────────────────────────────
+# ── PDF streamer (per-tile PDF button) ────────────────────────────────────────
 
-@app.route("/api/pdf/<patent_num>", methods=["GET"])
-def pdf_proxy(patent_num):
+def _epo_fullimage_pdf(docdb: str) -> bytes | None:
     """
-    Redirect to a best-effort PDF source for a granted US patent number.
-    Google Patents reliably hosts the full patent document.
+    Stream the full patent or published-application image from EPO OPS.
+    Two-step: (1) GET /images to get an image-link for the PUBLICATION image,
+              (2) GET that image-link as PDF.
+    Returns PDF bytes, or None on failure.
+    """
+    import requests as _rq
+
+    epo_key    = os.environ.get("EPO_CONSUMER_KEY",    "").strip()
+    epo_secret = os.environ.get("EPO_CONSUMER_SECRET", "").strip()
+    if not epo_key or not epo_secret:
+        return None
+    token = tracker.epo_get_token(epo_key, epo_secret)
+    if not token:
+        return None
+
+    # 1) Discover the publication-image endpoint + page count
+    try:
+        info = _rq.get(
+            f"https://ops.epo.org/3.2/rest-services/published-data/publication/docdb/{docdb}/images",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/xml"},
+            timeout=15,
+        )
+        if info.status_code != 200:
+            print(f"  EPO images lookup HTTP {info.status_code}")
+            return None
+        import re as _re
+        xml = info.text
+        # Find the first document-instance whose desc is FullDocument/PublicationImage
+        # and capture its link + number-of-pages.
+        best = None
+        for m in _re.finditer(
+            r'<ops:document-instance[^>]*desc="([^"]+)"[^>]*link="([^"]+)"[^>]*number-of-pages="(\d+)"',
+            xml, _re.IGNORECASE,
+        ):
+            desc, link, pages = m.group(1), m.group(2), int(m.group(3))
+            if desc.lower() in ("fulldocument", "publicationimage"):
+                best = (desc, link, pages)
+                break
+            if best is None:
+                best = (desc, link, pages)
+        if not best:
+            # Fallback: any link in the response
+            link_m = _re.search(r'<ops:document-instance[^>]*link="([^"]+)"[^>]*number-of-pages="(\d+)"', xml)
+            if link_m:
+                best = ("Any", link_m.group(1), int(link_m.group(2)))
+        if not best:
+            return None
+        _, link, pages = best
+    except Exception as exc:
+        print(f"  EPO images lookup error: {exc}")
+        return None
+
+    # 2) Pull the PDF for "Range=1-N" which returns the consolidated PDF
+    try:
+        # Link is relative like "published-data/images/US/.../PA/fullimage"
+        pdf_url = f"https://ops.epo.org/3.2/rest-services/{link}.pdf?Range=1-{pages}"
+        resp = _rq.get(
+            pdf_url,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/pdf"},
+            timeout=60,
+        )
+        if resp.status_code == 200 and resp.content[:4] == b"%PDF":
+            return resp.content
+        print(f"  EPO fullimage HTTP {resp.status_code} ({len(resp.content)} bytes)")
+    except Exception as exc:
+        print(f"  EPO fullimage error: {exc}")
+    return None
+
+
+def _uspto_pdf(pub_num_clean: str) -> bytes | None:
+    """
+    Fallback PDF source for US documents via USPTO PatentsView imagewrapper CDN.
+    Works for both granted patents and published applications, no auth required.
     """
     import re as _re
-    from flask import redirect
+    import requests as _rq
 
-    clean = _re.sub(r"[^A-Z0-9]", "", (patent_num or "").upper())
+    # Strip leading "US" and kind code to get the core digit string.
+    core = _re.sub(r"^US", "", pub_num_clean)
+    core = _re.sub(r"[A-Z]\d?$", "", core)
+    if not core:
+        return None
+
+    # USPTO image-server direct PDF download (public, no auth). Pattern works for
+    # both granted patents (9-10 digit patent #) and pre-grant publications (11-digit
+    # year-prefixed number).
+    urls = [
+        f"https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/{core}",
+        f"https://patentimages.storage.googleapis.com/pdfs/{core}.pdf",  # secondary cache
+    ]
+    for u in urls:
+        try:
+            resp = _rq.get(u, timeout=45, allow_redirects=True,
+                           headers={"User-Agent": "PatentQ/1.0"})
+            if resp.status_code == 200 and resp.content[:4] == b"%PDF":
+                return resp.content
+        except Exception:
+            continue
+    return None
+
+
+@app.route("/api/pdf/<pub_num>", methods=["GET"])
+def pdf_proxy(pub_num):
+    """
+    Stream the granted-patent PDF (for granted) or the published-application PDF
+    (for pending) as inline application/pdf.  Input: CC+NUM+KIND style pub number
+    like 'US12178560B2' or 'US20260059078A1'.
+
+    Primary source: EPO OPS full-image PDF (needs our consumer key/secret).
+    Fallback: USPTO image-server direct download for US documents.
+    """
+    import re as _re
+    from flask import Response
+
+    clean = _re.sub(r"[^A-Z0-9]", "", (pub_num or "").upper())
     if not clean:
-        return jsonify({"error": "invalid patent number"}), 400
-    return redirect(f"https://patents.google.com/patent/{clean}/en")
+        return jsonify({"error": "invalid publication number"}), 400
+
+    docdb = tracker.patent_to_docdb(clean)
+    pdf   = _epo_fullimage_pdf(docdb) if docdb else None
+    if not pdf and clean.startswith("US"):
+        pdf = _uspto_pdf(clean)
+
+    if not pdf:
+        return jsonify({
+            "error": (
+                f"No PDF available for {clean}. EPO OPS and USPTO both failed to "
+                f"return a PDF. The document may not have a published image yet."
+            )
+        }), 404
+
+    return Response(
+        pdf,
+        mimetype="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{clean}.pdf"'},
+    )
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

@@ -2690,29 +2690,42 @@ def _render_card(m: dict) -> str:
         f'&#128206; Files</button>'
     )
 
-    # Analyze OA button — sends postMessage to parent for Claude-powered office action analysis
-    tile_ai_html = (
-        f'<button class="tile-ai-btn" '
-        f"onclick=\"window.parent.postMessage({{type:'open-tile-ai',pubNum:'{_pub_esc}'}},'*')\">"
-        f'Analyze OA</button>'
-    )
+    # Analyze OA button — only for pending applications with an outstanding office
+    # action awaiting response. Granted patents and pending apps with no open OA
+    # (e.g. most recent event is a response we've already filed, or just a notice
+    # of allowance / issue-fee stage) do not get this button.
+    _has_outstanding_oa = False
+    if m.get("status") == "pending":
+        _dl_label, _ = _pending_app_deadline(m)
+        if _dl_label and _dl_label.lower().startswith("response to"):
+            _has_outstanding_oa = True
+    tile_ai_html = ""
+    if _has_outstanding_oa:
+        tile_ai_html = (
+            f'<button class="tile-ai-btn" '
+            f"onclick=\"window.parent.postMessage({{type:'open-tile-ai',pubNum:'{_pub_esc}'}},'*')\">"
+            f'Analyze OA</button>'
+        )
 
-    # PDF download button — resolves PDF via backend proxy (avoids Google Patents blocking)
+    # PDF download button — resolves via backend proxy. For granted patents the
+    # backend streams the granted-patent PDF; for pending apps it streams the
+    # published application PDF. Backend uses pub_num's kind code to choose.
     _clean_pnum = re.sub(r"[^A-Z0-9]", "", pub_num_key.upper())
     _proxy_base = os.environ.get("PATENT_DOC_PROXY_BASE", "")
     _pdf_api = f"{_proxy_base}/api/pdf/{_clean_pnum}" if _proxy_base else f"/api/pdf/{_clean_pnum}"
+    _pdf_label = "Patent PDF" if m.get("status") == "granted" else "Publication PDF"
     tile_pdf_html = (
         f'<button class="tile-pdf-btn" '
         f"onclick=\"window.open('{_pdf_api}','_blank')\">"
-        f'PDF</button>'
+        f'{_pdf_label}</button>'
     )
 
-    # Action bar with Analyze OA + PDF buttons — placed above "Latest event"
+    # Action bar — AI button only when relevant, PDF always shown
     action_bar_html = (
         f'<div class="tile-action-bar">'
         f'{tile_ai_html}{tile_pdf_html}'
         f'</div>'
-    )
+    ) if (tile_ai_html or tile_pdf_html) else ""
 
     return (
         f'<div class="card" style="border-top:4px solid {border}">'
