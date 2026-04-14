@@ -718,15 +718,24 @@ _REJECTION_GROUNDS: dict[str, dict] = {
     },
 }
 
-# Foreign office systems for linking
+# Foreign office systems for linking. All URLs are chosen to default to English:
+# query params / language parameters where supported, or English portal pages
+# where the office offers a native-vs-English toggle.
 _FOREIGN_SYSTEMS: dict[str, tuple[str, str]] = {
-    "EP": ("EPO Register",  "https://register.epo.org/application?number="),
-    "JP": ("J-PlatPat",     "https://www.j-platpat.inpit.go.jp/"),
-    "CN": ("CNIPA CPQUERY", "https://cpquery.cponline.cnipa.gov.cn/"),
-    "KR": ("KIPRIS",        "https://www.kipris.or.kr/"),
+    "EP": ("EPO Register",  "https://register.epo.org/application?lng=en&number="),
+    "JP": ("J-PlatPat",     "https://www.j-platpat.inpit.go.jp/p0000"),  # English portal
+    "CN": ("CNIPA CPQUERY", "https://english.cnipa.gov.cn/col/col3076/index.html"),
+    "KR": ("KIPRIS",        "http://engpat.kipris.or.kr/engpat/searchLogina.do?next=MainSearch"),
     "AU": ("AusPat",        "https://www.ipaustralia.gov.au/tools-resources/search-patent"),
     "CA": ("CIPO",          "https://ised-isde.canada.ca/site/canadian-intellectual-property-office/en/patents"),
     "GB": ("IPO",           "https://www.ipo.gov.uk/p-ipsum.htm"),
+    "DE": ("DPMA Register", "https://register.dpma.de/DPMAregister/pat/einsteiger?lang=en"),
+    "TW": ("TIPO",          "https://twpat7.tipo.gov.tw/twpatc/twpatkm?!!FRURL"),
+    "IL": ("ILPO",          "https://ilpatsearch.justice.gov.il/"),
+    "BR": ("INPI",          "https://busca.inpi.gov.br/pePI/?lang=en"),
+    "IN": ("InPASS",        "https://ipindia.gov.in/patents.htm"),
+    "RU": ("Rospatent",     "https://new.fips.ru/en/iiss/"),
+    "MX": ("IMPI MARCANET", "https://vidoc.impi.gob.mx/?lang=en"),
 }
 
 
@@ -825,6 +834,58 @@ def extract_rejection_summary(m: dict) -> Optional[dict]:
 
 
 # ── USPTO Open Data Portal (ODP) helpers ─────────────────────────────────────
+
+def _format_us_patent_num(pub_num: str) -> str:
+    """
+    Pretty-print a US granted patent publication number as 'US 12,178,560 B2'.
+    Accepts 'US12178560B2', 'US12178560', '12178560B2', '12,178,560'.
+    Returns the input unchanged if it doesn't match a US granted pattern.
+    """
+    s = (pub_num or "").strip()
+    if not s:
+        return ""
+    clean = re.sub(r"[^A-Z0-9]", "", s.upper())
+    # Match optional US, required digits (7-10), optional kind code A/B/C[digit]
+    m = re.match(r"^(US)?(\d{6,10})([A-Z]\d?)?$", clean)
+    if not m:
+        return pub_num
+    cc, num, kind = m.group(1) or "", m.group(2), m.group(3) or ""
+    # Insert thousands separators right-to-left
+    rev = num[::-1]
+    grouped = ",".join(rev[i:i+3] for i in range(0, len(rev), 3))[::-1]
+    parts = []
+    if cc:
+        parts.append(cc)
+    parts.append(grouped)
+    if kind:
+        parts.append(kind)
+    return " ".join(parts)
+
+
+def calc_expiration_date(filing_date: str, country: str,
+                         is_design: bool = False) -> str:
+    """
+    Estimate the patent expiration date. For utility patents this is 20 years
+    from the earliest non-provisional filing date in most jurisdictions; for
+    US design patents it's 15 years from grant. This is an estimate that
+    does not account for patent term adjustment (PTA), patent term extension
+    (PTE), or terminal disclaimers.  Returns ISO 'YYYY-MM-DD' or ''.
+    """
+    if not filing_date:
+        return ""
+    try:
+        from datetime import date as _dt
+        fd = _dt.fromisoformat(filing_date[:10])
+        years = 15 if (is_design and country == "US") else 20
+        # Feb 29 edge case: clamp to Feb 28
+        try:
+            exp = fd.replace(year=fd.year + years)
+        except ValueError:
+            exp = fd.replace(year=fd.year + years, day=28)
+        return exp.isoformat()
+    except Exception:
+        return ""
+
 
 def _format_us_app_num(raw: str) -> str:
     """
@@ -1224,7 +1285,7 @@ def _render_oa_documents(oa_docs: list, app_num: str = "") -> str:
         )
 
     return (
-        f'<details class="history oa-details" open>'
+        f'<details class="history oa-details">'
         f'<summary class="oa-summary">'
         f'Prosecution History'
         f'<span class="ev-count">{len(oa_docs)}</span>'
@@ -2505,6 +2566,11 @@ def _render_card(m: dict) -> str:
     app_num = m.get("app_num", "").strip()
     # Granted patents → show patent publication number; pending/other → show application number
     display = m["pub_num"] if status == "granted" else (app_num if app_num else m["pub_num"])
+    # Pretty-print US granted patents as 'US 12,178,560 B2'
+    if code == "US" and status == "granted":
+        _p = _format_us_patent_num(display)
+        if _p:
+            display = _p
     # Pretty-print US application numbers as 'XX/XXX,XXX' even when EPO gave us
     # the 14-char 'US202017134990' form, a 12-digit 'US2020/17134990' form, or
     # the bare 8-digit serial. Only applies when we're actually displaying an
@@ -2538,6 +2604,12 @@ def _render_card(m: dict) -> str:
     if grant:
         second_label = "Granted" if status == "granted" else "Published"
         date_items += f'<span>{second_label}: <b>{grant}</b></span>'
+
+    # Expiration date (estimated) — shown inline next to Granted for issued patents
+    if status == "granted" and (filing and filing != "—"):
+        _exp_iso = calc_expiration_date(filing, code)
+        if _exp_iso:
+            date_items += f'<span>Expires: <b>{_exp_iso}</b></span>'
 
     # Next deadline banner — visible for all tile types (OA response, maintenance, annuity)
     next_deadline_html = ""
@@ -2641,7 +2713,7 @@ def _render_card(m: dict) -> str:
                 )
             annuity_html = (
                 f'<div class="ann-expiry">Expires (est.): <b>{ann["expiry"]}</b></div>'
-                f'<details class="history">'
+                f'<details class="history" data-fee-type="annuity">'
                 f'<summary>Annual renewal fees '
                 f'<span class="ev-count">{cur} &nbsp;·&nbsp; ~${ann["total_usd"]:,} remaining</span>'
                 f'</summary>'
@@ -2891,26 +2963,132 @@ def generate_dashboard_html(
     other   = len(family_details) - granted - pending
 
     # Status-grouped sections: Issued → Pending (oldest filing first) → Abandoned
+    from datetime import date as _today_dt
+    _today = _today_dt.today()
+
+    def _months_since(iso_date: str) -> int:
+        try:
+            d = _today_dt.fromisoformat((iso_date or "")[:10])
+            return (_today.year - d.year) * 12 + (_today.month - d.month)
+        except Exception:
+            return -1
+
+    def _is_us_provisional(m: dict) -> bool:
+        """Provisional US apps have 60/61/62/63 prefix serial numbers."""
+        app = _clean_app_num(m.get("app_num", "") or "")
+        return bool(re.match(r"^(60|61|62|63)", app))
+
+    def _is_expired_granted(m: dict) -> bool:
+        """Granted patent whose estimated expiration is in the past."""
+        if m.get("status") != "granted":
+            return False
+        _fd = m.get("filing_date") or m.get("date") or ""
+        _exp = calc_expiration_date(_fd, country_code(m["pub_num"]))
+        return bool(_exp) and _exp < _today.isoformat()
+
+    def _is_stale_provisional(m: dict) -> bool:
+        """US provisional whose 12-month anniversary has passed — converts to lapsed."""
+        return (
+            country_code(m["pub_num"]) == "US"
+            and _is_us_provisional(m)
+            and _months_since(m.get("filing_date") or m.get("date") or "") >= 12
+        )
+
+    def _is_nat_phase_pct(m: dict) -> bool:
+        """PCT application past the 30-month national-stage deadline."""
+        return (
+            country_code(m["pub_num"]) == "WO"
+            and m.get("status") in ("pending", "unknown")
+            and _months_since(m.get("filing_date") or m.get("date") or "") >= 30
+        )
+
+    def _lapsed(m: dict) -> bool:
+        return (
+            m.get("status") in ("abandoned", "expired", "rejected", "lapsed")
+            or _is_expired_granted(m)
+            or _is_stale_provisional(m)
+            or _is_nat_phase_pct(m)
+        )
+
     granted_members   = sorted(
-        [m for m in family_details if m.get("status") == "granted"],
+        [m for m in family_details if m.get("status") == "granted" and not _is_expired_granted(m)],
         key=lambda m: m.get("grant_date") or m.get("filing_date") or m.get("date") or "",
     )
     pending_members   = sorted(
-        [m for m in family_details if m.get("status") in ("pending", "unknown")],
+        [m for m in family_details
+         if m.get("status") in ("pending", "unknown")
+         and not _is_stale_provisional(m)
+         and not _is_nat_phase_pct(m)],
         key=lambda m: (
             0 if country_code(m["pub_num"]) == "US" else 1,   # US apps first
             m.get("filing_date") or m.get("date") or "",       # then oldest filing
         ),
     )
     abandoned_members = sorted(
-        [m for m in family_details if m.get("status") in ("abandoned", "expired", "rejected")],
+        [m for m in family_details if _lapsed(m)],
         key=lambda m: m.get("filing_date") or m.get("date") or "",
     )
-    country_html = ""
+    # ── Printable overview (family list + upcoming deadlines) ────────────
+    # These blocks live in the dashboard HTML but are hidden on screen via
+    # CSS (.print-only). PrintBar in the React app toggles individual blocks
+    # on/off at print time based on the user's checkbox selections.
+    _all_for_print = granted_members + pending_members + abandoned_members
+    _family_rows = ""
+    for _m in _all_for_print:
+        _cc = country_code(_m["pub_num"])
+        _flag = COUNTRY_FLAGS.get(_cc, "")
+        _st = _m.get("status", "unknown")
+        _pub = _m["pub_num"]
+        if _cc == "US" and _st == "granted":
+            _pub = _format_us_patent_num(_pub) or _pub
+        _fd = _m.get("filing_date") or _m.get("date") or ""
+        _gd = _m.get("grant_date", "") or ""
+        _family_rows += (
+            f'<tr><td>{_flag} {_cc}</td>'
+            f'<td>{_pub}</td>'
+            f'<td>{_m.get("app_num","") or ""}</td>'
+            f'<td>{_st}</td>'
+            f'<td>{_fd}</td>'
+            f'<td>{_gd}</td></tr>'
+        )
+    _deadline_rows = ""
+    for _m in _all_for_print:
+        _dl = _get_next_deadline(_m)
+        if not _dl:
+            continue
+        _deadline_rows += (
+            f'<tr><td>{country_code(_m["pub_num"])}</td>'
+            f'<td>{_m["pub_num"]}</td>'
+            f'<td>{_dl.get("label","")}</td>'
+            f'<td>{_dl.get("date","")}</td></tr>'
+        )
+    print_overview_html = (
+        f'<div class="print-only print-overview" id="print-overview">'
+        f'<div id="print-family-list">'
+        f'<h3>Patent Family &mdash; {len(_all_for_print)} members</h3>'
+        f'<table><thead><tr>'
+        f'<th>Country</th><th>Publication</th><th>Application</th>'
+        f'<th>Status</th><th>Filed</th><th>Granted</th>'
+        f'</tr></thead><tbody>{_family_rows}</tbody></table>'
+        f'</div>'
+        f'<div id="print-deadlines-list" style="margin-top:1rem">'
+        f'<h3>Upcoming Deadlines</h3>'
+        + (
+            f'<table><thead><tr>'
+            f'<th>Country</th><th>Publication</th><th>Deadline</th><th>Due</th>'
+            f'</tr></thead><tbody>{_deadline_rows}</tbody></table>'
+            if _deadline_rows else
+            '<p style="color:#666">No upcoming deadlines found in family data.</p>'
+        )
+        + '</div>'
+        '</div>'
+    )
+
+    country_html = print_overview_html
     for group_label, members, icon in [
         ("Issued Patents",       granted_members,   "✅"),
         ("Pending Applications", pending_members,   "🔄"),
-        ("Abandoned / Lapsed",   abandoned_members, "❌"),
+        ("Abandoned & Lapsed",   abandoned_members, "❌"),
     ]:
         if not members:
             continue
@@ -3405,14 +3583,23 @@ def generate_dashboard_html(
       footer {{ margin-top: 1.5rem; }}
     }}
 
+    /* Print-only overview blocks — hidden on screen, shown only when printing */
+    .print-only {{ display: none; }}
     @media print {{
       .no-print {{ display: none !important; }}
       .print-hide {{ display: none !important; }}
+      .print-only {{ display: block !important; }}
       body {{ background: #fff; padding: .5rem; }}
       .card {{ break-inside: avoid; }}
       .history {{ display: block; }}
       details {{ display: block; }}
       details > summary {{ display: none; }}
+      .print-overview {{ margin-bottom: 1rem; page-break-after: auto; }}
+      .print-overview table {{ width: 100%; border-collapse: collapse; font-size: 11px; }}
+      .print-overview th, .print-overview td {{
+        border: 1px solid #ccc; padding: 4px 8px; text-align: left;
+      }}
+      .print-overview h3 {{ margin: .5rem 0 .3rem; font-size: 13px; }}
     }}
 
     .claim-block {{ margin-bottom: .9rem; padding-bottom: .9rem; border-bottom: 1px solid #f3f4f6; }}

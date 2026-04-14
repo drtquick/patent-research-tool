@@ -97,6 +97,7 @@ export default function Search() {
               {saved ? "✓ Saved" : saving ? "Saving…" : isMobile ? "+ Portfolio" : "Save to Portfolio"}
             </button>
           </div>
+          <PrintBar iframeRef={iframeRef} />
           <iframe
             ref={iframeRef}
             title="Patent Dashboard"
@@ -104,7 +105,6 @@ export default function Search() {
             srcDoc={result.dashboard_html}
             sandbox="allow-scripts allow-same-origin allow-modals allow-popups"
           />
-          <PrintBar iframeRef={iframeRef} />
         </div>
       )}
     </div>

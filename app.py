@@ -521,31 +521,77 @@ def _run_search(patent_input: str, search_type: str = "auto") -> dict:
 
     # ── Pull in abandoned / unpublished US continuations via ODP continuity ──
     # INPADOC family data from EPO frequently misses abandoned continuations,
-    # CIPs, and divisionals whose US publications never entered INPADOC.  For
-    # every US member we just fetched, look at ODP's parent/child continuity
-    # bags and add any related US app we haven't already seen.  Fetched via
-    # ODP so status (including "abandoned") is authoritative.
+    # CIPs, and divisionals whose US publications never entered INPADOC.
+    #
+    # Two paths run here:
+    #  (1) per-member walk — every US member we just fetched exposes its own
+    #      parent/child continuity bag via result["related_us_apps"]. We add
+    #      any referenced US apps we haven't already seen.
+    #  (2) primary-app pull — if any US member is in the family, we also look
+    #      up the FULL continuity chain seeded from that app's parent/child
+    #      bags and again merge any new apps. Catches the common case where
+    #      the per-member ODP calls all 404'd (recent unpublished apps).
     if odp_key:
         known = {tracker._clean_app_num(m.get("app_num", "")) for m in family_details}
         known.discard("")
         extras_seen: set[str] = set()
         extras: list[dict] = []
+
+        # (1) per-member walk
         for m in list(family_details):
             for rel in m.get("related_us_apps") or []:
                 rel_app = rel.get("app_num", "")
                 if not rel_app or rel_app in known or rel_app in extras_seen:
                     continue
                 extras_seen.add(rel_app)
-                stub = {
-                    "pub_num": rel.get("patent") and f"US{rel['patent']}B2" or f"US{rel_app}",
+                extras.append({
+                    "pub_num": f"US{rel['patent']}B2" if rel.get("patent") else f"US{rel_app}",
                     "app_num": rel_app,
                     "href":    "",
                     "title":   "",
                     "country": "US",
                     "date":    rel.get("filing", ""),
                     "lang":    "",
-                }
-                extras.append(stub)
+                })
+
+        # (2) primary-app continuity fetch — BFS through parent/child links
+        _us_primaries = [m for m in family_details
+                         if tracker.country_code(m.get("pub_num", "")) == "US"
+                         and m.get("app_num")]
+        _seed_apps = [tracker._clean_app_num(m["app_num"]) for m in _us_primaries]
+        _visited: set[str] = set(known)
+        _queue = [a for a in _seed_apps if a]
+        while _queue:
+            _app = _queue.pop(0)
+            if _app in _visited:
+                continue
+            _visited.add(_app)
+            try:
+                stub = {"pub_num": f"US{_app}", "app_num": _app, "country": "US",
+                        "href": "", "title": "", "date": "", "lang": ""}
+                det = tracker.fetch_us_member_via_odp(stub, odp_key)
+                if not det or det.get("fetch_error"):
+                    continue
+                for rel in det.get("related_us_apps", []) or []:
+                    rel_app = rel.get("app_num", "")
+                    if rel_app and rel_app not in _visited and rel_app not in extras_seen:
+                        _queue.append(rel_app)
+                        if rel_app not in known:
+                            extras_seen.add(rel_app)
+                            extras.append({
+                                "pub_num": (f"US{rel['patent']}B2"
+                                            if rel.get("patent") else f"US{rel_app}"),
+                                "app_num": rel_app,
+                                "href":    "",
+                                "title":   "",
+                                "country": "US",
+                                "date":    rel.get("filing", ""),
+                                "lang":    "",
+                            })
+            except Exception as exc:
+                print(f"  continuity BFS skipped {_app}: {exc}")
+
+        print(f"  continuity merge: adding {len(extras)} US app(s) discovered via ODP")
         for j, stub in enumerate(extras):
             try:
                 det = tracker.fetch_member_details(

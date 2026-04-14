@@ -726,6 +726,7 @@ export default function Portfolio() {
             ⚠️ Refresh failed: {refreshError} — your cached dashboard is still shown below.
           </div>
         )}
+        <PrintBar iframeRef={iframeRef} />
         <div style={styles.iframeWrap}>
           <iframe
             ref={iframeRef}
@@ -735,7 +736,6 @@ export default function Portfolio() {
             sandbox="allow-scripts allow-same-origin allow-modals allow-popups"
             onLoad={handleIframeLoad}
           />
-          <PrintBar iframeRef={iframeRef} />
         </div>
       </div>
     );
