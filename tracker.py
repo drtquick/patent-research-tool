@@ -2714,10 +2714,11 @@ def _render_card(m: dict) -> str:
     _proxy_base = os.environ.get("PATENT_DOC_PROXY_BASE", "")
     _pdf_api = f"{_proxy_base}/api/pdf/{_clean_pnum}" if _proxy_base else f"/api/pdf/{_clean_pnum}"
     _pdf_label = "Patent PDF" if m.get("status") == "granted" else "Publication PDF"
+    # Rendered as a download link (not a window.open call) so Chrome saves the
+    # PDF to the user's Downloads folder instead of opening a viewer tab.
     tile_pdf_html = (
-        f'<button class="tile-pdf-btn" '
-        f"onclick=\"window.open('{_pdf_api}','_blank')\">"
-        f'{_pdf_label}</button>'
+        f'<a class="tile-pdf-btn" href="{_pdf_api}" download="{_clean_pnum}.pdf">'
+        f'{_pdf_label}</a>'
     )
 
     # Action bar — AI button only when relevant, PDF always shown

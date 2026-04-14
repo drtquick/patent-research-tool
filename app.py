@@ -1916,7 +1916,7 @@ def pdf_proxy(pub_num):
     return Response(
         pdf,
         mimetype="application/pdf",
-        headers={"Content-Disposition": f'inline; filename="{clean}.pdf"'},
+        headers={"Content-Disposition": f'attachment; filename="{clean}.pdf"'},
     )
 
 
