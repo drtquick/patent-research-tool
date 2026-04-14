@@ -826,6 +826,25 @@ def extract_rejection_summary(m: dict) -> Optional[dict]:
 
 # ── USPTO Open Data Portal (ODP) helpers ─────────────────────────────────────
 
+def _format_us_app_num(raw: str) -> str:
+    """
+    Format a US application number as 'XX/XXX,XXX' (the standard USPTO form).
+
+    Accepts any of:
+      '17134990'            → '17/134,990'
+      'US17134990'          → '17/134,990'
+      'US202017134990'      → '17/134,990'     (EPO 12-digit year-prefixed)
+      'US2020/17134990'     → '17/134,990'
+      '17/134,990'          → '17/134,990'     (pass-through)
+
+    Returns the input unchanged if we can't resolve it to an 8-digit serial.
+    """
+    clean = _clean_app_num(raw or "")
+    if len(clean) == 8 and clean.isdigit():
+        return f"{clean[:2]}/{clean[2:5]},{clean[5:]}"
+    return raw or ""
+
+
 def _clean_app_num(s: str) -> str:
     """Strip non-digits so '17/508,065' → '17508065'.
     Handles EPO year-prefix formats:
@@ -1029,6 +1048,40 @@ def fetch_us_member_via_odp(member: dict, api_key: str) -> dict | None:
         ]
         # Fetch prosecution documents (office actions etc.) — non-fatal
         result["oa_documents"] = fetch_odp_documents(result["app_num"], api_key)
+
+        # Continuity: parent/child US apps (continuations, CIPs, divisionals).
+        # We surface these so _run_search can add any that aren't already in the
+        # EPO INPADOC family (INPADOC misses many abandoned US continuations).
+        related: list[dict] = []
+        for side, key in (("parent", "parentContinuityBag"),
+                          ("child",  "childContinuityBag")):
+            for cb in bag.get(key, []) or []:
+                raw_app = (
+                    cb.get("parentApplicationNumberText")
+                    or cb.get("childApplicationNumberText")
+                    or cb.get("applicationNumberText", "")
+                )
+                clean = _clean_app_num(raw_app)
+                if not clean:
+                    continue
+                related.append({
+                    "side":     side,
+                    "app_num":  clean,
+                    "filing":   (
+                        cb.get("parentApplicationFilingDate")
+                        or cb.get("childApplicationFilingDate", "")
+                    ),
+                    "patent":   (
+                        cb.get("parentPatentNumber")
+                        or cb.get("childPatentNumber", "")
+                    ),
+                    "relation": (
+                        cb.get("claimParentageTypeCode")
+                        or cb.get("continuityTypeText", "")
+                    ),
+                })
+        if related:
+            result["related_us_apps"] = related
     except Exception as exc:
         result["fetch_error"] = str(exc)[:80]
 
@@ -1047,16 +1100,34 @@ def fetch_member_details(member: dict, idx: int, total: int,
     """
     pub_num = member.get("pub_num", "")
 
-    # ── Fast / reliable path: USPTO ODP for US patents ──────────────────────
-    if odp_api_key and pub_num.startswith("US") and member.get("app_num"):
-        print(f"  [{idx:>2}/{total}] {pub_num:<22} … (ODP) ", end="", flush=True)
-        odp_result = fetch_us_member_via_odp(member, odp_api_key)
-        if odp_result is not None and not odp_result.get("fetch_error"):
-            print("ok")
-            _time.sleep(0.05)   # tiny courtesy delay
-            return odp_result
-        err = (odp_result or {}).get("fetch_error", "unknown")
-        print(f"ODP-err({err[:40]}), falling back to GP")
+    # ── Fast / reliable path: USPTO ODP for ALL US members ─────────────────
+    # For any US member we try ODP first. If app_num is missing, resolve it
+    # via EPO biblio (document-id-type="original" yields the 8-digit serial
+    # ODP uses). Only fall through to the GP scraper when ODP truly can't be
+    # reached for this member.
+    if odp_api_key and pub_num.startswith("US"):
+        if not member.get("app_num"):
+            _epo_key    = os.environ.get("EPO_CONSUMER_KEY",    "").strip()
+            _epo_secret = os.environ.get("EPO_CONSUMER_SECRET", "").strip()
+            if _epo_key and _epo_secret:
+                _docdb = patent_to_docdb(pub_num)
+                if _docdb:
+                    _tok = epo_get_token(_epo_key, _epo_secret)
+                    if _tok:
+                        _bib = fetch_epo_biblio(_docdb, _tok)
+                        if _bib:
+                            _app = extract_us_app_num_from_biblio(_bib)
+                            if _app:
+                                member = {**member, "app_num": _app}
+        if member.get("app_num"):
+            print(f"  [{idx:>2}/{total}] {pub_num:<22} … (ODP) ", end="", flush=True)
+            odp_result = fetch_us_member_via_odp(member, odp_api_key)
+            if odp_result is not None and not odp_result.get("fetch_error"):
+                print("ok")
+                _time.sleep(0.05)   # tiny courtesy delay
+                return odp_result
+            err = (odp_result or {}).get("fetch_error", "unknown")
+            print(f"ODP-err({err[:40]}), falling back to GP")
 
     # ── Standard path: Google Patents ───────────────────────────────────────
     result = {
@@ -2434,6 +2505,14 @@ def _render_card(m: dict) -> str:
     app_num = m.get("app_num", "").strip()
     # Granted patents → show patent publication number; pending/other → show application number
     display = m["pub_num"] if status == "granted" else (app_num if app_num else m["pub_num"])
+    # Pretty-print US application numbers as 'XX/XXX,XXX' even when EPO gave us
+    # the 14-char 'US202017134990' form, a 12-digit 'US2020/17134990' form, or
+    # the bare 8-digit serial. Only applies when we're actually displaying an
+    # app number (i.e. non-granted tiles) for a US member.
+    if code == "US" and status != "granted" and display:
+        _pretty = _format_us_app_num(display)
+        if _pretty and _pretty != display:
+            display = _pretty
     # Normalize PCT application number format: "PCT/US2020/066580" not "PC:T/..." variants
     if code == "WO" and display and not display.upper().startswith("WO"):
         display = re.sub(r'\bPC\s*[:\s]*T\s*[:/\s]+', 'PCT/', display, flags=re.IGNORECASE)

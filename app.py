@@ -231,6 +231,37 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
                         except Exception as exc:
                             print(f"  family merge skipped: {exc}")
 
+    # ── Continuity: pull in abandoned/unpublished US continuations via ODP ──
+    # Mirrors the _run_search logic — see that function for rationale.
+    if api_key:
+        known = {tracker._clean_app_num(m.get("app_num", "")) for m in family_details}
+        known.discard("")
+        extras_seen: set = set()
+        extras: list = []
+        for m in list(family_details):
+            for rel in (m.get("related_us_apps") or []):
+                rel_app = rel.get("app_num", "")
+                if not rel_app or rel_app in known or rel_app in extras_seen:
+                    continue
+                extras_seen.add(rel_app)
+                extras.append({
+                    "pub_num": rel.get("patent") and f"US{rel['patent']}B2" or f"US{rel_app}",
+                    "app_num": rel_app,
+                    "href":    "",
+                    "title":   "",
+                    "country": "US",
+                    "date":    rel.get("filing", ""),
+                    "lang":    "",
+                })
+        for j, stub in enumerate(extras):
+            try:
+                det = tracker.fetch_member_details(
+                    stub, j + 1, len(extras), odp_api_key=api_key
+                )
+                family_details.append(det)
+            except Exception as exc:
+                print(f"  continuity merge (odp path) skipped {stub.get('app_num')}: {exc}")
+
     # ── Build summaries + dashboard from (possibly enriched) family ──────────
     dashboard_html = tracker.generate_dashboard_html(
         metas, family_details, odp_url, pub_num,
@@ -481,12 +512,48 @@ def _run_search(patent_input: str, search_type: str = "auto") -> dict:
     dates = metas.get("DC.date", [])
 
     # ── Fetch family member prosecution details ───────────────────────────────
-    # US members → ODP (when app_num available); others → GP page scrape
+    # US members → ODP (resolves app_num via EPO biblio if needed); others → GP
     total          = len(family)
     family_details = [
         tracker.fetch_member_details(m, i + 1, total, odp_api_key=odp_key)
         for i, m in enumerate(family)
     ]
+
+    # ── Pull in abandoned / unpublished US continuations via ODP continuity ──
+    # INPADOC family data from EPO frequently misses abandoned continuations,
+    # CIPs, and divisionals whose US publications never entered INPADOC.  For
+    # every US member we just fetched, look at ODP's parent/child continuity
+    # bags and add any related US app we haven't already seen.  Fetched via
+    # ODP so status (including "abandoned") is authoritative.
+    if odp_key:
+        known = {tracker._clean_app_num(m.get("app_num", "")) for m in family_details}
+        known.discard("")
+        extras_seen: set[str] = set()
+        extras: list[dict] = []
+        for m in list(family_details):
+            for rel in m.get("related_us_apps") or []:
+                rel_app = rel.get("app_num", "")
+                if not rel_app or rel_app in known or rel_app in extras_seen:
+                    continue
+                extras_seen.add(rel_app)
+                stub = {
+                    "pub_num": rel.get("patent") and f"US{rel['patent']}B2" or f"US{rel_app}",
+                    "app_num": rel_app,
+                    "href":    "",
+                    "title":   "",
+                    "country": "US",
+                    "date":    rel.get("filing", ""),
+                    "lang":    "",
+                }
+                extras.append(stub)
+        for j, stub in enumerate(extras):
+            try:
+                det = tracker.fetch_member_details(
+                    stub, total + j + 1, total + len(extras), odp_api_key=odp_key
+                )
+                family_details.append(det)
+            except Exception as exc:
+                print(f"  continuity merge skipped {stub.get('app_num')}: {exc}")
 
     # ── ODP ↔ EPO cross-validation for US members ────────────────────────────
     status_discrepancies: list = []
