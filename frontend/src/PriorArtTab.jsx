@@ -8,21 +8,25 @@ import { api } from "./api";
  *   - Per-member: one column per US member with the full reference list.
  */
 export default function PriorArtTab({ portfolioId }) {
-  const [loading, setLoading] = useState(true);
-  const [error,   setError]   = useState("");
-  const [data,    setData]    = useState(null);
-  const [view,    setView]    = useState("matrix");
+  const [loading,    setLoading]    = useState(true);
+  const [aiRunning,  setAiRunning]  = useState(false);
+  const [error,      setError]      = useState("");
+  const [data,       setData]       = useState(null);
+  const [view,       setView]       = useState("matrix");
+
+  function load({ aiScan = false } = {}) {
+    if (!portfolioId) return;
+    if (aiScan) setAiRunning(true); else setLoading(true);
+    setError("");
+    api.getPortfolioPriorArt(portfolioId, { aiScan })
+      .then((d) => { setData(d); })
+      .catch((err) => { setError(err.message || "Failed to load prior art"); })
+      .finally(() => { setLoading(false); setAiRunning(false); });
+  }
 
   useEffect(() => {
-    if (!portfolioId) return;
-    let alive = true;
-    setLoading(true);
-    setError("");
-    api.getPortfolioPriorArt(portfolioId)
-      .then((d) => { if (alive) setData(d); })
-      .catch((err) => { if (alive) setError(err.message || "Failed to load prior art"); })
-      .finally(() => { if (alive) setLoading(false); });
-    return () => { alive = false; };
+    load({ aiScan: false });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [portfolioId]);
 
   if (loading) return <div style={s.loading}>Loading prior-art citations from EPO biblio…</div>;
@@ -42,19 +46,32 @@ export default function PriorArtTab({ portfolioId }) {
         <div>
           <strong>{refs.length}</strong> unique references cited across <strong>{members.length}</strong> US family member{members.length === 1 ? "" : "s"}.
         </div>
-        <div style={s.toggle}>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
           <button
-            style={{ ...s.toggleBtn, ...(view === "matrix" ? s.toggleActive : {}) }}
-            onClick={() => setView("matrix")}
+            onClick={() => load({ aiScan: true })}
+            disabled={aiRunning}
+            title="Use Claude to extract references from the latest IDS and 892 PDFs on pending apps. Results are cached."
+            style={{ padding: "6px 14px", borderRadius: 6,
+                     background: aiRunning ? "#d1c4e9" : "#8b5cf6",
+                     color: "#fff", border: "none", fontSize: 12, fontWeight: 700,
+                     cursor: aiRunning ? "wait" : "pointer" }}
           >
-            Matrix
+            {aiRunning ? "Scanning with AI…" : "🧠 Scan pending apps with AI"}
           </button>
-          <button
-            style={{ ...s.toggleBtn, ...(view === "per" ? s.toggleActive : {}) }}
-            onClick={() => setView("per")}
-          >
-            Per-Member
-          </button>
+          <div style={s.toggle}>
+            <button
+              style={{ ...s.toggleBtn, ...(view === "matrix" ? s.toggleActive : {}) }}
+              onClick={() => setView("matrix")}
+            >
+              Matrix
+            </button>
+            <button
+              style={{ ...s.toggleBtn, ...(view === "per" ? s.toggleActive : {}) }}
+              onClick={() => setView("per")}
+            >
+              Per-Member
+            </button>
+          </div>
         </div>
       </div>
 

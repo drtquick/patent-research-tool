@@ -1635,20 +1635,116 @@ def list_searches():
 
 # ── Assignments (USPTO Assignment chain per family member) ─────────────────
 
+def _ai_scan_pending_references(app_num: str, request_uid: str | None = None) -> list[dict]:
+    """
+    Pull the latest IDS (applicant) and 892 (examiner) PDFs for a pending US
+    application and ask Claude to extract structured cited references. Cached
+    in Firestore by app_num + hash of (doc_code, doc_date) pairs so unchanged
+    document sets cost zero tokens on repeat calls.
+    """
+    import hashlib as _hl
+    import requests as _rq
+
+    if not app_num:
+        return []
+    api_key = os.environ.get("USPTO_ODP_API_KEY", "").strip()
+    if not api_key:
+        return []
+
+    try:
+        docs = tracker.fetch_odp_documents(app_num, api_key) or []
+    except Exception as exc:
+        print(f"  ai_scan_refs {app_num}: docs fetch failed ({exc})", flush=True)
+        return []
+
+    # Pick most-recent of each relevant code
+    picks: list[tuple[str, dict]] = []  # (doc_type_label, doc)
+    seen_codes = set()
+    for d in sorted(docs, key=lambda x: x.get("date", ""), reverse=True):
+        code = (d.get("code") or "").upper()
+        if code in ("IDS", "1449") and "IDS" not in seen_codes and d.get("download_url"):
+            picks.append(("IDS", d))
+            seen_codes.add("IDS")
+        elif code == "892" and "892" not in seen_codes and d.get("download_url"):
+            picks.append(("892", d))
+            seen_codes.add("892")
+
+    if not picks:
+        return []
+
+    # Cache key — changes when any picked doc's (code,date) changes
+    cache_sig = _hl.sha1(
+        "|".join(f"{t}:{d.get('date','')}:{d.get('code','')}" for t, d in picks).encode()
+    ).hexdigest()[:20]
+    cache_id = f"{app_num}__{cache_sig}"
+
+    cache_ref = None
+    if request_uid:
+        try:
+            cache_ref = (
+                db.collection("users").document(request_uid)
+                  .collection("ai_prior_art_cache")
+            )
+            snap = cache_ref.document(cache_id).get()
+            if snap.exists:
+                return (snap.to_dict() or {}).get("refs", []) or []
+        except Exception:
+            cache_ref = None
+
+    # Build PatentAI lazily
+    try:
+        from ai_engine import PatentAI
+        ai = PatentAI()
+    except Exception as exc:
+        print(f"  ai_scan_refs {app_num}: PatentAI init failed ({exc})", flush=True)
+        return []
+
+    refs: list[dict] = []
+    headers = {"X-API-Key": api_key}
+    for doc_type, d in picks:
+        url = d.get("download_url", "")
+        try:
+            resp = _rq.get(url, headers=headers, timeout=30)
+            if resp.status_code != 200 or not resp.content:
+                print(f"  ai_scan_refs {app_num}: {doc_type} download HTTP {resp.status_code}", flush=True)
+                continue
+            extracted = ai.extract_references_from_pdf(resp.content, doc_type=doc_type)
+            # Stamp source + doc date
+            for r in extracted:
+                r.setdefault("source_doc_code", d.get("code", ""))
+                r.setdefault("source_doc_date", d.get("date", ""))
+            print(f"  ai_scan_refs {app_num}: {doc_type} → {len(extracted)} refs", flush=True)
+            refs.extend(extracted)
+        except Exception as exc:
+            print(f"  ai_scan_refs {app_num}: {doc_type} error ({exc})", flush=True)
+
+    # Save cache
+    if cache_ref is not None:
+        try:
+            cache_ref.document(cache_id).set({
+                "app_num":   app_num,
+                "refs":      refs,
+                "picks":     [{"type": t, "code": d.get("code"), "date": d.get("date")}
+                              for t, d in picks],
+                "cached_at": datetime.now(timezone.utc),
+            })
+        except Exception as exc:
+            print(f"  ai_scan_refs {app_num}: cache save failed ({exc})", flush=True)
+
+    return refs
+
+
 @app.route("/api/portfolios/<portfolio_id>/prior-art", methods=["GET"])
 @require_auth
 def get_portfolio_prior_art(portfolio_id):
     """
     Return aggregated prior-art citations for every US family member.
     For granted patents we pull structured <patcit>/<nplcit> from EPO biblio
-    (authoritative mirror of USPTO citation data). Response shape:
-    {
-      "members": [ { pub_num, app_num, status, display_number, references: [...] }, ... ],
-      "dedup_references": [
-        { key, display, type, country, number, kind, category, citing_members: [pub_num,...] }
-      ]
-    }
+    (authoritative mirror of USPTO citation data). For pending apps, add
+    ai_scan=1 to the query string to run Claude against the latest IDS and
+    892 PDFs and merge the extracted references in.
     """
+    ai_scan = (request.args.get("ai_scan") or "").strip() in ("1", "true", "yes")
     try:
         ref = (
             db.collection("users").document(request.uid)
@@ -1679,6 +1775,22 @@ def get_portfolio_prior_art(portfolio_id):
                     biblio_xml = tracker.fetch_epo_biblio(docdb, token)
                     if biblio_xml:
                         refs = tracker.parse_epo_references_cited(biblio_xml)
+
+            # For pending US apps, optionally augment with AI-extracted refs
+            # from the latest IDS + 892 PDFs.
+            if ai_scan and m.get("status") in ("pending", "unknown"):
+                ai_refs = _ai_scan_pending_references(
+                    tracker._clean_app_num(m.get("app_num", "")),
+                    request_uid=request.uid,
+                )
+                # De-dup against EPO-biblio refs by (country, number)
+                seen = {(r.get("country", ""), r.get("number", "")) for r in refs}
+                for r in ai_refs:
+                    key = (r.get("country", ""), r.get("number", ""))
+                    if r.get("type") == "patent" and key in seen:
+                        continue
+                    r.setdefault("display", r.get("text", "")[:120])
+                    refs.append(r)
 
             display = m.get("pub_num", "")
             if m.get("status") == "granted":

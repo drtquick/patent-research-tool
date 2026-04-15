@@ -93,9 +93,11 @@ export const api = {
   getPortfolioAssignments: (id) =>
     authFetch(`/api/portfolios/${id}/assignments`),
 
-  // Aggregated prior-art citations per US family member
-  getPortfolioPriorArt: (id) =>
-    authFetch(`/api/portfolios/${id}/prior-art`),
+  // Aggregated prior-art citations per US family member.
+  // Pass { aiScan: true } to ALSO run Claude against the latest IDS + 892
+  // PDFs on pending apps. Results are cached in Firestore by doc set hash.
+  getPortfolioPriorArt: (id, { aiScan = false } = {}) =>
+    authFetch(`/api/portfolios/${id}/prior-art${aiScan ? "?ai_scan=1" : ""}`),
 
   // ── Patentee groups (combined multi-family dashboards) ───────────────────
 

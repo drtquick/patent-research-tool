@@ -218,6 +218,100 @@ class PatentAI:
 
     # ── Public methods ────────────────────────────────────────────────────────
 
+    def extract_references_from_pdf(self, pdf_bytes: bytes, doc_type: str = "IDS") -> list[dict]:
+        """
+        Ask Claude to read a USPTO prior-art PDF (IDS / 1449 / 892 Notice of
+        References Cited) and return a structured list of cited references.
+        doc_type is informational — it's added to the prompt so Claude knows
+        which form conventions to expect.
+
+        Returns a list of dicts:
+          { "type": "patent"|"nonpatent",
+            "country": "US", "number": "10123456", "kind": "B2",
+            "display": "US 10,123,456 B2",
+            "cited_by": "applicant"|"examiner",
+            "date": "YYYY-MM-DD" or "",
+            "text": "raw NPL text" (empty for patents) }
+        """
+        import base64 as _b64
+
+        if not pdf_bytes:
+            return []
+        pdf_b64 = _b64.b64encode(pdf_bytes).decode("ascii")
+
+        cited_by = "examiner" if doc_type.upper() in ("892", "NOTICE OF REFERENCES") else "applicant"
+        doc_hint = {
+            "892":            "USPTO Form 892 (Notice of References Cited by Examiner)",
+            "IDS":            "Information Disclosure Statement (SB/08 or similar)",
+            "1449":           "PTO-1449 List of References Cited by Applicant",
+        }.get(doc_type.upper(), doc_type)
+
+        schema = """
+Return a JSON object:
+{
+  "references": [
+    {
+      "type":     "patent" | "nonpatent",
+      "country":  "US" | "EP" | ... (empty for NPL),
+      "number":   "10123456" (patent number as printed, digits only if possible, empty for NPL),
+      "kind":     "A1" | "B2" | "" (kind code if printed, else empty),
+      "display":  "US 10,123,456 B2" | "Smith et al., Journal X (2019)" (human-readable),
+      "date":     "YYYY-MM-DD" (publication/pub date printed next to the reference; empty if not printed),
+      "text":     "full citation text" (for NPL; empty for patents)
+    }
+  ]
+}
+
+Rules:
+- Parse every row of the reference table(s). Include foreign patents (EP, JP, WO, CN, KR, etc.) and non-patent literature.
+- Do not invent entries. If the table is empty, return "references": [].
+- Omit signature/date boxes; only the reference rows are of interest.
+- Output ONLY the JSON object, no surrounding prose.
+"""
+
+        user_blocks = [
+            {"type": "document", "source": {"type": "base64",
+                                             "media_type": "application/pdf", "data": pdf_b64}},
+            {"type": "text", "text": (
+                f"This PDF is a {doc_hint}. Extract every cited prior-art reference.\n\n"
+                f"{schema}"
+            )},
+        ]
+        try:
+            response = self.client.messages.create(
+                model=self.MODEL,
+                max_tokens=4000,
+                system="You are an expert at reading USPTO prior-art forms. Extract structured citations faithfully. Output JSON only.",
+                messages=[{"role": "user", "content": user_blocks}],
+            )
+            raw = response.content[0].text.strip()
+            if raw.startswith("```"):
+                lines = raw.split("\n")
+                raw = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
+                raw = raw.strip()
+            data = json.loads(raw)
+            refs = data.get("references") or []
+            # Normalize + stamp cited_by
+            out = []
+            for r in refs:
+                r.setdefault("cited_by", cited_by)
+                r.setdefault("cited_phase", "ids" if cited_by == "applicant" else "examination")
+                # Prettify US patent displays
+                if r.get("type") == "patent" and r.get("country") == "US":
+                    num = (r.get("number") or "").replace(",", "").strip()
+                    kind = r.get("kind", "")
+                    if num.isdigit():
+                        rev = num[::-1]
+                        grouped = ",".join(rev[i:i+3] for i in range(0, len(rev), 3))[::-1]
+                        r["display"] = f"US {grouped}{(' ' + kind) if kind else ''}".strip()
+                        r["number"]  = num
+                out.append(r)
+            return out
+        except Exception as exc:
+            print(f"  extract_references_from_pdf ({doc_type}): {exc}")
+            return []
+
+
     def analyze_next_deadline(self, member_data: dict) -> dict:
         """
         Determine the single most important upcoming action/deadline for a
