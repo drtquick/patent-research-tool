@@ -1635,6 +1635,95 @@ def list_searches():
 
 # ── Assignments (USPTO Assignment chain per family member) ─────────────────
 
+@app.route("/api/portfolios/<portfolio_id>/prior-art", methods=["GET"])
+@require_auth
+def get_portfolio_prior_art(portfolio_id):
+    """
+    Return aggregated prior-art citations for every US family member.
+    For granted patents we pull structured <patcit>/<nplcit> from EPO biblio
+    (authoritative mirror of USPTO citation data). Response shape:
+    {
+      "members": [ { pub_num, app_num, status, display_number, references: [...] }, ... ],
+      "dedup_references": [
+        { key, display, type, country, number, kind, category, citing_members: [pub_num,...] }
+      ]
+    }
+    """
+    try:
+        ref = (
+            db.collection("users").document(request.uid)
+              .collection("portfolios").document(portfolio_id)
+        )
+        snap = ref.get()
+        if not snap.exists:
+            return jsonify({"error": "Not found"}), 404
+        data = snap.to_dict() or {}
+        family = data.get("family", []) or []
+
+        epo_key    = os.environ.get("EPO_CONSUMER_KEY",    "").strip()
+        epo_secret = os.environ.get("EPO_CONSUMER_SECRET", "").strip()
+        token = (tracker.epo_get_token(epo_key, epo_secret)
+                 if epo_key and epo_secret else None)
+
+        out_members: list[dict] = []
+        dedup: dict[str, dict] = {}
+
+        for m in family:
+            pub = (m.get("pub_num") or "").upper()
+            if not pub.startswith("US") and m.get("country") != "US":
+                continue
+            refs: list[dict] = []
+            if token:
+                docdb = tracker.patent_to_docdb(pub)
+                if docdb:
+                    biblio_xml = tracker.fetch_epo_biblio(docdb, token)
+                    if biblio_xml:
+                        refs = tracker.parse_epo_references_cited(biblio_xml)
+
+            display = m.get("pub_num", "")
+            if m.get("status") == "granted":
+                display = tracker._format_us_patent_num(display) or display
+
+            for r in refs:
+                # Dedup key: country+number for patent, first 80 chars of text for NPL
+                if r.get("type") == "patent":
+                    key = f"{r.get('country','')}{r.get('number','')}"
+                else:
+                    key = "NPL:" + (r.get("text") or r.get("display") or "")[:80]
+                if key not in dedup:
+                    dedup[key] = {
+                        "key": key,
+                        "display":  r.get("display", ""),
+                        "type":     r.get("type", "patent"),
+                        "country":  r.get("country", ""),
+                        "number":   r.get("number", ""),
+                        "kind":     r.get("kind", ""),
+                        "category": r.get("category", ""),
+                        "citing_members": [],
+                    }
+                dedup[key]["citing_members"].append(m.get("pub_num", ""))
+
+            out_members.append({
+                "pub_num":         m.get("pub_num", ""),
+                "app_num":         tracker._clean_app_num(m.get("app_num", "")),
+                "display_number":  display,
+                "status":          m.get("status", "unknown"),
+                "references":      refs,
+            })
+
+        dedup_list = sorted(
+            dedup.values(),
+            key=lambda r: (-len(r["citing_members"]), r["type"], r["display"])
+        )
+        return jsonify({
+            "members":           out_members,
+            "dedup_references":  dedup_list,
+        })
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.route("/api/portfolios/<portfolio_id>/assignments", methods=["GET"])
 @require_auth
 def get_portfolio_assignments(portfolio_id):

@@ -1350,7 +1350,22 @@ def fetch_member_details(member: dict, idx: int, total: int,
             print(f"  [{idx:>2}/{total}] {pub_num:<22} … (ODP) ", end="", flush=True)
             odp_result = fetch_us_member_via_odp(member, odp_api_key)
             if odp_result is not None and not odp_result.get("fetch_error"):
-                print("ok")
+                # Supplementary EPO biblio pass to capture the structured
+                # references-cited list (ODP doesn't expose this). Non-fatal.
+                try:
+                    _epo_key    = os.environ.get("EPO_CONSUMER_KEY",    "").strip()
+                    _epo_secret = os.environ.get("EPO_CONSUMER_SECRET", "").strip()
+                    if _epo_key and _epo_secret:
+                        _docdb = patent_to_docdb(odp_result.get("pub_num", pub_num))
+                        if _docdb:
+                            _tok = epo_get_token(_epo_key, _epo_secret)
+                            if _tok:
+                                _bib = fetch_epo_biblio(_docdb, _tok)
+                                if _bib:
+                                    odp_result["references_cited"] = parse_epo_references_cited(_bib)
+                except Exception as _exc:
+                    print(f" refs-skip({_exc})", end="")
+                print(f"ok ({len(odp_result.get('references_cited') or [])} refs)")
                 _time.sleep(0.05)   # tiny courtesy delay
                 return odp_result
             err = (odp_result or {}).get("fetch_error", "unknown")
@@ -1404,7 +1419,9 @@ def fetch_member_details(member: dict, idx: int, total: int,
         # Infer status from the kind code if the EPO biblio doesn't give us
         # a better signal.
         result["status"] = infer_status(pub_num)
-        print("ok")
+        # Cited prior art — from the EPO biblio references-cited block.
+        result["references_cited"] = parse_epo_references_cited(biblio_xml)
+        print(f"ok ({len(result['references_cited'])} refs)")
     except requests.HTTPError as e:
         print(f"EPO HTTP {e.response.status_code} — tile uses INPADOC fallback only")
     except Exception as e:
@@ -1923,6 +1940,88 @@ def fetch_epo_abstract(docdb: str, token: str) -> Optional[str]:
     except Exception as exc:
         print(f"  EPO abstract error: {exc}")
         return None
+
+
+def parse_epo_references_cited(biblio_xml: str) -> list[dict]:
+    """
+    Extract cited prior-art references from an EPO OPS biblio XML response.
+    Each reference dict has:
+        { "type": "patent"|"nonpatent",
+          "country": "US",  "number": "10123456", "kind": "B2",
+          "display": "US 10,123,456 B2",
+          "category": "X"|"Y"|"A"|... (relevance),
+          "cited_phase": "search-report"|"application"|"examination"|...,
+          "cited_by": "examiner"|"applicant"|"",
+          "date": "YYYY-MM-DD",
+          "text": "raw text for NPL" }
+    """
+    if not biblio_xml:
+        return []
+    out: list[dict] = []
+    # Find the references-cited block first so we don't scan the whole doc.
+    m_block = re.search(
+        r"<references-cited[^>]*>(.*?)</references-cited>", biblio_xml, re.DOTALL
+    )
+    block = m_block.group(1) if m_block else biblio_xml
+
+    for citation_xml in re.findall(r"<citation\b[^>]*>(.*?)</citation>", block, re.DOTALL):
+        cat   = _first(re.findall(r"<category>\s*([^<]+?)\s*</category>", citation_xml)).strip()
+        phase = ""
+        m_ph  = re.search(r'cited-phase="([^"]+)"', citation_xml)
+        if m_ph:
+            phase = m_ph.group(1)
+        cited_by = ""
+        m_by   = re.search(r'cited-by="([^"]+)"', citation_xml)
+        if m_by:
+            cited_by = m_by.group(1)
+
+        # Patent citation — prefer docdb form for the clean components
+        pat_m = re.search(r"<patcit[^>]*>(.*?)</patcit>", citation_xml, re.DOTALL)
+        if pat_m:
+            pat_xml = pat_m.group(1)
+            docdb = re.search(
+                r'<document-id[^>]*document-id-type="docdb"[^>]*>(.*?)</document-id>',
+                pat_xml, re.DOTALL,
+            )
+            cc = num = kind = date = ""
+            if docdb:
+                inside = docdb.group(1)
+                cc   = _first(re.findall(r"<country>\s*([^<]+?)\s*</country>", inside)).strip()
+                num  = _first(re.findall(r"<doc-number>\s*([^<]+?)\s*</doc-number>", inside)).strip()
+                kind = _first(re.findall(r"<kind>\s*([^<]+?)\s*</kind>", inside)).strip()
+                date = _fmt_epo_date(_first(re.findall(r"<date>\s*([^<]+?)\s*</date>", inside)).strip())
+            else:
+                # Fallback: take the first document-id of any type
+                any_id = re.search(r"<document-id[^>]*>(.*?)</document-id>", pat_xml, re.DOTALL)
+                if any_id:
+                    inside = any_id.group(1)
+                    cc   = _first(re.findall(r"<country>\s*([^<]+?)\s*</country>", inside)).strip()
+                    num  = _first(re.findall(r"<doc-number>\s*([^<]+?)\s*</doc-number>", inside)).strip()
+                    kind = _first(re.findall(r"<kind>\s*([^<]+?)\s*</kind>", inside)).strip()
+                    date = _fmt_epo_date(_first(re.findall(r"<date>\s*([^<]+?)\s*</date>", inside)).strip())
+            # Pretty-print US patents with commas
+            display = f"{cc} {num}{(' ' + kind) if kind else ''}".strip()
+            if cc == "US" and num.isdigit():
+                rev = num[::-1]
+                grouped = ",".join(rev[i:i+3] for i in range(0, len(rev), 3))[::-1]
+                display = f"US {grouped}{(' ' + kind) if kind else ''}".strip()
+            out.append({
+                "type": "patent", "country": cc, "number": num, "kind": kind,
+                "display": display, "category": cat, "cited_phase": phase,
+                "cited_by": cited_by, "date": date, "text": "",
+            })
+            continue
+
+        npl_m = re.search(r"<nplcit[^>]*>(.*?)</nplcit>", citation_xml, re.DOTALL)
+        if npl_m:
+            txt_m = re.search(r"<text>\s*(.*?)\s*</text>", npl_m.group(1), re.DOTALL)
+            text = (txt_m.group(1) if txt_m else "").strip()
+            out.append({
+                "type": "nonpatent", "country": "", "number": "", "kind": "",
+                "display": text[:140], "category": cat, "cited_phase": phase,
+                "cited_by": cited_by, "date": "", "text": text,
+            })
+    return out
 
 
 def parse_epo_biblio(biblio_xml: str, abstract_xml: Optional[str] = None) -> dict:

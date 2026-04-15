@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 import PrintBar from "../PrintBar";
 import AssignmentsTab from "../AssignmentsTab";
+import PriorArtTab from "../PriorArtTab";
 import DocumentsPanel from "../DocumentsPanel";
 import { useIsMobile } from "../useIsMobile";
 
@@ -935,6 +936,7 @@ export default function Portfolio() {
           {[
             { key: "dashboard",   label: "📊 Family Dashboard" },
             { key: "assignments", label: "🏛 Assignments" },
+            { key: "prior_art",   label: "📚 Prior Art" },
           ].map((t) => (
             <button
               key={t.key}
@@ -966,6 +968,11 @@ export default function Portfolio() {
         {activeTab === "assignments" && (
           <div style={styles.iframeWrap}>
             <AssignmentsTab portfolioId={viewingId} />
+          </div>
+        )}
+        {activeTab === "prior_art" && (
+          <div style={styles.iframeWrap}>
+            <PriorArtTab portfolioId={viewingId} />
           </div>
         )}
       </div>

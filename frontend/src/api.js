@@ -93,6 +93,10 @@ export const api = {
   getPortfolioAssignments: (id) =>
     authFetch(`/api/portfolios/${id}/assignments`),
 
+  // Aggregated prior-art citations per US family member
+  getPortfolioPriorArt: (id) =>
+    authFetch(`/api/portfolios/${id}/prior-art`),
+
   // ── Patentee groups (combined multi-family dashboards) ───────────────────
 
   listPatenteeGroups: () => authFetch("/api/patentee-groups"),
