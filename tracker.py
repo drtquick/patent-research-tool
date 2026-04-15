@@ -1093,24 +1093,28 @@ def fetch_odp_continuity(app_num: str, api_key: str) -> list[dict]:
         # the BFS. Must read the field that matches the side.
         for entry in bag:
             for cb in entry.get("parentContinuityBag", []) or []:
-                ca = _clean_app_num(cb.get("parentApplicationNumberText", ""))
+                raw = cb.get("parentApplicationNumberText", "") or ""
+                ca  = _clean_app_num(raw)
                 if not ca:
                     continue
                 out.append({
                     "side":     "parent",
                     "app_num":  ca,
+                    "app_raw":  raw,
                     "filing":   cb.get("parentApplicationFilingDate", ""),
                     "patent":   cb.get("parentPatentNumber", ""),
                     "relation": cb.get("claimParentageTypeCode", "")
                                 or cb.get("claimParentageTypeCodeDescriptionText", ""),
                 })
             for cb in entry.get("childContinuityBag", []) or []:
-                ca = _clean_app_num(cb.get("childApplicationNumberText", ""))
+                raw = cb.get("childApplicationNumberText", "") or ""
+                ca  = _clean_app_num(raw)
                 if not ca:
                     continue
                 out.append({
                     "side":     "child",
                     "app_num":  ca,
+                    "app_raw":  raw,
                     "filing":   cb.get("childApplicationFilingDate", ""),
                     "patent":   cb.get("childPatentNumber", ""),
                     "relation": cb.get("claimParentageTypeCode", "")

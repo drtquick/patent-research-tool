@@ -284,10 +284,15 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
             if core:
                 pct_known.add(core)
 
-    def _is_pct_serial(app_clean: str) -> bool:
-        """10+ digits starting with 19xx or 20xx, or matches an existing WO tile."""
+    def _is_pct_serial(app_clean: str, raw: str = "") -> bool:
+        """PCT if: raw starts with 'PCT' (case-insensitive and separator-agnostic),
+        or cleaned is 10+ digits year-prefixed, or matches an existing WO tile."""
         if not app_clean:
             return False
+        if raw:
+            r = raw.upper().replace(" ", "").replace("/", "").replace("-", "")
+            if r.startswith("PCT"):
+                return True
         if app_clean in pct_known:
             return True
         return (
@@ -308,10 +313,10 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
         known = {tracker._clean_app_num(m.get("app_num", "")) for m in family_details}
         known.discard("")
         visited: set = set()
-        queue: list = [clean]
+        queue: list = [(clean, "")]  # (app_num, raw_form_if_known)
         extras: list = []
         while queue:
-            cur = queue.pop(0)
+            cur, cur_raw = queue.pop(0)
             if not cur or cur in visited:
                 continue
             visited.add(cur)
@@ -319,13 +324,13 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
             # PCT-style serial? Already represented by the WO tile from EPO;
             # don't create a duplicate US tile for the US-RO administrative
             # record. Still walk it to discover further continuity though.
-            if _is_pct_serial(cur):
+            if _is_pct_serial(cur, cur_raw):
                 rels = tracker.fetch_odp_continuity(cur, api_key)
                 print(f"    continuity {cur} (PCT, no tile): {len(rels)} link(s)")
                 for rel in rels:
                     rel_app = rel.get("app_num", "")
                     if rel_app and rel_app not in visited:
-                        queue.append(rel_app)
+                        queue.append((rel_app, rel.get("app_raw", "")))
                 continue
 
             # Ensure this app is in family_details. If not, fetch via ODP.
@@ -347,7 +352,7 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
             for rel in rels:
                 rel_app = rel.get("app_num", "")
                 if rel_app and rel_app not in visited:
-                    queue.append(rel_app)
+                    queue.append((rel_app, rel.get("app_raw", "")))
 
         print(f"  ODP continuity BFS: +{len(extras)} US member(s)")
 
