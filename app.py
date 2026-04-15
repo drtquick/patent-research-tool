@@ -195,12 +195,25 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
                 if family_xml:
                     epo_members = tracker.parse_epo_family(family_xml)
                     if epo_members:
-                        # Build a family list of non-US members; fetch details
-                        # via GP/EPO for each so they render as normal tiles.
-                        non_us = [em for em in epo_members if em.get("country") != "US"]
+                        # Include EVERY EPO family member except the one we've
+                        # already added from ODP (dedup by normalized pub_num).
+                        # Previously we filtered out all US members, which
+                        # silently dropped siblings like continuation pubs
+                        # of the searched app.
+                        _already = tracker.normalize(pub_num)
+                        _already_app = tracker._clean_app_num(clean)
                         extra_family_raw = []
-                        for em in non_us:
-                            norm_pub = tracker.normalize(em["pub_num"])
+                        for em in epo_members:
+                            _em_pub = tracker.normalize(em["pub_num"])
+                            _em_app = tracker._clean_app_num(em.get("app_num", ""))
+                            if _em_pub == _already:
+                                continue
+                            if _em_app and _em_app == _already_app:
+                                # Same US application, different publication
+                                # stage (e.g. A1 pre-grant vs B2 granted) —
+                                # skip to avoid duplicate tiles.
+                                continue
+                            norm_pub = _em_pub
                             extra_family_raw.append({
                                 "pub_num": em["pub_num"],
                                 "app_num": em.get("app_num", ""),

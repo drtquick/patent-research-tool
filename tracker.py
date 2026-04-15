@@ -3150,6 +3150,51 @@ def generate_dashboard_html(
 
     assignee_str = "; ".join(assignees) if assignees else "N/A"
 
+    # ── Application number + priority chain for the hero block ─────────────
+    # Primary member = the one whose pub_num matches the number we searched.
+    # That member's ODP response carries parent continuity data — we use it to
+    # build a compact priority-chain list (earliest parent → direct parent).
+    _norm_num = normalize(number)
+    _primary_member = next(
+        (m for m in family_details if normalize(m.get("pub_num", "")) == _norm_num),
+        None
+    )
+    if _primary_member is None:
+        _primary_member = next(
+            (m for m in family_details if country_code(m.get("pub_num", "")) == "US"),
+            None
+        )
+    _primary_app_display = ""
+    _priority_chain_html = ""
+    if _primary_member:
+        _pa = _primary_member.get("app_num", "")
+        if _pa:
+            _primary_app_display = _format_us_app_num(_pa) if country_code(_primary_member["pub_num"]) == "US" else _pa
+        _parents = [
+            r for r in (_primary_member.get("related_us_apps") or [])
+            if r.get("side") == "parent" and r.get("app_num")
+        ]
+        # Sort oldest → newest by filing, so the chain reads earliest-priority-first
+        _parents = sorted(_parents, key=lambda r: r.get("filing", "") or "")
+        if _parents:
+            _chain_items = []
+            for _p in _parents:
+                _app_fmt = _format_us_app_num(_p["app_num"])
+                _rel     = (_p.get("relation") or "").replace("_", " ").title()
+                _fdate   = _p.get("filing", "")
+                _txt     = _app_fmt
+                if _fdate:
+                    _txt += f' <span style="color:#64748b">({_fdate})</span>'
+                if _rel:
+                    _txt = f'<span style="color:#64748b">{_rel}:</span> ' + _txt
+                _chain_items.append(f'<li>{_txt}</li>')
+            _priority_chain_html = (
+                '<div class="priority-chain">'
+                '<div class="priority-label">Priority chain</div>'
+                '<ol>' + "".join(_chain_items) + '</ol>'
+                '</div>'
+            )
+
     # Alternative patent viewer URLs for the hero section (GP removed — often blocked).
     _hero_norm = number.replace(" ", "").replace(",", "")
     _hero_esp  = f"https://worldwide.espacenet.com/patent/search?q=pn%3D{_hero_norm}"
@@ -3260,6 +3305,19 @@ def generate_dashboard_html(
       font-size: .78rem; color: #16a34a; font-style: italic;
       margin: .15rem .75rem .35rem; line-height: 1.4;
     }}
+    .priority-chain {{
+      margin-top: .9rem; padding: .65rem .9rem; background: rgba(255,255,255,.08);
+      border: 1px solid rgba(255,255,255,.18); border-radius: 8px;
+      color: #e2e8f0; font-size: .82rem;
+    }}
+    .priority-chain .priority-label {{
+      font-weight: 700; text-transform: uppercase; letter-spacing: .06em;
+      font-size: .68rem; color: #94a3b8; margin-bottom: .3rem;
+    }}
+    .priority-chain ol {{
+      margin: 0; padding-left: 1.2rem; line-height: 1.6;
+    }}
+    .priority-chain li {{ margin: 0; }}
     .hero-translated {{
       font-size: .95rem; color: #86efac; font-style: italic;
       margin-top: .35rem; margin-bottom: .1rem;
@@ -3713,12 +3771,14 @@ def generate_dashboard_html(
     {f'<div class="hero-translated">&#127760; {translated_title}</div>' if translated_title and translated_title.lower() != (title or "").lower() else ""}
     <div class="hero-sub">
       <span class="hero-chip">&#128196; {number}</span>
+      {f'<span class="hero-chip">&#128203; App No. {_primary_app_display}</span>' if _primary_app_display else ''}
       <span class="hero-chip">&#128197; Filed {filing_date}</span>
       <span class="hero-chip">&#9989; Granted {grant_date}</span>
       {'<span class="hero-chip">&#127970; ' + assignee_str + '</span>' if assignees else ''}
       <span class="hero-chip"><a href="{_hero_esp}" target="_blank" style="color:#93c5fd">Espacenet &#8599;</a></span>
       {f'<span class="hero-chip"><a href="{_hero_odp}" target="_blank" style="color:#93c5fd">USPTO ODP &#8599;</a></span>' if _hero_odp else ''}
     </div>
+    {_priority_chain_html}
   </div>
 
   <div class="stats-bar">
