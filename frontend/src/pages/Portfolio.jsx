@@ -83,6 +83,98 @@ function _timeAgo(isoStr) {
   return `${days}d ago`;
 }
 
+function renderAnalysisMarkdown(r, pubNum) {
+  const lines = [];
+  lines.push(`# Office Action Analysis — ${pubNum}`);
+  lines.push("");
+  if (r.oa_type)       lines.push(`**Type:** ${r.oa_type}`);
+  if (r.mailing_date)  lines.push(`**Mailed:** ${r.mailing_date}`);
+  if (r.response_deadline_short)
+    lines.push(`**Response due:** ${r.response_deadline_short}${r.response_deadline_extended && r.response_deadline_extended !== r.response_deadline_short ? ` (extendable to ${r.response_deadline_extended})` : ""}`);
+  lines.push("");
+  if (r.overview) { lines.push("## Overview", r.overview, ""); }
+  if (r.rejections && r.rejections.length) {
+    lines.push(`## Rejections (${r.rejections.length})`);
+    r.rejections.forEach((rj, i) => {
+      lines.push(`### ${i + 1}. ${rj.section || rj.type || ""}`);
+      if (rj.claims_affected) lines.push(`_Claims affected:_ ${rj.claims_affected}`);
+      if (rj.summary) lines.push(rj.summary);
+      if (rj.key_argument) lines.push(`> ${rj.key_argument}`);
+      lines.push("");
+    });
+  }
+  if (r.cited_prior_art && r.cited_prior_art.length) {
+    lines.push(`## Cited Prior Art (${r.cited_prior_art.length})`);
+    r.cited_prior_art.forEach((c) => {
+      lines.push(`- **${c.reference}** — ${c.relevance || ""}`);
+    });
+    lines.push("");
+  }
+  if (r.suggested_response_strategies && r.suggested_response_strategies.length) {
+    lines.push(`## Response Strategies`);
+    r.suggested_response_strategies.forEach((s) => {
+      lines.push(`- **${s.strategy}** (${s.likelihood_of_success || "?"})`);
+      if (s.details) lines.push(`  ${s.details}`);
+    });
+    lines.push("");
+  }
+  if (r.attorney_flags && r.attorney_flags.length) {
+    lines.push(`## Attorney Flags`);
+    r.attorney_flags.forEach((f) => lines.push(`- ${f}`));
+    lines.push("");
+  }
+  if (r.pdf_url) lines.push(`---\n[Download Original OA PDF](${r.pdf_url})`);
+  return lines.join("\n");
+}
+
+function renderAnalysisPrintable(r, pubNum) {
+  const esc = (s) => String(s || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  let body = `<h1>Office Action Analysis — ${esc(pubNum)}</h1>`;
+  body += `<p>`;
+  if (r.oa_type)       body += `<strong>Type:</strong> ${esc(r.oa_type)} &nbsp; `;
+  if (r.mailing_date)  body += `<strong>Mailed:</strong> ${esc(r.mailing_date)} &nbsp; `;
+  if (r.response_deadline_short) {
+    body += `<strong>Response due:</strong> ${esc(r.response_deadline_short)}`;
+    if (r.response_deadline_extended && r.response_deadline_extended !== r.response_deadline_short)
+      body += ` (extendable to ${esc(r.response_deadline_extended)})`;
+  }
+  body += `</p>`;
+  if (r.overview)      body += `<h2>Overview</h2><p>${esc(r.overview)}</p>`;
+  if (r.rejections && r.rejections.length) {
+    body += `<h2>Rejections (${r.rejections.length})</h2>`;
+    r.rejections.forEach((rj, i) => {
+      body += `<div style="margin:10px 0;padding:10px;border-left:4px solid #c62828;background:#fff5f5"><strong>${i + 1}. ${esc(rj.section || rj.type || "")}</strong>`;
+      if (rj.claims_affected) body += `<br><em>Claims:</em> ${esc(rj.claims_affected)}`;
+      if (rj.summary)         body += `<p>${esc(rj.summary)}</p>`;
+      if (rj.key_argument)    body += `<p style="color:#555;font-style:italic">Examiner's argument: ${esc(rj.key_argument)}</p>`;
+      body += `</div>`;
+    });
+  }
+  if (r.cited_prior_art && r.cited_prior_art.length) {
+    body += `<h2>Cited Prior Art</h2><ul>`;
+    r.cited_prior_art.forEach((c) => {
+      body += `<li><strong>${esc(c.reference)}</strong>${c.relevance ? " — " + esc(c.relevance) : ""}</li>`;
+    });
+    body += `</ul>`;
+  }
+  if (r.suggested_response_strategies && r.suggested_response_strategies.length) {
+    body += `<h2>Response Strategies</h2>`;
+    r.suggested_response_strategies.forEach((s) => {
+      body += `<div style="margin:8px 0;padding:10px;border-left:4px solid #2e7d32;background:#f1f8f4"><strong>${esc(s.strategy)}</strong> <em>(${esc(s.likelihood_of_success || "?")})</em>`;
+      if (s.details) body += `<p>${esc(s.details)}</p>`;
+      body += `</div>`;
+    });
+  }
+  if (r.attorney_flags && r.attorney_flags.length) {
+    body += `<h2>Attorney Flags</h2><ul>`;
+    r.attorney_flags.forEach((f) => body += `<li>${esc(f)}</li>`);
+    body += `</ul>`;
+  }
+  return `<!doctype html><html><head><meta charset="utf-8"><title>OA Analysis — ${esc(pubNum)}</title>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:780px;margin:20px auto;padding:0 20px;color:#1a1a2e;line-height:1.55}h1{margin-top:0}h2{border-bottom:1px solid #e0e0e0;padding-bottom:4px;margin-top:24px}@media print{body{margin:10mm}}</style>
+</head><body>${body}</body></html>`;
+}
+
 export default function Portfolio() {
   const isMobile  = useIsMobile();
   const navigate  = useNavigate();
@@ -434,6 +526,31 @@ export default function Portfolio() {
     }
   }
 
+  function handlePrintAnalysis() {
+    // Open a new window containing a printable version of the analysis.
+    if (!aiResult || aiResult.error) return;
+    const w = window.open("", "_blank", "width=900,height=1000");
+    if (!w) return;
+    const h = renderAnalysisPrintable(aiResult, aiPanel?.pubNum || "");
+    w.document.write(h);
+    w.document.close();
+    setTimeout(() => w.print(), 400);
+  }
+
+  function handleDownloadAnalysisMarkdown() {
+    if (!aiResult || aiResult.error) return;
+    const md = renderAnalysisMarkdown(aiResult, aiPanel?.pubNum || "");
+    const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `OA-analysis-${aiPanel?.pubNum || "patent"}.md`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
   async function handleRefreshAi() {
     if (!aiPanel) return;
     setAiResult(null);
@@ -543,7 +660,29 @@ export default function Portfolio() {
               <div style={aiStyles.header}>
                 <h3 style={aiStyles.title}>Office Action Analysis</h3>
                 <span style={aiStyles.subtitle}>{aiPanel.pubNum}</span>
-                <button style={aiStyles.closeBtn} onClick={() => { setAiPanel(null); setAiResult(null); setAiError(""); }}>✕</button>
+                <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
+                  {aiResult && !aiResult.error && (
+                    <>
+                      <button
+                        style={{ padding: "6px 10px", borderRadius: 6, background: "#f0f4f8",
+                                 border: "1px solid #d0d7de", cursor: "pointer", fontSize: 12, fontWeight: 600 }}
+                        onClick={() => handlePrintAnalysis()}
+                        title="Print this analysis (or Save as PDF via print dialog)"
+                      >
+                        🖨 Print / Save PDF
+                      </button>
+                      <button
+                        style={{ padding: "6px 10px", borderRadius: 6, background: "#f0f4f8",
+                                 border: "1px solid #d0d7de", cursor: "pointer", fontSize: 12, fontWeight: 600 }}
+                        onClick={() => handleDownloadAnalysisMarkdown()}
+                        title="Download the analysis as a Markdown file"
+                      >
+                        ⬇️ Save .md
+                      </button>
+                    </>
+                  )}
+                  <button style={aiStyles.closeBtn} onClick={() => { setAiPanel(null); setAiResult(null); setAiError(""); }}>✕</button>
+                </div>
               </div>
               {aiLoading && (
                 <div style={aiStyles.loadingWrap}>

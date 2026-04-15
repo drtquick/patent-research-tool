@@ -85,9 +85,20 @@ export default function DocumentsPanel({
   const [isDragging,   setIsDragging]  = useState(false);
   const fileInputRef = useRef(null);
 
-  // Derived: which files show in the Files tab
+  // Derived: which files show in the Files tab. Match on pub_num OR app_num
+  // since analyze-oa may have saved files under the app number when the tile
+  // was still a stub, or vice-versa after a fresh scrape upgraded pub_num.
+  const tileAppDigits = (usAppNum || "").replace(/\D/g, "");
   const visibleFiles = isTileView
-    ? allFiles.filter((f) => f.tile_pub_num === tilePubNum)
+    ? allFiles.filter((f) => {
+        if (f.tile_pub_num === tilePubNum) return true;
+        if (f.tile_app_num && tileAppDigits && f.tile_app_num === tileAppDigits) return true;
+        // Files saved with the earlier stub form (e.g. "US18131547") still
+        // match if their trailing digits equal the tile's app_num.
+        if (f.tile_pub_num && tileAppDigits &&
+            f.tile_pub_num.replace(/\D/g, "").endsWith(tileAppDigits)) return true;
+        return false;
+      })
     : allFiles;
 
   // ── Loaders ────────────────────────────────────────────────────────────

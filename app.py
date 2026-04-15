@@ -129,6 +129,32 @@ def _annotate_ai_deadlines(family_details: list, request_uid: str | None = None)
         except Exception:
             cache_ref = None
 
+    import re as _re
+    from datetime import date as _dt
+
+    def _would_be_abandoned(m: dict) -> bool:
+        """Mirror the abandoned/lapsed categorization from generate_dashboard_html."""
+        app = _re.sub(r"[^\d]", "", (m.get("app_num") or ""))
+        # Expired US provisional (60/61/62/63 prefix, >12 months old)
+        if _re.match(r"^(60|61|62|63)", app):
+            fd = m.get("filing_date") or ""
+            try:
+                if (_dt.today() - _dt.fromisoformat(fd[:10])).days >= 365:
+                    return True
+            except Exception:
+                pass
+        # PCT (WO) pending past 30 months
+        pub = (m.get("pub_num") or "").upper()
+        if pub.startswith("WO"):
+            fd = m.get("filing_date") or ""
+            try:
+                d = _dt.fromisoformat(fd[:10])
+                if (_dt.today().year - d.year) * 12 + (_dt.today().month - d.month) >= 30:
+                    return True
+            except Exception:
+                pass
+        return False
+
     ai = None
     for m in family_details:
         if m.get("country") != "US" and not m.get("pub_num", "").startswith("US"):
@@ -136,6 +162,10 @@ def _annotate_ai_deadlines(family_details: list, request_uid: str | None = None)
         if m.get("status") not in ("pending", "unknown"):
             continue
         if m.get("data_not_available"):
+            continue
+        # Don't spend tokens on tiles that will end up in Abandoned & Lapsed —
+        # no response due is implied for those.
+        if _would_be_abandoned(m):
             continue
 
         key = _ai_deadline_cache_key(m)
@@ -1922,7 +1952,7 @@ def _download_oa_text(member: dict) -> tuple[str, dict | None]:
         return "", None
 
     print(f"  Analyze OA: downloading {oa_doc.get('code')} {oa_doc.get('date')} "
-          f"{oa_doc.get('download_url','')[:80]}")
+          f"{oa_doc.get('download_url','')[:80]}", flush=True)
     try:
         resp = _rq.get(
             oa_doc["download_url"],
@@ -2066,8 +2096,13 @@ def _attach_prior_art_to_tile(result: dict, uid: str, portfolio_id: str,
             blob.upload_from_string(pdf, content_type="application/pdf")
             from datetime import timedelta as _td
             url = blob.generate_signed_url(expiration=_td(hours=24), method="GET")
-            # Add portfolio_files entry so the tile's Files button surfaces it
+            # Add portfolio_files entry so the tile's Files button surfaces it.
+            # Save BOTH tile_pub_num and tile_app_num so the Files panel can
+            # match even if the tile's pub_num was later upgraded.
             try:
+                # Derive the app_num of the tile this analysis was run from
+                _tile_ref, _tile_member = _find_family_member(portfolio_id, pub_num)
+                _tile_app = (_tile_member or {}).get("app_num", "") if _tile_member else ""
                 (
                     db.collection("users").document(uid)
                       .collection("portfolios").document(portfolio_id)
@@ -2076,8 +2111,9 @@ def _attach_prior_art_to_tile(result: dict, uid: str, portfolio_id: str,
                           "name":          f"{pnum}.pdf",
                           "type":          "prior_art",
                           "tile_pub_num":  pub_num,
+                          "tile_app_num":  _tile_app,
                           "storage_path":  storage_path,
-                          "signed_url":    url,
+                          "download_url":  url,
                           "reference":     ref,
                           "source_pub":    pnum,
                           "uploaded_at":   datetime.now(timezone.utc),
@@ -2155,6 +2191,28 @@ def ai_analyze_oa():
         pdf_url = _upload_oa_pdf(
             pdf_bytes, request.uid, portfolio_id, pub_num, oa_doc
         )
+        # Also write a portfolio_files record scoped to this tile so the OA
+        # PDF appears under the tile's Files button.
+        if pdf_url:
+            try:
+                _oa_name = (
+                    f"OA_{(oa_doc.get('date') or '').replace('-','')}"
+                    f"_{(oa_doc.get('code') or 'OA')}.pdf"
+                )
+                db.collection("users").document(request.uid) \
+                  .collection("portfolios").document(portfolio_id) \
+                  .collection("files").add({
+                      "name":          _oa_name,
+                      "type":          "office_action",
+                      "tile_pub_num":  pub_num,
+                      "tile_app_num":  (member or {}).get("app_num", ""),
+                      "download_url":  pdf_url,
+                      "oa_date":       oa_doc.get("date", ""),
+                      "oa_code":       oa_doc.get("code", ""),
+                      "uploaded_at":   datetime.now(timezone.utc),
+                  })
+            except Exception as exc:
+                print(f"  Analyze OA: file record save failed: {exc}", flush=True)
 
     try:
         ai = PatentAI()
