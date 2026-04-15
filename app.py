@@ -1911,8 +1911,12 @@ def _download_oa_text(member: dict) -> tuple[str, dict | None]:
         None,
     )
     if not oa_doc:
+        _codes = sorted({(d.get("code") or "").upper() for d in oa_docs})
+        print(f"  Analyze OA: no matching OA in {len(oa_docs)} docs. Codes seen: {_codes[:20]}")
         return "", None
 
+    print(f"  Analyze OA: downloading {oa_doc.get('code')} {oa_doc.get('date')} "
+          f"{oa_doc.get('download_url','')[:80]}")
     try:
         resp = _rq.get(
             oa_doc["download_url"],
@@ -1921,18 +1925,24 @@ def _download_oa_text(member: dict) -> tuple[str, dict | None]:
         )
         resp.raise_for_status()
         pdf_bytes = resp.content
+        print(f"  Analyze OA: PDF downloaded — {len(pdf_bytes)} bytes")
     except Exception as exc:
-        print(f"  OA PDF download failed: {exc}")
+        print(f"  Analyze OA: download failed: {exc}")
         return "", oa_doc
+
+    # Attach bytes to the doc meta so callers can save or send to Claude directly
+    oa_doc["_pdf_bytes"] = pdf_bytes
 
     # Extract text with pypdf (lightweight, pure-python)
     try:
         from pypdf import PdfReader
         reader = PdfReader(_io.BytesIO(pdf_bytes))
         text   = "\n".join((page.extract_text() or "") for page in reader.pages)
-        return text.strip(), oa_doc
+        text = text.strip()
+        print(f"  Analyze OA: pypdf extracted {len(text)} chars from {len(reader.pages)} pages")
+        return text, oa_doc
     except Exception as exc:
-        print(f"  OA PDF text extraction failed: {exc}")
+        print(f"  Analyze OA: pypdf extraction failed: {exc}")
         return "", oa_doc
 
 
@@ -1975,11 +1985,37 @@ def ai_analyze():
         return jsonify({"error": f"AI analysis failed: {exc}"}), 500
 
 
+def _upload_oa_pdf(pdf_bytes: bytes, uid: str, portfolio_id: str,
+                   pub_num: str, oa_doc: dict) -> str:
+    """
+    Save the office-action PDF to Firebase default Storage bucket and return
+    a signed URL valid for 24 hours. Returns empty string on any failure.
+    """
+    try:
+        from google.cloud import storage as _gcs
+        client = _gcs.Client(project="patent-research-tool")
+        bucket = client.bucket("patent-research-tool.appspot.com")
+        safe_pub = pub_num.replace("/", "_")
+        code     = (oa_doc.get("code") or "OA").upper()
+        date     = (oa_doc.get("date") or "").replace("-", "")
+        path     = f"users/{uid}/oa_pdfs/{portfolio_id}/{safe_pub}__{date}_{code}.pdf"
+        blob = bucket.blob(path)
+        blob.upload_from_string(pdf_bytes, content_type="application/pdf")
+        from datetime import timedelta as _td
+        url = blob.generate_signed_url(expiration=_td(hours=24), method="GET")
+        return url
+    except Exception as exc:
+        print(f"  Analyze OA: storage upload failed: {exc}")
+        return ""
+
+
 @app.route("/api/ai/analyze-oa", methods=["POST"])
 @require_auth
 def ai_analyze_oa():
     """
-    Download the most recent office action, extract text, run Claude's OA schema.
+    Download the most recent office action, try text extraction, fall back to
+    sending the PDF directly to Claude for scanned docs, and save the PDF to
+    Cloud Storage with a signed URL returned alongside the analysis.
     Body: { "portfolio_id": "...", "pub_num": "..." }
     """
     body = request.get_json(silent=True) or {}
@@ -1998,21 +2034,44 @@ def ai_analyze_oa():
         return jsonify({"error": "portfolio or family member not found"}), 404
 
     oa_text, oa_doc = _download_oa_text(member)
-    if not oa_text:
+    if oa_doc is None:
         return jsonify({"error": "No office action PDF available for analysis"}), 404
 
+    pdf_bytes = oa_doc.get("_pdf_bytes") or b""
+    pdf_url   = ""
+    if pdf_bytes:
+        pdf_url = _upload_oa_pdf(
+            pdf_bytes, request.uid, portfolio_id, pub_num, oa_doc
+        )
+
     try:
-        ai     = PatentAI()
-        result = ai.analyze_office_action(member, oa_text, oa_doc)
+        ai = PatentAI()
+        if oa_text and len(oa_text) > 200:
+            print(f"  Analyze OA: using text-mode analysis ({len(oa_text)} chars)")
+            result = ai.analyze_office_action(member, oa_text, oa_doc)
+        elif pdf_bytes:
+            print(f"  Analyze OA: pypdf extract empty — using PDF-direct mode")
+            result = ai.analyze_office_action_pdf(member, pdf_bytes, oa_doc)
+        else:
+            return jsonify({"error": "OA PDF download failed"}), 502
+
+        # Attach convenience fields to the result
+        if pdf_url:
+            result["pdf_url"]      = pdf_url
+            result["pdf_filename"] = f"{pub_num}_{(oa_doc.get('date') or '').replace('-','')}_{(oa_doc.get('code') or 'OA')}.pdf"
+        result["oa_code"] = oa_doc.get("code", "")
+        result["oa_date"] = oa_doc.get("date", "")
+
         doc_id = pub_num.replace("/", "_")
         port_ref.collection("ai_analysis").document(f"{doc_id}__oa").set({
-            **result,
+            **{k: v for k, v in result.items() if k != "_pdf_bytes"},
             "analyzed_at": datetime.now(timezone.utc),
             "pub_num":     pub_num,
             "kind":        "office_action",
-            "oa_code":     (oa_doc or {}).get("code", ""),
-            "oa_date":     (oa_doc or {}).get("date", ""),
         })
+        # Don't leak bytes in the JSON response
+        if isinstance(oa_doc, dict):
+            oa_doc.pop("_pdf_bytes", None)
         return jsonify(result)
     except Exception as exc:
         traceback.print_exc()

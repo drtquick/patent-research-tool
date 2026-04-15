@@ -333,6 +333,78 @@ the attorney's attention, prioritized by urgency.
 
         return self._call_claude(SYSTEM_PROMPT_PORTFOLIO, user_message)
 
+    def analyze_office_action_pdf(self, member_data: dict, pdf_bytes: bytes,
+                                  oa_doc_info: Optional[dict] = None) -> dict:
+        """
+        Same as analyze_office_action but feeds the PDF directly to Claude via
+        the document content block. Used when pypdf can't extract text (scanned
+        PDFs, encrypted PDFs, etc.). Claude reads the image pages natively.
+        """
+        import base64 as _b64
+        pdf_b64 = _b64.b64encode(pdf_bytes).decode("ascii")
+
+        header = [
+            f"=== Patent Application: {member_data.get('pub_num','Unknown')} ===",
+            f"Application Number: {member_data.get('app_num','N/A')}",
+            f"Title: {member_data.get('title','') or member_data.get('member_title','')}",
+            f"Status: {member_data.get('status','unknown')}",
+            f"Filing Date: {member_data.get('filing_date','N/A')}",
+        ]
+        if oa_doc_info:
+            header += [
+                f"Office Action Date: {oa_doc_info.get('date','Unknown')}",
+                f"Document Type: {oa_doc_info.get('description','Unknown')}",
+                f"Document Code: {oa_doc_info.get('code','Unknown')}",
+            ]
+        header.append(f"Today's date: {datetime.now().strftime('%Y-%m-%d')}")
+        ctx = "\n".join(header)
+
+        user_blocks = [
+            {
+                "type": "document",
+                "source": {
+                    "type":       "base64",
+                    "media_type": "application/pdf",
+                    "data":       pdf_b64,
+                },
+            },
+            {
+                "type": "text",
+                "text": (
+                    f"The attached PDF is the referenced office action.\n\n{ctx}\n\n"
+                    "Analyze it in detail — extract every rejection, cited prior art "
+                    "reference, and response strategy.\n\n"
+                    f"{ANALYZE_OA_SCHEMA_INSTRUCTIONS}"
+                ),
+            },
+        ]
+        try:
+            response = self.client.messages.create(
+                model=self.MODEL,
+                max_tokens=6000,
+                system=SYSTEM_PROMPT_ANALYZE_OA,
+                messages=[{"role": "user", "content": user_blocks}],
+            )
+            raw_text = response.content[0].text.strip()
+            if raw_text.startswith("```"):
+                lines = raw_text.split("\n")
+                raw_text = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
+                raw_text = raw_text.strip()
+            result = json.loads(raw_text)
+            result["_ai_meta"] = {
+                "model":         self.MODEL,
+                "input_tokens":  response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+                "source":        "pdf-direct",
+                "timestamp":     datetime.now(timezone.utc).isoformat(),
+            }
+            return result
+        except json.JSONDecodeError as e:
+            return {"error": f"JSON parse error: {e}",
+                    "raw_response": (raw_text[:2000] if 'raw_text' in dir() else "")}
+        except anthropic.APIError as e:
+            return {"error": f"Claude API error: {e}"}
+
     def analyze_office_action(self, member_data: dict, oa_text: str,
                               oa_doc_info: Optional[dict] = None) -> dict:
         """

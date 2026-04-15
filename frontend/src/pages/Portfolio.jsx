@@ -560,8 +560,8 @@ export default function Portfolio() {
               )}
               {aiResult && (
                 <div style={aiStyles.resultWrap}>
-                  {/* OA Type + Deadlines */}
-                  <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 16 }}>
+                  {/* OA Type + Deadlines + PDF */}
+                  <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 16, alignItems: "center" }}>
                     {aiResult.oa_type && (
                       <span style={{ ...aiStyles.urgencyTag, background: "#e3f2fd", color: "#1565c0", fontSize: 12, padding: "4px 12px" }}>
                         {aiResult.oa_type.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase())}
@@ -569,6 +569,19 @@ export default function Portfolio() {
                     )}
                     {aiResult.mailing_date && (
                       <span style={{ fontSize: 12, color: "#666", alignSelf: "center" }}>Mailed: {aiResult.mailing_date}</span>
+                    )}
+                    {aiResult.pdf_url && (
+                      <a
+                        href={aiResult.pdf_url}
+                        target="_blank"
+                        rel="noopener"
+                        download={aiResult.pdf_filename || "office-action.pdf"}
+                        style={{ marginLeft: "auto", padding: "6px 12px", borderRadius: 6,
+                                 background: "#1a73e8", color: "#fff", textDecoration: "none",
+                                 fontSize: 13, fontWeight: 600 }}
+                      >
+                        📄 Download OA PDF
+                      </a>
                     )}
                   </div>
                   {(aiResult.response_deadline_short || aiResult.response_deadline_extended) && (
