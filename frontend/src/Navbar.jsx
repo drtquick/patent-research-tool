@@ -129,7 +129,7 @@ export default function Navbar() {
     return (
       <>
         <nav style={s.navMobile}>
-          <button style={s.brandBtn} onClick={() => navigate("/portfolio")}>PatentQ<span style={s.version}>β 1.31</span></button>
+          <button style={s.brandBtn} onClick={() => navigate("/portfolio")}>PatentQ<span style={s.version}>β 1.32</span></button>
 
           <div style={{ ...s.searchFormMobile, position: "relative" }}>
             <form onSubmit={handleSearch} style={{ display: "flex", gap: 4, flex: 1 }}>
@@ -171,7 +171,7 @@ export default function Navbar() {
   /* ── Desktop layout ─────────────────────────────────── */
   return (
     <nav style={s.nav}>
-      <button style={s.brandBtn} onClick={() => navigate("/portfolio")}>PatentQ<span style={s.version}>β 1.31</span></button>
+      <button style={s.brandBtn} onClick={() => navigate("/portfolio")}>PatentQ<span style={s.version}>β 1.32</span></button>
 
       <div style={{ position: "relative", flex: 1, maxWidth: 520, minWidth: 220 }}>
         <form onSubmit={handleSearch} style={s.searchForm}>

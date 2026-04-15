@@ -2677,15 +2677,47 @@ def _get_next_deadline(m: dict) -> dict | None:
     code   = country_code(m["pub_num"])
     status = m.get("status", "unknown")
 
-    # Pending: office action / prosecution response deadline. When we can't
-    # identify an outstanding action (app is docketed, awaiting examiner,
-    # already responded, etc.), return an explicit "No response due"
-    # sentinel so the tile can still show a banner rather than going blank.
+    # Pending: office action / prosecution response deadline.
+    # Priority:
+    #   1. Claude-powered analysis (m["ai_deadline"]) — smartest path, looks
+    #      at the full event + IFW history and covers OA responses, issue
+    #      fees, missing parts, formal drawings, oath, appeal briefs, etc.
+    #   2. Deterministic OA rules (_pending_app_deadline) — fast fallback
+    #      when AI is unavailable or errored.
+    #   3. If neither knows anything, leave the tile without a banner so we
+    #      don't claim "No response due" unverified.
     if status in ("pending", "unknown"):
+        ai = m.get("ai_deadline") or {}
+        if ai and not ai.get("error"):
+            _type  = (ai.get("type") or "other").lower()
+            _label = (ai.get("label") or "").strip()
+            _date  = (ai.get("date")  or "").strip()
+            _reason = (ai.get("reasoning") or "").strip()
+            if ai.get("action_required") is False or _type == "none":
+                return {
+                    "label":     _label or "No response due",
+                    "date":      "",
+                    "type":      "none",
+                    "reasoning": _reason,
+                    "source":    "ai",
+                }
+            if _label:
+                # Map AI type to the render-time banner type
+                rtype = "response" if _type in ("response", "appeal", "missing_parts") else (
+                    "fee" if _type == "fee" else "other"
+                )
+                return {
+                    "label":     _label,
+                    "date":      _date,
+                    "type":      rtype,
+                    "reasoning": _reason,
+                    "source":    "ai",
+                }
+
         label, iso = _pending_app_deadline(m)
         if label:
-            return {"label": label, "date": iso, "type": "response"}
-        return {"label": "No response due", "date": "", "type": "none"}
+            return {"label": label, "date": iso, "type": "response", "source": "rules"}
+        return None
 
     # Granted US: next unpaid maintenance fee
     if code == "US" and status == "granted":
@@ -2803,12 +2835,20 @@ def _render_card(m: dict) -> str:
             except Exception:
                 pass
         icon = ("&#9989;" if dl_type == "none"
-                else ("&#128203;" if dl_type == "response" else "&#128197;"))
+                else ("&#128203;" if dl_type == "response"
+                      else ("&#128182;" if dl_type == "fee" else "&#128197;")))
         _hdr = "Status" if dl_type == "none" else "Next deadline"
+        _reason = (next_dl.get("reasoning") or "").replace('"', "'")
+        _src    = next_dl.get("source", "")
+        _badge  = (
+            f'<span class="ai-badge" title="{_reason}">AI</span>'
+            if _src == "ai" else ""
+        )
         next_deadline_html = (
             f'<div class="next-deadline" style="'
-            f'background:{bg};color:{fg};border:1px solid {bdr}">'
-            f'{icon} <strong>{_hdr}:</strong> {dl_label}'
+            f'background:{bg};color:{fg};border:1px solid {bdr}" '
+            f'title="{_reason}">'
+            f'{icon} <strong>{_hdr}:</strong> {dl_label} {_badge}'
             f'</div>'
         )
 
@@ -3577,6 +3617,12 @@ def generate_dashboard_html(
       align-items:center; line-height:1.2;
     }}
     .tile-ifw-btn:hover {{ background:#ffedd5; }}
+    .ai-badge {{
+      display:inline-block; margin-left:6px; padding:1px 6px;
+      background:#8b5cf6; color:#fff; border-radius:10px;
+      font-size:.62rem; font-weight:700; letter-spacing:.04em;
+      vertical-align:middle; cursor:help;
+    }}
     .data-unavail {{
       margin: .55rem 0 .35rem; padding: .6rem .8rem;
       background: #fffbeb; border: 1px solid #fde68a; border-radius: 6px;

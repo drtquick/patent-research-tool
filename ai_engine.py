@@ -215,6 +215,80 @@ class PatentAI:
 
     # ── Public methods ────────────────────────────────────────────────────────
 
+    def analyze_next_deadline(self, member_data: dict) -> dict:
+        """
+        Determine the single most important upcoming action/deadline for a
+        pending US application based on its full file history (ODP events
+        + IFW documents). This is the smart deadline that replaces simple
+        "last event" heuristics.
+
+        Returns a dict with:
+            { "label": str, "date": "YYYY-MM-DD" or "",
+              "type":  "response" | "fee" | "other" | "none",
+              "confidence": "high" | "medium" | "low",
+              "reasoning": str,
+              "action_required": bool }
+        """
+        today = datetime.now().strftime("%Y-%m-%d")
+        app_num    = member_data.get("app_num", "")
+        pub_num    = member_data.get("pub_num", "")
+        status     = member_data.get("status", "unknown")
+        filing     = member_data.get("filing_date", "")
+        grant      = member_data.get("grant_date", "") or ""
+        events     = member_data.get("events", []) or []
+        oa_docs    = member_data.get("oa_documents", []) or []
+
+        # Compact context — keep token usage modest
+        lines = [
+            f"Today: {today}",
+            f"Application: {app_num}  Publication: {pub_num}",
+            f"Status: {status}   Filed: {filing}   Grant: {grant or 'n/a'}",
+            "",
+            "Events (chronological, most-recent last):",
+        ]
+        for ev in events[-40:]:
+            lines.append(
+                f"  {ev.get('date','')} [{ev.get('code','')}] "
+                f"{(ev.get('title') or ev.get('value') or '').strip()}"
+            )
+        if oa_docs:
+            lines.append("")
+            lines.append("IFW documents (newest first):")
+            for d in oa_docs[:25]:
+                lines.append(
+                    f"  {d.get('date','')} [{d.get('code','')}] "
+                    f"{d.get('description','')}  "
+                    f"({d.get('direction','')})"
+                )
+        context = "\n".join(lines)
+
+        schema = """
+Respond with ONE JSON object and nothing else:
+
+{
+  "action_required": true | false,
+  "label": "short one-line description (e.g. 'Response to Non-Final Office Action due October 15, 2026 (extendable to January 15, 2027)')",
+  "date":  "YYYY-MM-DD of the earliest statutory deadline, or empty string if none",
+  "type":  "response" | "fee" | "missing_parts" | "appeal" | "other" | "none",
+  "confidence": "high" | "medium" | "low",
+  "reasoning": "one or two sentences explaining which event triggered this deadline and any key assumptions"
+}
+
+Rules:
+- Any applicant-facing deadline counts: OA responses, issue-fee payment, missing parts, inventor oath, formal drawings, appeal / reply brief, response to restriction, pre-appeal decision follow-up, Rule 312 amendment windows, etc.
+- A later-filed response extinguishes a prior OA deadline — if the applicant has already responded, that OA is not the open deadline.
+- Use statutory periods: non-final = 3 months (extendable to 6); final = 3 months (extendable to 6); restriction/missing parts/Quayle = 2 months (extendable to 5 when allowed); issue fee = 3 months non-extendable.
+- If the applicant is waiting on the examiner and no applicant action is currently due, set action_required=false and type="none" with label "No response due".
+- Only output "No response due" when you're confident no applicant action is outstanding based on the history you've been given.
+""".strip()
+
+        user_message = (
+            "Analyze this US application's file history and identify the single "
+            "most imminent applicant deadline or action.\n\n"
+            f"{context}\n\n{schema}"
+        )
+        return self._call_claude(SYSTEM_PROMPT_ANALYZE, user_message, max_tokens=700)
+
     def analyze_prosecution(self, member_data: dict, oa_text: Optional[str] = None) -> dict:
         """
         Analyze the prosecution history of a single patent family member.

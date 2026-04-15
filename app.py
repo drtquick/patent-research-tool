@@ -85,6 +85,106 @@ def require_auth(f):
     return wrapper
 
 
+# ── AI deadline annotator ────────────────────────────────────────────────────
+
+def _ai_deadline_cache_key(member: dict) -> str:
+    """
+    Stable hash of a pending app's event state — changes whenever a new event
+    or OA document arrives, invalidating the cached Claude result.
+    """
+    import hashlib as _hl
+    app_num = (member.get("app_num") or "").strip()
+    parts = [app_num, member.get("status", "")]
+    for ev in (member.get("events") or [])[-40:]:
+        parts.append(f"{ev.get('date','')}|{ev.get('code','')}|{(ev.get('title') or '')[:60]}")
+    for d in (member.get("oa_documents") or [])[:25]:
+        parts.append(f"{d.get('date','')}|{d.get('code','')}")
+    return _hl.sha1("::".join(parts).encode()).hexdigest()[:24]
+
+
+def _annotate_ai_deadlines(family_details: list, request_uid: str | None = None) -> None:
+    """
+    For every pending US family member, call Claude to compute the smart
+    next-deadline based on the full file history and attach it to the member
+    as `ai_deadline`. Cached in Firestore under
+    users/{uid}/ai_deadline_cache/{app_num}__{event_hash} so repeat scrapes
+    don't re-spend tokens on unchanged histories.
+
+    Non-fatal: any AI error leaves ai_deadline unset; the tile renderer then
+    falls back to the deterministic rule set.
+    """
+    if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        return
+    try:
+        from ai_engine import PatentAI
+    except Exception as exc:
+        print(f"  ai_deadline: import failed ({exc})")
+        return
+
+    cache_ref = None
+    if request_uid:
+        try:
+            cache_ref = db.collection("users").document(request_uid) \
+                         .collection("ai_deadline_cache")
+        except Exception:
+            cache_ref = None
+
+    ai = None
+    for m in family_details:
+        if m.get("country") != "US" and not m.get("pub_num", "").startswith("US"):
+            continue
+        if m.get("status") not in ("pending", "unknown"):
+            continue
+        if m.get("data_not_available"):
+            continue
+
+        key = _ai_deadline_cache_key(m)
+        app_num = (m.get("app_num") or "").strip()
+        if not app_num:
+            continue
+        cache_id = f"{app_num}__{key}"
+
+        # Cache hit?
+        if cache_ref is not None:
+            try:
+                snap = cache_ref.document(cache_id).get()
+                if snap.exists:
+                    cached = snap.to_dict() or {}
+                    m["ai_deadline"] = cached.get("result") or cached
+                    continue
+            except Exception:
+                pass
+
+        if ai is None:
+            try:
+                ai = PatentAI()
+            except Exception as exc:
+                print(f"  ai_deadline: PatentAI init failed ({exc})")
+                return
+
+        try:
+            result = ai.analyze_next_deadline(m)
+        except Exception as exc:
+            print(f"  ai_deadline {app_num}: call failed ({exc})")
+            continue
+
+        if not result or result.get("error"):
+            print(f"  ai_deadline {app_num}: {result.get('error','no result') if result else 'no result'}")
+            continue
+
+        m["ai_deadline"] = result
+        if cache_ref is not None:
+            try:
+                cache_ref.document(cache_id).set({
+                    "result":     result,
+                    "app_num":    app_num,
+                    "event_hash": key,
+                    "cached_at":  datetime.now(timezone.utc),
+                })
+            except Exception:
+                pass
+
+
 # ── Core search logic ─────────────────────────────────────────────────────────
 
 def _is_us_app_num(raw: str) -> bool:
@@ -355,6 +455,9 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
                     queue.append((rel_app, rel.get("app_raw", "")))
 
         print(f"  ODP continuity BFS: +{len(extras)} US member(s)")
+
+    # ── AI deadline analysis for every pending US member ────────────────────
+    _annotate_ai_deadlines(family_details, request_uid=getattr(request, "uid", None))
 
     # ── Build summaries + dashboard from (possibly enriched) family ──────────
     dashboard_html = tracker.generate_dashboard_html(
@@ -727,6 +830,9 @@ def _run_search(patent_input: str, search_type: str = "auto") -> dict:
                 "google_app": "",
                 "note":       sd["note"],
             })
+
+    # ── AI deadline analysis for every pending US member ────────────────────
+    _annotate_ai_deadlines(family_details, request_uid=getattr(request, "uid", None))
 
     dashboard_html = tracker.generate_dashboard_html(
         metas, family_details, url, patent_input, claims,
