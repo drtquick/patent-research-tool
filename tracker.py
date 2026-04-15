@@ -2547,14 +2547,34 @@ def _pending_app_deadline(m: dict) -> tuple[str, str]:
         return "", ""
 
     # (label, short_months, max_months) — short = without extension, max = with extension
+    # Keys are searched case-insensitively against event title and value fields.
     _OA_DEADLINES: dict[str, tuple[str, int, int]] = {
-        "NON FINAL ACTION MAILED":        ("Response to Non-Final Office Action", 3, 6),
-        "NON-FINAL ACTION MAILED":        ("Response to Non-Final Office Action", 3, 6),
-        "FINAL ACTION MAILED":            ("Response to Final Office Action", 2, 5),
-        "FINAL REJECTION MAILED":         ("Response to Final Rejection", 2, 5),
-        "RESTRICTION REQUIREMENT MAILED": ("Response to Restriction Requirement", 2, 5),
-        "NOTICE OF ALLOWANCE MAILED":     ("Issue fee payment", 3, 3),
-        "NOTICE OF ALLOWANCE":            ("Issue fee payment", 3, 3),
+        # Non-final office actions
+        "NON FINAL ACTION MAILED":           ("Response to Non-Final Office Action", 3, 6),
+        "NON-FINAL ACTION MAILED":           ("Response to Non-Final Office Action", 3, 6),
+        "NON-FINAL REJECTION":               ("Response to Non-Final Office Action", 3, 6),
+        "MISCELLANEOUS ACTION - NON-FINAL":  ("Response to Miscellaneous Non-Final Action", 3, 6),
+        "EX PARTE QUAYLE ACTION":            ("Response to Ex Parte Quayle Action", 2, 5),
+        # Final rejections
+        "FINAL ACTION MAILED":               ("Response to Final Office Action", 3, 6),
+        "FINAL REJECTION MAILED":            ("Response to Final Rejection", 3, 6),
+        "MISCELLANEOUS ACTION - FINAL":      ("Response to Miscellaneous Final Action", 3, 6),
+        # Restriction / election
+        "RESTRICTION REQUIREMENT MAILED":    ("Response to Restriction Requirement", 2, 5),
+        "ELECTION / RESTRICTION":            ("Response to Restriction Requirement", 2, 5),
+        # Advisory (post-final)
+        "ADVISORY ACTION MAILED":            ("Advisory Action response / Appeal deadline", 2, 5),
+        # Notice of Allowance: fee + formal drawings due in 3 months (non-extendable)
+        "NOTICE OF ALLOWANCE MAILED":        ("Issue fee payment", 3, 3),
+        "NOTICE OF ALLOWANCE":               ("Issue fee payment", 3, 3),
+        # Missing parts / formalities
+        "NOTICE TO FILE MISSING PARTS":      ("Response to Notice to File Missing Parts", 2, 5),
+        "NOTICE TO FILE CORRECTED":          ("Response to Notice to File Corrected Papers", 2, 5),
+        # Appeal
+        "EXAMINER'S ANSWER":                 ("Reply Brief (optional) / Oral Hearing Request", 2, 2),
+        "DECISION ON APPEAL":                ("Further action (RCE, continuation, or civil action)", 2, 2),
+        # Pre-appeal decision
+        "PRE-APPEAL BRIEF":                  ("Pre-Appeal Brief decision", 0, 0),
     }
 
     # Events that supersede an OA deadline when filed after it
@@ -2562,10 +2582,25 @@ def _pending_app_deadline(m: dict) -> tuple[str, str]:
         "RESPONSE AFTER",
         "RESPONSE TO NON-FINAL",
         "RESPONSE TO FINAL",
-        "AMENDMENT AFTER",
+        "RESPONSE AFTER FINAL",
+        "AMENDMENT AFTER NON-FINAL",
+        "AMENDMENT AFTER FINAL",
+        "AMENDMENT AFTER ALLOWANCE",
+        "AMENDMENT SUBMITTED/ENTERED",
         "REQUEST FOR CONTINUED EXAMINATION",
+        "RCE",
         "NOTICE OF APPEAL",
-        "REQUEST FOR EXAMINATION",
+        "PRE-APPEAL BRIEF REQUEST",
+        "APPEAL BRIEF",
+        "REPLY BRIEF",
+        "AFTER FINAL CONSIDERATION",
+        "AFCP",
+        "ELECTION AS TO SPECIES",
+        "RESPONSE TO ELECTION / RESTRICTION",
+        "RESPONSE TO RESTRICTION",
+        "RESPONSE TO NOTICE",
+        "PAYMENT OF ISSUE FEE",
+        "ISSUE FEE PAYMENT",
     )
 
     # Walk events newest-first and find the most recent OA-type event. If a
@@ -2642,12 +2677,15 @@ def _get_next_deadline(m: dict) -> dict | None:
     code   = country_code(m["pub_num"])
     status = m.get("status", "unknown")
 
-    # Pending: office action / prosecution response deadline
+    # Pending: office action / prosecution response deadline. When we can't
+    # identify an outstanding action (app is docketed, awaiting examiner,
+    # already responded, etc.), return an explicit "No response due"
+    # sentinel so the tile can still show a banner rather than going blank.
     if status in ("pending", "unknown"):
         label, iso = _pending_app_deadline(m)
         if label:
             return {"label": label, "date": iso, "type": "response"}
-        return None
+        return {"label": "No response due", "date": "", "type": "none"}
 
     # Granted US: next unpaid maintenance fee
     if code == "US" and status == "granted":
@@ -2750,7 +2788,9 @@ def _render_card(m: dict) -> str:
         dl_type  = next_dl["type"]
         # Urgency-aware color
         bg, fg, bdr = "#eff6ff", "#1e40af", "#bfdbfe"   # default: blue
-        if dl_date:
+        if dl_type == "none":
+            bg, fg, bdr = "#f3f4f6", "#4b5563", "#d1d5db"   # neutral gray
+        elif dl_date:
             try:
                 from datetime import date as _dt2
                 days_left = (_dt2.fromisoformat(dl_date) - _dt2.today()).days
@@ -2762,11 +2802,13 @@ def _render_card(m: dict) -> str:
                     bg, fg, bdr = "#fff7ed", "#c2410c", "#fed7aa"   # soon: orange
             except Exception:
                 pass
-        icon = "&#128203;" if dl_type == "response" else "&#128197;"
+        icon = ("&#9989;" if dl_type == "none"
+                else ("&#128203;" if dl_type == "response" else "&#128197;"))
+        _hdr = "Status" if dl_type == "none" else "Next deadline"
         next_deadline_html = (
             f'<div class="next-deadline" style="'
             f'background:{bg};color:{fg};border:1px solid {bdr}">'
-            f'{icon} <strong>Next deadline:</strong> {dl_label}'
+            f'{icon} <strong>{_hdr}:</strong> {dl_label}'
             f'</div>'
         )
 
