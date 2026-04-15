@@ -1159,8 +1159,11 @@ def fetch_us_member_via_odp(member: dict, api_key: str) -> dict | None:
             if resp.status_code in (404, 403):
                 # 404: not yet indexed in ODP (common for recent filings).
                 # 403: ODP rejects the app number format (e.g. bad digit count).
-                # Either way, return whatever EPO gave us without flagging an error.
-                print(f"  ODP {resp.status_code} — {app_num}; using EPO bibliographic data")
+                # Flag the tile so the renderer can show a clear "Data not
+                # yet available from USPTO ODP" notice instead of a blank tile.
+                print(f"  ODP {resp.status_code} — {app_num}; marking data-not-available")
+                result["data_not_available"] = True
+                result["fetch_error"] = f"ODP {resp.status_code}"
                 return result
             resp.raise_for_status()
             break
@@ -2538,9 +2541,6 @@ def _pending_app_deadline(m: dict) -> tuple[str, str]:
     events = m.get("events", [])
     if not events:
         return "", ""
-    last_ev   = events[-1]
-    ev_title  = (last_ev.get("title") or last_ev.get("value") or "").upper()
-    date_str  = last_ev.get("date", "")
 
     # (label, short_months, max_months) — short = without extension, max = with extension
     _OA_DEADLINES: dict[str, tuple[str, int, int]] = {
@@ -2552,6 +2552,48 @@ def _pending_app_deadline(m: dict) -> tuple[str, str]:
         "NOTICE OF ALLOWANCE MAILED":     ("Issue fee payment", 3, 3),
         "NOTICE OF ALLOWANCE":            ("Issue fee payment", 3, 3),
     }
+
+    # Events that supersede an OA deadline when filed after it
+    _RESPONSE_EVENTS = (
+        "RESPONSE AFTER",
+        "RESPONSE TO NON-FINAL",
+        "RESPONSE TO FINAL",
+        "AMENDMENT AFTER",
+        "REQUEST FOR CONTINUED EXAMINATION",
+        "NOTICE OF APPEAL",
+        "REQUEST FOR EXAMINATION",
+    )
+
+    # Walk events newest-first and find the most recent OA-type event. If a
+    # response-type event dated later than an OA is found first, no deadline
+    # is outstanding — responding extinguished the deadline.
+    latest_oa: dict | None = None
+    latest_resp_date: str = ""
+    for ev in reversed(events):
+        t = (ev.get("title") or ev.get("value") or "").upper()
+        dt = ev.get("date", "") or ""
+        # Priority 1: response-type event invalidates any earlier OA deadline.
+        if any(rk in t for rk in _RESPONSE_EVENTS):
+            if dt > latest_resp_date:
+                latest_resp_date = dt
+            continue
+        # Priority 2: record the first OA-style event we encounter going back.
+        for key in _OA_DEADLINES:
+            if key in t:
+                if latest_oa is None or (dt > (latest_oa.get("date") or "")):
+                    latest_oa = {"title": t, "date": dt, "key": key}
+                break
+
+    # If the latest response came AFTER the latest OA, there is no open deadline
+    if latest_oa and latest_resp_date and latest_resp_date > (latest_oa.get("date") or ""):
+        latest_oa = None
+
+    if latest_oa:
+        ev_title = latest_oa["title"]
+        date_str = latest_oa["date"]
+    else:
+        return "", ""
+
     for key, (label, short_mo, max_mo) in _OA_DEADLINES.items():
         if key in ev_title:
             if date_str:
@@ -2927,6 +2969,34 @@ def _render_card(m: dict) -> str:
         f'&#128206; Files</button>'
     )
 
+    # "Full IFW on ODP" link — shown on every US tile (pending or granted) so
+    # the user can jump to the file wrapper regardless of whether ODP returned
+    # document metadata. Uses the cleaned 8-digit serial.
+    tile_ifw_html = ""
+    if code == "US":
+        _ifw_app = re.sub(r"[^\d]", "", app_num) if app_num else ""
+        if _ifw_app:
+            _ifw_url = (
+                f"https://data.uspto.gov/patent-file-wrapper/details/{_ifw_app}/documents"
+            )
+            tile_ifw_html = (
+                f'<a class="tile-ifw-btn" href="{_ifw_url}" target="_blank" rel="noopener">'
+                f'Full IFW on ODP &#8599;</a>'
+            )
+
+    # Data-not-available notice — for apps that ODP couldn't locate (typically
+    # brand-new continuations that haven't been indexed yet). Shown in place of
+    # the empty prosecution / fees block so the tile reads cleanly.
+    data_unavail_html = ""
+    if m.get("data_not_available"):
+        data_unavail_html = (
+            '<div class="data-unavail">'
+            '&#9888; <strong>Data not yet available</strong> — this application '
+            'has not been indexed by USPTO ODP (common for very recent filings). '
+            'The file wrapper link below will open in ODP once available.'
+            '</div>'
+        )
+
     # Analyze OA button — only for pending applications with an outstanding office
     # action awaiting response. Granted patents and pending apps with no open OA
     # (e.g. most recent event is a response we've already filed, or just a notice
@@ -2981,12 +3051,12 @@ def _render_card(m: dict) -> str:
         + action_bar_html
         # When ODP documents are present they already show the full prosecution record —
         # suppress the EPO/GP-derived rejection summary and history to avoid duplication.
-        + latest_html + maint_html + annuity_html + rej_html
+        + data_unavail_html + latest_html + maint_html + annuity_html + rej_html
         + (rej_summary_html if not m.get("oa_documents") else "")
         + oa_docs_html + err_html
         + (history_html if not m.get("oa_documents") else "")
         + notes_html
-        + f'<div class="tile-btn-row">{tile_files_html}</div>'
+        + f'<div class="tile-btn-row">{tile_files_html}{tile_ifw_html}</div>'
         + '</div>'
     )
 
@@ -3454,6 +3524,18 @@ def generate_dashboard_html(
       color:#1a1a2e; font-weight:600; display:inline-flex; align-items:center; gap:4px;
     }}
     .tile-files-btn:hover {{ background:#e2e8f0; }}
+    .tile-ifw-btn {{
+      padding:5px 10px; border-radius:6px; background:#fff7ed;
+      border:1px solid #fed7aa; color:#c2410c; font-size:.72rem;
+      font-weight:600; text-decoration:none; display:inline-flex;
+      align-items:center; line-height:1.2;
+    }}
+    .tile-ifw-btn:hover {{ background:#ffedd5; }}
+    .data-unavail {{
+      margin: .55rem 0 .35rem; padding: .6rem .8rem;
+      background: #fffbeb; border: 1px solid #fde68a; border-radius: 6px;
+      font-size: .78rem; color: #78350f; line-height: 1.45;
+    }}
     .tile-ai-btn {{
       padding:5px 12px; border-radius:6px; cursor:pointer;
       background:#ede7f6; border:1px solid #ce93d8; font-size:.75rem;

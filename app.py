@@ -266,6 +266,36 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
                         except Exception as exc:
                             print(f"  family merge skipped: {exc}")
 
+    # Build a PCT lookup so BFS can skip entries that already appear as WO
+    # tiles. EPO's WO member's app_num field carries the PCT international
+    # number (e.g. "US2020066580"); we normalize to its 10-digit serial here.
+    def _pct_core(raw: str) -> str:
+        import re as _re3
+        s = (raw or "").upper()
+        # strip PCT/ and separators
+        s = _re3.sub(r"^PCT[/\-_]?", "", s)
+        digits = _re3.sub(r"[^\d]", "", s)
+        return digits if len(digits) >= 10 else ""
+
+    pct_known: set = set()
+    for _m in family_details:
+        if tracker.country_code(_m.get("pub_num", "")) == "WO":
+            core = _pct_core(_m.get("app_num", ""))
+            if core:
+                pct_known.add(core)
+
+    def _is_pct_serial(app_clean: str) -> bool:
+        """10+ digits starting with 19xx or 20xx, or matches an existing WO tile."""
+        if not app_clean:
+            return False
+        if app_clean in pct_known:
+            return True
+        return (
+            len(app_clean) >= 10
+            and app_clean[:2] in ("19", "20")
+            and app_clean[:4].isdigit()
+        )
+
     # ── ODP-first continuity BFS: discover the full US family via ODP ────────
     # ODP is authoritative for US information. Starting from the primary US
     # application we just fetched, walk parent and child continuity links
@@ -285,6 +315,18 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
             if not cur or cur in visited:
                 continue
             visited.add(cur)
+
+            # PCT-style serial? Already represented by the WO tile from EPO;
+            # don't create a duplicate US tile for the US-RO administrative
+            # record. Still walk it to discover further continuity though.
+            if _is_pct_serial(cur):
+                rels = tracker.fetch_odp_continuity(cur, api_key)
+                print(f"    continuity {cur} (PCT, no tile): {len(rels)} link(s)")
+                for rel in rels:
+                    rel_app = rel.get("app_num", "")
+                    if rel_app and rel_app not in visited:
+                        queue.append(rel_app)
+                continue
 
             # Ensure this app is in family_details. If not, fetch via ODP.
             if cur not in known:
