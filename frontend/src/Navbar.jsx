@@ -129,7 +129,7 @@ export default function Navbar() {
     return (
       <>
         <nav style={s.navMobile}>
-          <button style={s.brandBtn} onClick={() => navigate("/portfolio")}>PatentQ<span style={s.version}>β 1.44</span></button>
+          <button style={s.brandBtn} onClick={() => navigate("/portfolio")}>PatentQ<span style={s.version}>β 1.45</span></button>
 
           <div style={{ ...s.searchFormMobile, position: "relative" }}>
             <form onSubmit={handleSearch} style={{ display: "flex", gap: 4, flex: 1 }}>
@@ -156,6 +156,7 @@ export default function Navbar() {
         {menuOpen && (
           <div style={s.mobileMenu}>
             <MobileNavLink to="/portfolio" onClick={closeMenu}>Portfolio</MobileNavLink>
+            <MobileNavLink to="/analytics" onClick={closeMenu}>Analytics</MobileNavLink>
             <MobileNavLink to="/alerts"    onClick={closeMenu}>Alerts</MobileNavLink>
             <MobileNavLink to="/settings"  onClick={closeMenu}>Settings</MobileNavLink>
             <div style={s.menuDivider} />
@@ -171,7 +172,7 @@ export default function Navbar() {
   /* ── Desktop layout ─────────────────────────────────── */
   return (
     <nav style={s.nav}>
-      <button style={s.brandBtn} onClick={() => navigate("/portfolio")}>PatentQ<span style={s.version}>β 1.44</span></button>
+      <button style={s.brandBtn} onClick={() => navigate("/portfolio")}>PatentQ<span style={s.version}>β 1.45</span></button>
 
       <div style={{ position: "relative", flex: 1, maxWidth: 520, minWidth: 220 }}>
         <form onSubmit={handleSearch} style={s.searchForm}>
@@ -192,6 +193,7 @@ export default function Navbar() {
 
       <div style={s.links}>
         <NavLink to="/portfolio" style={navStyle}>Portfolio</NavLink>
+        <NavLink to="/analytics" style={navStyle}>Analytics</NavLink>
         <NavLink to="/alerts"    style={navStyle}>Alerts</NavLink>
         <NavLink to="/settings"  style={navStyle}>Settings</NavLink>
       </div>

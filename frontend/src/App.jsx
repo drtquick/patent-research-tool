@@ -5,6 +5,7 @@ import Login from "./pages/Login";
 import Search from "./pages/Search";
 import Portfolio from "./pages/Portfolio";
 import Alerts from "./pages/Alerts";
+import Analytics from "./pages/Analytics";
 import Settings from "./pages/Settings";
 
 function AppRoutes() {
@@ -29,6 +30,7 @@ function AppRoutes() {
         <Route path="/search"    element={<Search />} />
         <Route path="/portfolio" element={<Portfolio />} />
         <Route path="/alerts"    element={<Alerts />} />
+        <Route path="/analytics" element={<Analytics />} />
         <Route path="/settings"  element={<Settings />} />
         <Route path="*"          element={<Navigate to="/portfolio" replace />} />
       </Routes>

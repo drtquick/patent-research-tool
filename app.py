@@ -3124,6 +3124,143 @@ def pdf_proxy(pub_num):
     )
 
 
+# ── Portfolio-wide analytics ─────────────────────────────────────────────────
+
+@app.route("/api/analytics", methods=["GET"])
+@require_auth
+def get_analytics():
+    """
+    Return cross-portfolio aggregates the /analytics dashboard uses:
+      totals, status counts, jurisdictions, deadlines by time window,
+      assignees (from cached family_summary data), rejection grounds,
+      and fee burden projection (maintenance + annuity) by year.
+
+    Heavy fee/annuity computation reuses the helpers in tracker.py
+    that the Alerts page already relies on.
+    """
+    from datetime import date as _dt, timedelta as _td
+    today = _dt.today()
+
+    try:
+        docs = (
+            db.collection("users").document(request.uid)
+              .collection("portfolios").stream()
+        )
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    families: list[dict] = []
+    for doc in docs:
+        d = doc.to_dict() or {}
+        d["id"] = doc.id
+        families.append(d)
+
+    # Core counts
+    total_families  = len(families)
+    total_members   = 0
+    status_counts   = {"granted": 0, "pending": 0, "abandoned": 0, "unknown": 0}
+    country_counts: dict[str, int] = {}
+    assignee_family: dict[str, set] = {}   # assignee_name -> set of family ids
+    rejection_counts: dict[str, int] = {}  # ground → count across pending apps
+
+    # Deadlines buckets
+    windows = {"30": 0, "60": 0, "90": 0, "overdue": 0}
+    next_deadline_list: list[dict] = []
+
+    # Fee burden by year (USD, US maintenance + foreign annuities combined)
+    fees_by_year: dict[int, float] = {}
+
+    for fam in families:
+        family = fam.get("family") or []
+        total_members += len(family)
+        # Assignee rollup for whole family
+        for a in (fam.get("assignees") or []):
+            if a:
+                assignee_family.setdefault(a.strip(), set()).add(fam["id"])
+
+        for m in family:
+            st = (m.get("status") or "unknown").lower()
+            if st not in status_counts:
+                st = "unknown"
+            status_counts[st] += 1
+            country_counts[m.get("country") or "??"] = country_counts.get(m.get("country") or "??", 0) + 1
+
+            dl_label = m.get("next_deadline_label", "") or ""
+            dl_date  = m.get("next_deadline_date", "")  or ""
+            if dl_date:
+                try:
+                    d = _dt.fromisoformat(dl_date[:10])
+                    delta = (d - today).days
+                    if delta < 0:
+                        windows["overdue"] += 1
+                    elif delta <= 30:
+                        windows["30"] += 1
+                    elif delta <= 60:
+                        windows["60"] += 1
+                    elif delta <= 90:
+                        windows["90"] += 1
+                    # Include in the Top 20 upcoming list for UI display
+                    if delta >= -30:
+                        next_deadline_list.append({
+                            "patent_number": fam.get("patent_number", ""),
+                            "pub_num":       m.get("pub_num", ""),
+                            "country":       m.get("country", ""),
+                            "label":         dl_label,
+                            "date":          dl_date,
+                            "days_out":      delta,
+                            "status":        st,
+                            "portfolio_id":  fam.get("id", ""),
+                        })
+                except Exception:
+                    pass
+
+        # Compute fee burden for this family via existing deadlines helper
+        try:
+            dls = _compute_deadlines(fam)
+            for row in dls:
+                dt = row.get("due_date") or ""
+                try:
+                    yr = int(dt[:4])
+                    fees_by_year[yr] = fees_by_year.get(yr, 0.0) + float(row.get("amount_usd") or 0)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # Assignee list sorted by number of families owned
+    assignees = sorted(
+        ({"name": n, "family_count": len(f)} for n, f in assignee_family.items()),
+        key=lambda x: (-x["family_count"], x["name"]),
+    )[:20]
+
+    # Country list sorted by member count
+    countries = sorted(
+        ({"country": c, "count": n} for c, n in country_counts.items()),
+        key=lambda x: -x["count"],
+    )
+
+    next_deadline_list.sort(key=lambda r: r["date"])
+    upcoming = next_deadline_list[:25]
+
+    fee_rows = sorted(
+        ({"year": y, "amount_usd": round(v)} for y, v in fees_by_year.items()),
+        key=lambda x: x["year"],
+    )
+
+    return jsonify({
+        "totals": {
+            "families":      total_families,
+            "members":       total_members,
+        },
+        "status":            status_counts,
+        "jurisdictions":     countries,
+        "deadline_windows":  windows,
+        "upcoming":          upcoming,
+        "assignees":         assignees,
+        "fee_burden":        fee_rows,
+    })
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

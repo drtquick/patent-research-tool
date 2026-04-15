@@ -93,6 +93,9 @@ export const api = {
   getPortfolioAssignments: (id) =>
     authFetch(`/api/portfolios/${id}/assignments`),
 
+  // Portfolio-wide analytics aggregates
+  getAnalytics: () => authFetch("/api/analytics"),
+
   // Family filing timeline + continuation graph
   getPortfolioTimeline: (id) =>
     authFetch(`/api/portfolios/${id}/timeline`),
