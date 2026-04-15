@@ -40,6 +40,7 @@ lines = [
     'USPTO_ODP_API_KEY: ' + yq(sys.argv[4]),
     'ANTHROPIC_API_KEY: ' + yq(sys.argv[5]),
     'FLASK_DEBUG: \"false\"',
+    'PYTHONUNBUFFERED: \"1\"',
 ]
 with open(sys.argv[6], 'w') as f:
     f.write('\n'.join(lines) + '\n')
