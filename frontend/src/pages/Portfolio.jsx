@@ -928,6 +928,27 @@ export default function Portfolio() {
           >
             🔔 Family Alerts
           </button>
+          <button
+            style={styles.refreshBtn}
+            onClick={async () => {
+              try {
+                const blob = await api.downloadPortfolioXlsx(viewingId);
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = `PatentQ_${viewingNumber}.xlsx`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
+              } catch (err) {
+                alert("Export failed: " + err.message);
+              }
+            }}
+            title="Download the family as a multi-sheet Excel workbook (Summary, Deadlines, Claims, Prior Art, Assignments, Fees)"
+          >
+            ⬇️ Excel
+          </button>
         </div>
         {refreshError && (
           <div style={styles.refreshErrorBanner}>

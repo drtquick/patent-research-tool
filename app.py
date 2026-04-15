@@ -3124,6 +3124,244 @@ def pdf_proxy(pub_num):
     )
 
 
+# ── Excel export (multi-sheet workbook per family) ───────────────────────────
+
+@app.route("/api/portfolios/<portfolio_id>/export.xlsx", methods=["GET"])
+@require_auth
+def export_portfolio_xlsx(portfolio_id):
+    """
+    Streams a multi-sheet Excel workbook for a single family. Sheets:
+      Summary     — one row per family member with pub/app number, status, dates, title
+      Deadlines   — upcoming deadlines, fees, and annuities across the family
+      Claims      — extracted independent claims per US member (cached)
+      Prior Art   — references cited (EPO biblio + cached AI scan if present)
+      Assignments — per-member assignment chain
+      Fees        — maintenance fees (US granted) + annuities (foreign)
+    """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        return jsonify({"error": "openpyxl not installed"}), 500
+
+    ref = (
+        db.collection("users").document(request.uid)
+          .collection("portfolios").document(portfolio_id)
+    )
+    snap = ref.get()
+    if not snap.exists:
+        return jsonify({"error": "Not found"}), 404
+    data = snap.to_dict() or {}
+    family = data.get("family") or []
+
+    wb = Workbook()
+    bold  = Font(bold=True, color="FFFFFF")
+    hdrfill = PatternFill("solid", fgColor="1A73E8")
+    wrap  = Alignment(wrap_text=True, vertical="top")
+    thin  = Side(border_style="thin", color="E0E0E0")
+    box   = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    def write_sheet(name: str, headers: list[str], rows: list[list]) -> None:
+        ws = wb.create_sheet(name) if name != "Summary" else wb.active
+        if name == "Summary":
+            ws.title = "Summary"
+        for c, h in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=c, value=h)
+            cell.font = bold
+            cell.fill = hdrfill
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = box
+        for ri, row in enumerate(rows, 2):
+            for ci, val in enumerate(row, 1):
+                cell = ws.cell(row=ri, column=ci, value=val if val is not None else "")
+                cell.alignment = wrap
+                cell.border = box
+        # Width autofit (simple heuristic)
+        for c in range(1, len(headers) + 1):
+            max_len = max([len(str(headers[c - 1]))] +
+                          [len(str((r[c - 1] if c - 1 < len(r) else "") or "")) for r in rows])
+            ws.column_dimensions[get_column_letter(c)].width = min(60, max(12, max_len + 2))
+        ws.row_dimensions[1].height = 20
+        ws.freeze_panes = "A2"
+
+    # ── Summary ────────────────────────────────────────────────────────────
+    summary_rows = []
+    for m in family:
+        pub  = m.get("pub_num", "")
+        app  = tracker._clean_app_num(m.get("app_num", ""))
+        disp = pub
+        if (m.get("status") == "granted" and pub.upper().startswith("US")):
+            disp = tracker._format_us_patent_num(pub) or pub
+        elif m.get("country") == "US" and app:
+            disp = tracker._format_us_app_num(app)
+        summary_rows.append([
+            m.get("country", ""),
+            disp,
+            pub,
+            app,
+            m.get("status", ""),
+            m.get("filing_date", ""),
+            m.get("grant_date", ""),
+            m.get("title", ""),
+            m.get("next_deadline_label", ""),
+            m.get("next_deadline_date", ""),
+        ])
+    write_sheet(
+        "Summary",
+        ["Country", "Display", "Publication #", "Application #", "Status",
+         "Filed", "Granted", "Title", "Next Deadline", "Due"],
+        summary_rows,
+    )
+
+    # ── Deadlines ──────────────────────────────────────────────────────────
+    try:
+        dls = _compute_deadlines(data)
+    except Exception:
+        dls = []
+    dl_rows = [[
+        d.get("due_date", ""),
+        d.get("country", ""),
+        d.get("patent_number", ""),
+        d.get("pub_num", ""),
+        d.get("type", ""),
+        d.get("label", ""),
+        d.get("amount_usd", "") if d.get("amount_usd") is not None else "",
+        d.get("currency", ""),
+        d.get("status", ""),
+    ] for d in sorted(dls, key=lambda r: r.get("due_date", ""))]
+    write_sheet(
+        "Deadlines",
+        ["Due Date", "Country", "Family", "Pub #", "Type", "Label",
+         "Amount (USD)", "Currency", "Status"],
+        dl_rows,
+    )
+
+    # ── Claims ─────────────────────────────────────────────────────────────
+    claim_rows: list = []
+    try:
+        claims_cache = (
+            db.collection("users").document(request.uid)
+              .collection("ai_claims_cache").stream()
+        )
+        for doc in claims_cache:
+            c = doc.to_dict() or {}
+            for ci in c.get("claims", []):
+                claim_rows.append([
+                    c.get("pub_num", ""),
+                    c.get("app_num", ""),
+                    ci.get("num", ""),
+                    ci.get("text", ""),
+                ])
+    except Exception:
+        pass
+    write_sheet(
+        "Claims",
+        ["Pub #", "App #", "Claim #", "Text"],
+        claim_rows,
+    )
+
+    # ── Prior Art ──────────────────────────────────────────────────────────
+    pa_rows: list = []
+    epo_key    = os.environ.get("EPO_CONSUMER_KEY", "").strip()
+    epo_secret = os.environ.get("EPO_CONSUMER_SECRET", "").strip()
+    token = (tracker.epo_get_token(epo_key, epo_secret)
+             if epo_key and epo_secret else None)
+    if token:
+        for m in family:
+            pub = (m.get("pub_num") or "").upper()
+            if not pub.startswith("US"):
+                continue
+            docdb = tracker.patent_to_docdb(pub)
+            if not docdb:
+                continue
+            bib = tracker.fetch_epo_biblio(docdb, token)
+            if not bib:
+                continue
+            for r in tracker.parse_epo_references_cited(bib):
+                pa_rows.append([
+                    m.get("pub_num", ""),
+                    r.get("type", ""),
+                    r.get("display", ""),
+                    r.get("country", ""),
+                    r.get("number", ""),
+                    r.get("kind", ""),
+                    r.get("category", ""),
+                    r.get("cited_by", ""),
+                    r.get("cited_phase", ""),
+                ])
+    write_sheet(
+        "Prior Art",
+        ["Citing Pub", "Type", "Display", "Country", "Number", "Kind",
+         "Category", "Cited By", "Phase"],
+        pa_rows,
+    )
+
+    # ── Assignments ────────────────────────────────────────────────────────
+    asn_rows: list = []
+    api_key = os.environ.get("USPTO_ODP_API_KEY", "").strip()
+    if api_key:
+        for m in family:
+            if (m.get("country") or "") != "US":
+                continue
+            app_num = tracker._clean_app_num(m.get("app_num", ""))
+            if not app_num:
+                continue
+            assigns = tracker.fetch_odp_assignments(app_num, api_key) or []
+            for a in assigns:
+                assignors = "; ".join(x.get("name", "") for x in a.get("assignors", []))
+                assignees = "; ".join(x.get("name", "") for x in a.get("assignees", []))
+                asn_rows.append([
+                    m.get("pub_num", ""),
+                    a.get("recorded_date", ""),
+                    a.get("execution_date", ""),
+                    a.get("conveyance", ""),
+                    assignors,
+                    assignees,
+                    a.get("reel_frame", ""),
+                    a.get("document_url", ""),
+                ])
+    write_sheet(
+        "Assignments",
+        ["Member", "Recorded", "Execution", "Conveyance",
+         "Assignors", "Assignees", "Reel/Frame", "Doc URL"],
+        asn_rows,
+    )
+
+    # ── Fees ───────────────────────────────────────────────────────────────
+    fee_rows = [[
+        d.get("due_date", ""),
+        d.get("country", ""),
+        d.get("patent_number", ""),
+        d.get("pub_num", ""),
+        d.get("type", ""),
+        d.get("label", ""),
+        d.get("amount_usd", ""),
+        d.get("amount_local", "") if d.get("amount_local") is not None else "",
+        d.get("currency", ""),
+    ] for d in dls if d.get("type") in ("maintenance", "annuity")]
+    write_sheet(
+        "Fees",
+        ["Due Date", "Country", "Family", "Pub #", "Type", "Label",
+         "Amount (USD)", "Amount (Local)", "Currency"],
+        fee_rows,
+    )
+
+    # Stream
+    import io
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    filename = f"PatentQ_{(data.get('patent_number') or portfolio_id)}.xlsx"
+    from flask import send_file
+    return send_file(
+        out,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=filename,
+    )
+
+
 # ── Portfolio-wide analytics ─────────────────────────────────────────────────
 
 @app.route("/api/analytics", methods=["GET"])

@@ -96,6 +96,25 @@ export const api = {
   // Portfolio-wide analytics aggregates
   getAnalytics: () => authFetch("/api/analytics"),
 
+  // Build the absolute URL for downloading an Excel export of a family
+  portfolioExportUrl: (id) => {
+    const BASE = import.meta.env.VITE_API_URL || "http://localhost:5001";
+    return `${BASE}/api/portfolios/${id}/export.xlsx`;
+  },
+
+  // Download the Excel export (uses auth token so we can't just use <a download>).
+  // Returns a Blob ready to trigger a save.
+  downloadPortfolioXlsx: async (id) => {
+    const { auth } = await import("./firebase");
+    const token = await auth.currentUser?.getIdToken();
+    const BASE = import.meta.env.VITE_API_URL || "http://localhost:5001";
+    const res = await fetch(`${BASE}/api/portfolios/${id}/export.xlsx`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({ error: res.statusText }))).error || "Export failed");
+    return res.blob();
+  },
+
   // Family filing timeline + continuation graph
   getPortfolioTimeline: (id) =>
     authFetch(`/api/portfolios/${id}/timeline`),
