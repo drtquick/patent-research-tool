@@ -254,8 +254,12 @@ def scan_events_for_user(db, uid: str,
         fam = doc.to_dict() or {}
         family_label = fam.get("patent_number") or fam.get("family_name") or doc.id
         for m in (fam.get("family") or []):
-            app = (m.get("app_num") or "").strip()
+            app_raw = (m.get("app_num") or "").strip()
             pub = m.get("pub_num") or ""
+            if not app_raw:
+                continue
+            # Firestore document ids can't contain '/' — sanitize before use.
+            app = app_raw.replace("/", "_").replace("\\", "_")
             if not app:
                 continue
             cache_ref = db.collection("users").document(uid) \
