@@ -3215,10 +3215,16 @@ def scheduled_run_digest():
 
     results = []
     try:
-        # list every user that has any portfolio
+        # Collect every unique uid from the portfolios collection group.
+        # (Firestore subcollections don't create parent docs automatically, so
+        # db.collection("users").stream() misses users who have data but no
+        # explicit parent doc.)
         users_seen: set = set()
-        for u_doc in db.collection("users").stream():
-            uid = u_doc.id
+        for p_doc in db.collection_group("portfolios").stream():
+            parent = p_doc.reference.parent.parent  # users/{uid}/portfolios → users/{uid}
+            if parent is None:
+                continue
+            uid = parent.id
             if uid in users_seen:
                 continue
             users_seen.add(uid)
@@ -3250,8 +3256,15 @@ def scheduled_scan_events():
 
     results = []
     try:
-        for u_doc in db.collection("users").stream():
-            uid = u_doc.id
+        users_seen: set = set()
+        for p_doc in db.collection_group("portfolios").stream():
+            parent = p_doc.reference.parent.parent
+            if parent is None:
+                continue
+            uid = parent.id
+            if uid in users_seen:
+                continue
+            users_seen.add(uid)
             try:
                 r = _notif.scan_events_for_user(db, uid)
                 if r.get("sent", 0) > 0 or r.get("reason"):
