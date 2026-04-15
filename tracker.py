@@ -1254,11 +1254,12 @@ def fetch_member_details(member: dict, idx: int, total: int,
             err = (odp_result or {}).get("fetch_error", "unknown")
             print(f"ODP-err({err[:40]}), falling back to GP")
 
-    # ── Standard path: Google Patents (non-US fallback) ─────────────────────
-    # Google Patents is aggressively rate-limiting and often returns 503 for
-    # long sequences. We keep retries low so a blocked GP doesn't stall the
-    # whole search, and on failure we fall back to the EPO-family biblio data
-    # we already have (country, pub_num, app_num, pub_date/app_date, kind).
+    # ── Non-US member path: EPO OPS biblio (no Google Patents) ──────────────
+    # Google Patents is NOT a primary source — it scrapes ODP and EPO. We use
+    # EPO OPS biblio directly for every non-US member so the data matches the
+    # authoritative source and we don't depend on GP's fragile HTML or its
+    # rate-limiting. EPO returns title, filing date, publication date,
+    # applicant list, and (via a second call) abstract.
     result = {
         **member,
         "status":        infer_status(pub_num),
@@ -1270,31 +1271,42 @@ def fetch_member_details(member: dict, idx: int, total: int,
         "member_title":  member.get("title", ""),
         "fetch_error":   None,
     }
-    if not member.get("href"):
-        return result
-
-    print(f"  [{idx:>2}/{total}] {pub_num:<22} … ", end="", flush=True)
+    print(f"  [{idx:>2}/{total}] {pub_num:<22} … (EPO) ", end="", flush=True)
     try:
-        page  = fetch_page(member["href"], max_retries=1)
-        metas = get_metas(page)
+        epo_key    = os.environ.get("EPO_CONSUMER_KEY",    "").strip()
+        epo_secret = os.environ.get("EPO_CONSUMER_SECRET", "").strip()
+        if not (epo_key and epo_secret):
+            print("no EPO creds — using parse_epo_family fallback")
+            return result
+        token = epo_get_token(epo_key, epo_secret)
+        if not token:
+            print("EPO auth failed — using parse_epo_family fallback")
+            return result
+        docdb = patent_to_docdb(pub_num)
+        if not docdb:
+            print("docdb parse failed — using parse_epo_family fallback")
+            return result
+        biblio_xml = fetch_epo_biblio(docdb, token)
+        if not biblio_xml:
+            print("no biblio — using parse_epo_family fallback")
+            return result
+        metas = parse_epo_biblio(biblio_xml)
         dates = metas.get("DC.date", [])
-        result["filing_date"]   = dates[0] if dates else result["filing_date"]
-        result["grant_date"]    = dates[1] if len(dates) > 1 else ""
-        result["app_num"]       = _first(metas.get("citation_patent_application_number", [])) or member.get("app_num", "")
-        result["member_title"]  = (metas.get("DC.title", [""])[0] or member.get("title", "")).strip()
-        result["status"]        = infer_status(pub_num, page)
-        result["events"]        = parse_legal_events(page)
-        result["backward_refs"] = parse_backward_refs(page)
-        result["rejections"]    = (
-            parse_rejections(page) if result["status"] in ("pending", "unknown") else []
-        )
+        if dates:
+            result["filing_date"] = dates[0]
+            if len(dates) > 1:
+                result["grant_date"] = dates[1]
+        _title = _first(metas.get("DC.title", [])) or ""
+        if _title:
+            result["member_title"] = _title.strip()
+        # Infer status from the kind code if the EPO biblio doesn't give us
+        # a better signal.
+        result["status"] = infer_status(pub_num)
         print("ok")
     except requests.HTTPError as e:
-        # On 503/429/etc, don't block — the EPO family data we already loaded
-        # into `result` is enough to render a meaningful tile. Log but proceed.
-        print(f"GP {e.response.status_code} (using EPO biblio fallback)")
+        print(f"EPO HTTP {e.response.status_code} — tile uses INPADOC fallback only")
     except Exception as e:
-        print(f"error ({str(e)[:40]}) — EPO biblio fallback")
+        print(f"EPO error ({str(e)[:40]}) — tile uses INPADOC fallback only")
 
     _time.sleep(0.1)
     return result

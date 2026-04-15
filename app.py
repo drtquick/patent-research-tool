@@ -479,67 +479,24 @@ def _run_search(patent_input: str, search_type: str = "auto") -> dict:
                         })
 
     # ── Decide which family list and metas to use ─────────────────────────────
+    # Authoritative sources: ODP (US) and EPO (non-US). Google Patents is NOT
+    # used here — it's only kept as a PDF fallback in the /api/pdf endpoint.
     claims: list = []
-    gp_url = f"https://patents.google.com/patent/{tracker.normalize(patent_input)}/en"
+    # URL shown on the hero "Espacenet / ODP" links only; not fetched.
+    url = f"https://worldwide.espacenet.com/patent/search?q=pn%3D{tracker.normalize(patent_input)}"
 
     if epo_family:
-        # EPO gave us a family — use it.  Try GP just for claims (non-fatal).
         metas  = epo_metas if epo_metas.get("citation_patent_number") else {}
         family = epo_family
-        url    = gp_url
-        try:
-            gp_html = tracker.fetch_page(url)
-            claims  = tracker.parse_claims(gp_html)
-            # If EPO biblio was empty, fall back to GP metas
-            if not metas:
-                gp_metas = tracker.get_metas(gp_html)
-                if gp_metas.get("citation_patent_number"):
-                    metas = gp_metas
-        except Exception:
-            pass  # claims are nice-to-have; don't fail the whole search
-
     else:
-        # EPO failed entirely — fall back to GP for everything
-        url       = tracker.build_url(patent_input)
-        html      = None
-        last_exc  = None
-        candidates = [url]
-        if "B2/en" in url:
-            candidates += [
-                url.replace("B2/en", "B1/en"),
-                url.replace("B2/en", "A1/en"),
-                url.replace("B2/en", "A2/en"),
-            ]
-        elif "B1/en" in url:
-            candidates += [url.replace("B1/en", "B2/en")]
-        bare = f"https://patents.google.com/patent/{tracker.normalize(patent_input)}/en"
-        if bare not in candidates:
-            candidates.append(bare)
-
-        for candidate in candidates:
-            try:
-                html = tracker.fetch_page(candidate)
-                url  = candidate
-                break
-            except _req.HTTPError as exc:
-                last_exc = exc
-                if exc.response.status_code != 404:
-                    raise
-            except Exception:
-                raise
-
-        if html is None:
-            raise ValueError(
-                f"Patent '{patent_input}' was not found. "
-                "EPO OPS and Google Patents both failed to return data for this patent."
-            )
-
-        metas  = tracker.get_metas(html)
-        family = tracker.parse_family(html)
-        claims = tracker.parse_claims(html)
+        # EPO returned no family — still may have biblio for the primary.
+        family = []
+        metas  = epo_metas or {}
 
     if not metas.get("citation_patent_number"):
-        raise ValueError(f"No patent data found for '{patent_input}'")
+        raise ValueError(
+            f"Patent '{patent_input}' was not found via EPO OPS / USPTO ODP."
+        )
 
     # ── Canonical patent number ───────────────────────────────────────────────
     raw_meta   = tracker._first(metas.get("citation_patent_number", [])) or ""
