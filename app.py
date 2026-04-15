@@ -137,8 +137,10 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
     assignees = [a.get("applicantNameText", "").strip() for a in applicants_raw if a.get("applicantNameText")]
 
     # Build the single family member directly from the ODP data already fetched above.
-    # Do NOT call fetch_us_member_via_odp here — that would make a redundant second
-    # ODP request for the same application number and is likely to trigger a 429.
+    # Do NOT call fetch_us_member_via_odp here — we already have the bag. Instead
+    # extract the same fields (events + continuity) inline so the primary member
+    # carries related_us_apps, which the BFS below uses to discover every US
+    # family member authoritatively via ODP.
     events    = tracker._odp_events_to_standard(bag.get("eventDataBag", []))
     rej_codes = {"CTNF", "CTFR", "MCTNF", "MCTFR"}
     member = {
@@ -150,19 +152,44 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
     }
     oa_documents = tracker.fetch_odp_documents(clean, api_key)
 
+    # Extract continuity (parent/child US apps) from the primary bag.
+    primary_related: list[dict] = []
+    for side, key in (("parent", "parentContinuityBag"),
+                      ("child",  "childContinuityBag")):
+        for cb in bag.get(key, []) or []:
+            raw_app = (
+                cb.get("parentApplicationNumberText")
+                or cb.get("childApplicationNumberText")
+                or cb.get("applicationNumberText", "")
+            )
+            _clean_rel = tracker._clean_app_num(raw_app)
+            if not _clean_rel:
+                continue
+            primary_related.append({
+                "side":     side,
+                "app_num":  _clean_rel,
+                "filing":   cb.get("parentApplicationFilingDate")
+                            or cb.get("childApplicationFilingDate", ""),
+                "patent":   cb.get("parentPatentNumber")
+                            or cb.get("childPatentNumber", ""),
+                "relation": cb.get("claimParentageTypeCode")
+                            or cb.get("continuityTypeText", ""),
+            })
+
     family_details = [{
         **member,
-        "status":        tracker._odp_status_to_standard(
-                             meta.get("applicationStatusDescriptionText", "")),
-        "events":        events,
-        "rejections":    [e["title"] for e in events if e.get("code") in rej_codes],
-        "backward_refs": [],
-        "filing_date":   filing,
-        "grant_date":    grant,
-        "member_title":  title,
-        "fetch_error":   None,
-        "lang":          "",
-        "oa_documents":  oa_documents,
+        "status":           tracker._odp_status_to_standard(
+                                meta.get("applicationStatusDescriptionText", "")),
+        "events":           events,
+        "rejections":       [e["title"] for e in events if e.get("code") in rej_codes],
+        "backward_refs":    [],
+        "filing_date":      filing,
+        "grant_date":       grant,
+        "member_title":     title,
+        "fetch_error":      None,
+        "lang":             "",
+        "oa_documents":     oa_documents,
+        "related_us_apps":  primary_related,
     }]
 
     metas = {
@@ -195,25 +222,15 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
                 if family_xml:
                     epo_members = tracker.parse_epo_family(family_xml)
                     if epo_members:
-                        # Include EVERY EPO family member except the one we've
-                        # already added from ODP (dedup by normalized pub_num).
-                        # Previously we filtered out all US members, which
-                        # silently dropped siblings like continuation pubs
-                        # of the searched app.
-                        _already = tracker.normalize(pub_num)
-                        _already_app = tracker._clean_app_num(clean)
+                        # ODP is authoritative for US — only pull non-US
+                        # members from EPO INPADOC. US family members
+                        # (including sibling continuations) are discovered
+                        # via the ODP continuity BFS further below.
+                        non_us = [em for em in epo_members
+                                  if em.get("country") != "US"]
                         extra_family_raw = []
-                        for em in epo_members:
-                            _em_pub = tracker.normalize(em["pub_num"])
-                            _em_app = tracker._clean_app_num(em.get("app_num", ""))
-                            if _em_pub == _already:
-                                continue
-                            if _em_app and _em_app == _already_app:
-                                # Same US application, different publication
-                                # stage (e.g. A1 pre-grant vs B2 granted) —
-                                # skip to avoid duplicate tiles.
-                                continue
-                            norm_pub = _em_pub
+                        for em in non_us:
+                            norm_pub = tracker.normalize(em["pub_num"])
                             extra_family_raw.append({
                                 "pub_num": em["pub_num"],
                                 "app_num": em.get("app_num", ""),
@@ -244,36 +261,50 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
                         except Exception as exc:
                             print(f"  family merge skipped: {exc}")
 
-    # ── Continuity: pull in abandoned/unpublished US continuations via ODP ──
-    # Mirrors the _run_search logic — see that function for rationale.
+    # ── ODP-first continuity BFS: discover the full US family via ODP ────────
+    # ODP is authoritative for US information. Starting from the primary US
+    # application we just fetched, walk parent and child continuity links
+    # breadth-first until we've visited every related US app. Each newly
+    # discovered app is fetched via ODP (not EPO, not GP) so its status,
+    # events, and filing info are all authoritative.
     if api_key:
         known = {tracker._clean_app_num(m.get("app_num", "")) for m in family_details}
         known.discard("")
-        extras_seen: set = set()
+        visited: set = set()
+        queue: list = [clean]
         extras: list = []
-        for m in list(family_details):
-            for rel in (m.get("related_us_apps") or []):
-                rel_app = rel.get("app_num", "")
-                if not rel_app or rel_app in known or rel_app in extras_seen:
+        while queue:
+            cur = queue.pop(0)
+            if not cur or cur in visited:
+                continue
+            visited.add(cur)
+            # Either find the already-hydrated member or fetch a fresh ODP record
+            existing = next(
+                (m for m in family_details
+                 if tracker._clean_app_num(m.get("app_num", "")) == cur),
+                None,
+            )
+            if existing is not None:
+                rels = existing.get("related_us_apps") or []
+            else:
+                stub = {"pub_num": f"US{cur}", "app_num": cur, "country": "US",
+                        "href": "", "title": "", "date": "", "lang": ""}
+                det = tracker.fetch_us_member_via_odp(stub, api_key)
+                if not det or det.get("fetch_error"):
                     continue
-                extras_seen.add(rel_app)
-                extras.append({
-                    "pub_num": rel.get("patent") and f"US{rel['patent']}B2" or f"US{rel_app}",
-                    "app_num": rel_app,
-                    "href":    "",
-                    "title":   "",
-                    "country": "US",
-                    "date":    rel.get("filing", ""),
-                    "lang":    "",
-                })
-        for j, stub in enumerate(extras):
-            try:
-                det = tracker.fetch_member_details(
-                    stub, j + 1, len(extras), odp_api_key=api_key
+                # Re-run through fetch_member_details so status/docs are consistent
+                det_full = tracker.fetch_member_details(
+                    stub, 0, 0, odp_api_key=api_key
                 )
-                family_details.append(det)
-            except Exception as exc:
-                print(f"  continuity merge (odp path) skipped {stub.get('app_num')}: {exc}")
+                family_details.append(det_full)
+                extras.append(det_full)
+                known.add(cur)
+                rels = det_full.get("related_us_apps") or []
+            for rel in rels:
+                rel_app = rel.get("app_num", "")
+                if rel_app and rel_app not in visited:
+                    queue.append(rel_app)
+        print(f"  ODP continuity BFS: +{len(extras)} US member(s)")
 
     # ── Build summaries + dashboard from (possibly enriched) family ──────────
     dashboard_html = tracker.generate_dashboard_html(
