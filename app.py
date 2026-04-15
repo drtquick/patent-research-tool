@@ -1880,9 +1880,32 @@ def _download_oa_text(member: dict) -> tuple[str, dict | None]:
     import io as _io
     import requests as _rq
 
-    OA_CODES = {"CTNF", "CTFR", "MCTNF", "MCTFR"}
-    oa_docs  = member.get("oa_documents") or []
-    oa_doc   = next(
+    # Accept the common OA codes plus a few related examination actions
+    # so the Analyze OA feature works on restriction requirements, advisory
+    # actions, and Ex Parte Quayle actions in addition to CTNF/CTFR.
+    OA_CODES = {
+        "CTNF", "CTFR", "MCTNF", "MCTFR",       # non-final / final (+misc)
+        "CTRS",                                  # restriction requirement
+        "CTAV",                                  # advisory action
+        "CTEQ", "QUAYLE",                        # ex parte Quayle
+        "CTNT", "CTNR",                          # additional variants
+    }
+
+    # Start from whatever the member already carries (fast path after a fresh
+    # scrape). If empty — which is normal when loading from Firestore cache,
+    # since the summary doesn't include oa_documents — re-fetch from ODP.
+    oa_docs = member.get("oa_documents") or []
+    if not oa_docs:
+        app_num = (member.get("app_num") or "").strip()
+        if app_num:
+            try:
+                oa_docs = tracker.fetch_odp_documents(
+                    app_num, os.environ.get("USPTO_ODP_API_KEY", "")
+                ) or []
+            except Exception as exc:
+                print(f"  Analyze OA: ODP documents fetch failed for {app_num}: {exc}")
+
+    oa_doc = next(
         (d for d in sorted(oa_docs, key=lambda x: x.get("date", ""), reverse=True)
          if (d.get("code") or "").upper() in OA_CODES and d.get("download_url")),
         None,
