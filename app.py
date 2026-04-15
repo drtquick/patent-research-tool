@@ -152,29 +152,34 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
     }
     oa_documents = tracker.fetch_odp_documents(clean, api_key)
 
-    # Extract continuity (parent/child US apps) from the primary bag.
+    # Extract continuity (parent/child US apps) from the primary bag. Must
+    # read the side-specific field so the related app (not the current one)
+    # gets recorded.
     primary_related: list[dict] = []
-    for side, key in (("parent", "parentContinuityBag"),
-                      ("child",  "childContinuityBag")):
-        for cb in bag.get(key, []) or []:
-            raw_app = (
-                cb.get("parentApplicationNumberText")
-                or cb.get("childApplicationNumberText")
-                or cb.get("applicationNumberText", "")
-            )
-            _clean_rel = tracker._clean_app_num(raw_app)
-            if not _clean_rel:
-                continue
-            primary_related.append({
-                "side":     side,
-                "app_num":  _clean_rel,
-                "filing":   cb.get("parentApplicationFilingDate")
-                            or cb.get("childApplicationFilingDate", ""),
-                "patent":   cb.get("parentPatentNumber")
-                            or cb.get("childPatentNumber", ""),
-                "relation": cb.get("claimParentageTypeCode")
-                            or cb.get("continuityTypeText", ""),
-            })
+    for cb in bag.get("parentContinuityBag", []) or []:
+        _clean_rel = tracker._clean_app_num(cb.get("parentApplicationNumberText", ""))
+        if not _clean_rel:
+            continue
+        primary_related.append({
+            "side":     "parent",
+            "app_num":  _clean_rel,
+            "filing":   cb.get("parentApplicationFilingDate", ""),
+            "patent":   cb.get("parentPatentNumber", ""),
+            "relation": cb.get("claimParentageTypeCode", "")
+                        or cb.get("claimParentageTypeCodeDescriptionText", ""),
+        })
+    for cb in bag.get("childContinuityBag", []) or []:
+        _clean_rel = tracker._clean_app_num(cb.get("childApplicationNumberText", ""))
+        if not _clean_rel:
+            continue
+        primary_related.append({
+            "side":     "child",
+            "app_num":  _clean_rel,
+            "filing":   cb.get("childApplicationFilingDate", ""),
+            "patent":   cb.get("childPatentNumber", ""),
+            "relation": cb.get("claimParentageTypeCode", "")
+                        or cb.get("claimParentageTypeCodeDescriptionText", ""),
+        })
 
     family_details = [{
         **member,

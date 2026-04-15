@@ -1085,28 +1085,37 @@ def fetch_odp_continuity(app_num: str, api_key: str) -> list[dict]:
             return []
         data = resp.json()
         bag  = data.get("patentFileWrapperDataBag") or [{}]
+        # In parentContinuityBag every entry points AT a parent of the current
+        # app — so the related app is parentApplicationNumberText. In
+        # childContinuityBag it's the opposite: the related app is
+        # childApplicationNumberText. Reading the "wrong" field gives the
+        # current app itself, which silently deduped the children out of
+        # the BFS. Must read the field that matches the side.
         for entry in bag:
-            for side, key in (("parent", "parentContinuityBag"),
-                              ("child",  "childContinuityBag")):
-                for cb in entry.get(key, []) or []:
-                    raw = (
-                        cb.get("parentApplicationNumberText")
-                        or cb.get("childApplicationNumberText")
-                        or cb.get("applicationNumberText", "")
-                    )
-                    ca = _clean_app_num(raw)
-                    if not ca:
-                        continue
-                    out.append({
-                        "side":     side,
-                        "app_num":  ca,
-                        "filing":   (cb.get("parentApplicationFilingDate")
-                                     or cb.get("childApplicationFilingDate", "")),
-                        "patent":   (cb.get("parentPatentNumber")
-                                     or cb.get("childPatentNumber", "")),
-                        "relation": (cb.get("claimParentageTypeCode")
-                                     or cb.get("continuityTypeText", "")),
-                    })
+            for cb in entry.get("parentContinuityBag", []) or []:
+                ca = _clean_app_num(cb.get("parentApplicationNumberText", ""))
+                if not ca:
+                    continue
+                out.append({
+                    "side":     "parent",
+                    "app_num":  ca,
+                    "filing":   cb.get("parentApplicationFilingDate", ""),
+                    "patent":   cb.get("parentPatentNumber", ""),
+                    "relation": cb.get("claimParentageTypeCode", "")
+                                or cb.get("claimParentageTypeCodeDescriptionText", ""),
+                })
+            for cb in entry.get("childContinuityBag", []) or []:
+                ca = _clean_app_num(cb.get("childApplicationNumberText", ""))
+                if not ca:
+                    continue
+                out.append({
+                    "side":     "child",
+                    "app_num":  ca,
+                    "filing":   cb.get("childApplicationFilingDate", ""),
+                    "patent":   cb.get("childPatentNumber", ""),
+                    "relation": cb.get("claimParentageTypeCode", "")
+                                or cb.get("claimParentageTypeCodeDescriptionText", ""),
+                })
     except Exception as exc:
         print(f"  ODP continuity error for {clean}: {str(exc)[:80]}")
     return out
@@ -1175,36 +1184,33 @@ def fetch_us_member_via_odp(member: dict, api_key: str) -> dict | None:
         result["oa_documents"] = fetch_odp_documents(result["app_num"], api_key)
 
         # Continuity: parent/child US apps (continuations, CIPs, divisionals).
-        # We surface these so _run_search can add any that aren't already in the
-        # EPO INPADOC family (INPADOC misses many abandoned US continuations).
+        # Read from the side-specific field so the related app (not the
+        # current one) gets recorded.
         related: list[dict] = []
-        for side, key in (("parent", "parentContinuityBag"),
-                          ("child",  "childContinuityBag")):
-            for cb in bag.get(key, []) or []:
-                raw_app = (
-                    cb.get("parentApplicationNumberText")
-                    or cb.get("childApplicationNumberText")
-                    or cb.get("applicationNumberText", "")
-                )
-                clean = _clean_app_num(raw_app)
-                if not clean:
-                    continue
-                related.append({
-                    "side":     side,
-                    "app_num":  clean,
-                    "filing":   (
-                        cb.get("parentApplicationFilingDate")
-                        or cb.get("childApplicationFilingDate", "")
-                    ),
-                    "patent":   (
-                        cb.get("parentPatentNumber")
-                        or cb.get("childPatentNumber", "")
-                    ),
-                    "relation": (
-                        cb.get("claimParentageTypeCode")
-                        or cb.get("continuityTypeText", "")
-                    ),
-                })
+        for cb in bag.get("parentContinuityBag", []) or []:
+            clean = _clean_app_num(cb.get("parentApplicationNumberText", ""))
+            if not clean:
+                continue
+            related.append({
+                "side":     "parent",
+                "app_num":  clean,
+                "filing":   cb.get("parentApplicationFilingDate", ""),
+                "patent":   cb.get("parentPatentNumber", ""),
+                "relation": cb.get("claimParentageTypeCode", "")
+                            or cb.get("claimParentageTypeCodeDescriptionText", ""),
+            })
+        for cb in bag.get("childContinuityBag", []) or []:
+            clean = _clean_app_num(cb.get("childApplicationNumberText", ""))
+            if not clean:
+                continue
+            related.append({
+                "side":     "child",
+                "app_num":  clean,
+                "filing":   cb.get("childApplicationFilingDate", ""),
+                "patent":   cb.get("childPatentNumber", ""),
+                "relation": cb.get("claimParentageTypeCode", "")
+                            or cb.get("claimParentageTypeCodeDescriptionText", ""),
+            })
         if related:
             result["related_us_apps"] = related
     except Exception as exc:
