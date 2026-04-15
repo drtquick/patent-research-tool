@@ -661,8 +661,32 @@ export default function Portfolio() {
                             )}
                           </div>
                           {ref.relevance && <p style={aiStyles.actionDetails}>{ref.relevance}</p>}
+                          {(() => {
+                            const dl = (aiResult.prior_art_downloads || []).find(
+                              (d) => ref.reference && ref.reference.toUpperCase().includes(d.pub_num)
+                            );
+                            if (!dl) return null;
+                            return (
+                              <a
+                                href={dl.download_url}
+                                target="_blank"
+                                rel="noopener"
+                                download={`${dl.pub_num}.pdf`}
+                                style={{ display: "inline-block", marginTop: 6, padding: "4px 10px",
+                                         borderRadius: 5, background: "#1a73e8", color: "#fff",
+                                         textDecoration: "none", fontSize: 12, fontWeight: 600 }}
+                              >
+                                📄 Download {dl.pub_num}
+                              </a>
+                            );
+                          })()}
                         </div>
                       ))}
+                      {aiResult.prior_art_downloads && aiResult.prior_art_downloads.length > 0 && (
+                        <p style={{ fontSize: 11, color: "#2e7d32", marginTop: 8 }}>
+                          ✓ {aiResult.prior_art_downloads.length} prior-art PDF{aiResult.prior_art_downloads.length === 1 ? "" : "s"} saved to this tile's Files
+                        </p>
+                      )}
                     </div>
                   )}
 

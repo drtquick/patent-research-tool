@@ -169,7 +169,13 @@ def _annotate_ai_deadlines(family_details: list, request_uid: str | None = None)
             continue
 
         if not result or result.get("error"):
-            print(f"  ai_deadline {app_num}: {result.get('error','no result') if result else 'no result'}")
+            err_msg = (result or {}).get("error", "no result") if result else "no result"
+            print(f"  ai_deadline {app_num}: {err_msg}")
+            # Short-circuit on out-of-credits — no point calling Claude again
+            # for every remaining pending member.
+            if result and result.get("out_of_credits"):
+                print("  ai_deadline: credits exhausted, skipping remaining members")
+                break
             continue
 
         m["ai_deadline"] = result
@@ -1985,6 +1991,112 @@ def ai_analyze():
         return jsonify({"error": f"AI analysis failed: {exc}"}), 500
 
 
+def _parse_patent_number(reference: str) -> str:
+    """
+    Extract a normalized patent/publication number from a free-form citation
+    string like 'Smith et al., US 10,123,456 B2'. Returns CCNNNKIND (e.g.
+    'US10123456B2') or '' if no valid number found.
+    """
+    import re as _re
+    if not reference:
+        return ""
+    s = reference.upper()
+    # Match CC (2 letters) + number with optional separators + optional kind
+    m = _re.search(
+        r"\b([A-Z]{2})[\s\-]*((?:\d[\d,\s]{4,13}\d))(?:[\s\-]*([A-Z]\d?))?\b",
+        s,
+    )
+    if not m:
+        return ""
+    cc   = m.group(1)
+    num  = _re.sub(r"[,\s\-]", "", m.group(2))
+    kind = (m.group(3) or "").strip()
+    # Sanity: skip year references (e.g. "2023" by itself)
+    if len(num) < 5:
+        return ""
+    return f"{cc}{num}{kind}"
+
+
+def _download_patent_pdf(pub_num: str) -> bytes | None:
+    """Reuse the PDF proxy's multi-source download, returning the bytes."""
+    import re as _re
+    clean = _re.sub(r"[^A-Z0-9]", "", (pub_num or "").upper())
+    if not clean:
+        return None
+    docdb = tracker.patent_to_docdb(clean)
+    pdf   = _epo_fullimage_pdf(docdb) if docdb else None
+    if not pdf and clean.startswith("US"):
+        pdf = _uspto_pdf(clean)
+    if not pdf:
+        pdf = _google_patents_pdf(clean)
+    return pdf
+
+
+def _attach_prior_art_to_tile(result: dict, uid: str, portfolio_id: str,
+                              pub_num: str) -> list[dict]:
+    """
+    For each cited prior-art reference, download the PDF, upload it to
+    Cloud Storage, and create a portfolio_files entry scoped to this tile
+    (tile_pub_num=pub_num) so it shows up in that tile's Files panel.
+    Returns a list of {pub_num, download_url, storage_path, title} dicts so
+    the frontend can also show them inline in the OA analysis panel.
+    """
+    cites = (result.get("cited_prior_art") or [])
+    if not cites:
+        return []
+
+    attachments: list[dict] = []
+    for cite in cites:
+        ref   = (cite.get("reference") or "").strip()
+        pnum  = _parse_patent_number(ref)
+        if not pnum:
+            continue
+        try:
+            pdf = _download_patent_pdf(pnum)
+            if not pdf:
+                print(f"  Prior art {pnum}: no PDF available")
+                continue
+            # Upload to Storage
+            from google.cloud import storage as _gcs
+            client = _gcs.Client(project="patent-research-tool")
+            bucket = client.bucket("patent-research-tool.appspot.com")
+            safe_pub = pub_num.replace("/", "_")
+            storage_path = f"users/{uid}/prior_art/{portfolio_id}/{safe_pub}/{pnum}.pdf"
+            blob = bucket.blob(storage_path)
+            blob.upload_from_string(pdf, content_type="application/pdf")
+            from datetime import timedelta as _td
+            url = blob.generate_signed_url(expiration=_td(hours=24), method="GET")
+            # Add portfolio_files entry so the tile's Files button surfaces it
+            try:
+                (
+                    db.collection("users").document(uid)
+                      .collection("portfolios").document(portfolio_id)
+                      .collection("files")
+                      .add({
+                          "name":          f"{pnum}.pdf",
+                          "type":          "prior_art",
+                          "tile_pub_num":  pub_num,
+                          "storage_path":  storage_path,
+                          "signed_url":    url,
+                          "reference":     ref,
+                          "source_pub":    pnum,
+                          "uploaded_at":   datetime.now(timezone.utc),
+                      })
+                )
+            except Exception as exc:
+                print(f"  Prior art file record failed for {pnum}: {exc}")
+            attachments.append({
+                "pub_num":      pnum,
+                "download_url": url,
+                "reference":    ref,
+                "title":        cite.get("relevance", "")[:120],
+            })
+            print(f"  Prior art {pnum}: attached ({len(pdf)} bytes)")
+        except Exception as exc:
+            print(f"  Prior art {pnum}: failed ({exc})")
+    return attachments
+
+
 def _upload_oa_pdf(pdf_bytes: bytes, uid: str, portfolio_id: str,
                    pub_num: str, oa_doc: dict) -> str:
     """
@@ -2070,6 +2182,18 @@ def ai_analyze_oa():
             result["pdf_filename"] = f"{pub_num}_{(oa_doc.get('date') or '').replace('-','')}_{(oa_doc.get('code') or 'OA')}.pdf"
         result["oa_code"] = oa_doc.get("code", "")
         result["oa_date"] = oa_doc.get("date", "")
+
+        # Download every cited prior-art reference, save to Storage, and
+        # link each file to this tile via the portfolio_files collection so
+        # they appear under the tile's Files button.
+        try:
+            attachments = _attach_prior_art_to_tile(
+                result, request.uid, portfolio_id, pub_num
+            )
+            if attachments:
+                result["prior_art_downloads"] = attachments
+        except Exception as exc:
+            print(f"  Prior art attach pass failed: {exc}")
 
         doc_id = pub_num.replace("/", "_")
         port_ref.collection("ai_analysis").document(f"{doc_id}__oa").set({
@@ -2233,12 +2357,24 @@ def _google_patents_pdf(pub_num_clean: str) -> bytes | None:
         "Accept-Language": "en",
     }
 
-    # Candidate URLs — try with and without kind code in case GP normalized it away
+    # Candidate URLs — try multiple normalizations because pub number formats
+    # vary across sources (EPO drops the leading zero on the serial; USPTO
+    # keeps it).  For a US pre-grant publication like US20230325714A1, EPO's
+    # form is US2023325714A1 (10 digits) while Google / USPTO want the
+    # 11-digit form.  We try the raw form first, then an augmented form that
+    # inserts a zero between the 4-digit year and the 6-digit serial, then
+    # finally drop the kind code entirely.
     _no_kind = _re.sub(r"[A-Z]+\d*$", "", clean)
-    candidates = [
-        f"https://patents.google.com/patent/{clean}/en",
-        f"https://patents.google.com/patent/{_no_kind}/en",
-    ]
+    candidates = [f"https://patents.google.com/patent/{clean}/en"]
+
+    # If US pub in EPO form (US + year + 6-digit serial + kind), try zero-pad
+    _m_us_epo = _re.match(r"^(US)(\d{4})(\d{6})([A-Z]\d?)$", clean)
+    if _m_us_epo:
+        padded = f"{_m_us_epo.group(1)}{_m_us_epo.group(2)}0{_m_us_epo.group(3)}{_m_us_epo.group(4)}"
+        candidates.append(f"https://patents.google.com/patent/{padded}/en")
+
+    # Also try without kind code
+    candidates.append(f"https://patents.google.com/patent/{_no_kind}/en")
     seen = set()
     for page_url in candidates:
         if page_url in seen:

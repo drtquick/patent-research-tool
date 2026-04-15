@@ -208,8 +208,11 @@ class PatentAI:
                 "_ai_meta": {"model": self.MODEL, "timestamp": datetime.now(timezone.utc).isoformat()},
             }
         except anthropic.APIError as e:
+            _msg = str(e)
+            _out_of_credits = "credit balance is too low" in _msg.lower() or "insufficient_quota" in _msg.lower()
             return {
-                "error": f"Claude API error: {e}",
+                "error": f"Claude API error: {_msg}",
+                "out_of_credits": _out_of_credits,
                 "_ai_meta": {"model": self.MODEL, "timestamp": datetime.now(timezone.utc).isoformat()},
             }
 
