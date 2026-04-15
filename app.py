@@ -1626,6 +1626,7 @@ def list_searches():
                 "granted_count": d.get("granted_count", 0),
                 "pending_count": d.get("pending_count", 0),
                 "searched_at":   sat.isoformat() if hasattr(sat, "isoformat") else str(sat or ""),
+                "search_type":   d.get("search_type", ""),
             })
         return jsonify({"searches": results})
     except Exception as exc:

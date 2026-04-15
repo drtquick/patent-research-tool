@@ -18,7 +18,7 @@ export default function Search() {
   // Run search whenever ?q= or ?type= param changes (including on first load)
   useEffect(() => {
     const q = searchParams.get("q") || "";
-    const t = searchParams.get("type") || "auto";
+    const t = searchParams.get("type") || "patent_number";
     const key = `${q}::${t}`;
     if (!q.trim() || key === ranQuery.current) return;
     ranQuery.current = key;
