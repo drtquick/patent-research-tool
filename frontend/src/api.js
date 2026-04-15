@@ -96,6 +96,15 @@ export const api = {
   // Portfolio-wide analytics aggregates
   getAnalytics: () => authFetch("/api/analytics"),
 
+  // Notification preferences
+  getNotificationSettings: () => authFetch("/api/settings/notifications"),
+  updateNotificationSettings: (patch) =>
+    authFetch("/api/settings/notifications", {
+      method: "PATCH", body: JSON.stringify(patch),
+    }),
+  sendTestNotification: () =>
+    authFetch("/api/notifications/test", { method: "POST" }),
+
   // Build the absolute URL for downloading an Excel export of a family
   portfolioExportUrl: (id) => {
     const BASE = import.meta.env.VITE_API_URL || "http://localhost:5001";

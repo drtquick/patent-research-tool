@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useAuth } from "../AuthContext";
 import { updatePassword, EmailAuthProvider, reauthenticateWithCredential } from "firebase/auth";
 import { useIsMobile } from "../useIsMobile";
+import { api } from "../api";
 
 export default function Settings() {
   const { user, logout } = useAuth();
@@ -113,15 +114,7 @@ export default function Settings() {
             </div>
           )}
 
-          {section === "notifications" && (
-            <div>
-              <h3 style={styles.sectionTitle}>Notifications</h3>
-              <p style={{ color: "#666", fontSize: 14 }}>
-                Deadline alert thresholds and email digest settings will be available in a future release.
-                Currently, all upcoming fees within the window you select on the Alerts page are shown automatically.
-              </p>
-            </div>
-          )}
+          {section === "notifications" && <NotificationsPanel />}
 
           {section === "about" && (
             <div>
@@ -143,6 +136,111 @@ export default function Settings() {
           )}
 
         </div>
+      </div>
+    </div>
+  );
+}
+
+function NotificationsPanel() {
+  const [prefs, setPrefs] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [msg, setMsg] = useState(null);
+
+  useEffect(() => {
+    api.getNotificationSettings().then(setPrefs).catch((e) => setMsg({ type: "error", text: e.message }));
+  }, []);
+
+  function toggle(key) {
+    setPrefs((p) => ({ ...p, [key]: !p[key] }));
+  }
+
+  async function save() {
+    if (!prefs) return;
+    setSaving(true);
+    try {
+      await api.updateNotificationSettings(prefs);
+      setMsg({ type: "success", text: "Preferences saved." });
+    } catch (err) {
+      setMsg({ type: "error", text: err.message });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function sendTest() {
+    setTesting(true);
+    setMsg(null);
+    try {
+      const r = await api.sendTestNotification();
+      setMsg({ type: "success", text: `Test email sent to ${r.sent_to}.` });
+    } catch (err) {
+      setMsg({ type: "error", text: err.message });
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  if (!prefs) return <div>Loading…</div>;
+
+  const row = (label, desc, key) => (
+    <label style={{ display: "flex", gap: 12, padding: "12px 0", borderBottom: "1px solid #f0f0f0", cursor: "pointer" }}>
+      <input type="checkbox" checked={!!prefs[key]} onChange={() => toggle(key)} style={{ marginTop: 3 }} />
+      <div>
+        <div style={{ fontWeight: 600, color: "#1a1a2e" }}>{label}</div>
+        <div style={{ fontSize: 12, color: "#666", marginTop: 2 }}>{desc}</div>
+      </div>
+    </label>
+  );
+
+  return (
+    <div>
+      <h3 style={{ marginTop: 0, color: "#1a1a2e" }}>Notifications</h3>
+      <p style={{ color: "#666", fontSize: 13, marginBottom: 10 }}>
+        Email alerts and digests are sent from <strong>PatentQ Alerts</strong> via MXroute SMTP.
+      </p>
+
+      {row("Enable all PatentQ emails", "Master switch. Turn off to pause everything.", "enabled")}
+      {row("Daily digest (weekdays, 7am)", "Each morning, a concise list of upcoming deadlines in the next 30 days.", "daily_digest")}
+      {row("Weekly digest (Mondays, 7am)", "Strategic overview covering the next 90 days.", "weekly_digest")}
+      {row("Event alerts (immediate)", "Email when a new Office Action, Notice of Allowance, or abandonment is detected.", "event_alerts")}
+      {row("Skip empty digests", "Don't send a digest email when there are no upcoming deadlines.", "skip_empty")}
+
+      <label style={{ display: "block", marginTop: 18 }}>
+        <div style={{ fontSize: 12, color: "#666", marginBottom: 4 }}>Recipient (defaults to your account email)</div>
+        <input
+          type="email"
+          value={prefs.recipient_email || ""}
+          onChange={(e) => setPrefs({ ...prefs, recipient_email: e.target.value })}
+          style={{ width: 320, maxWidth: "100%", padding: "8px 10px", borderRadius: 6, border: "1px solid #d0d7de", fontSize: 14 }}
+        />
+      </label>
+
+      {msg && (
+        <div style={{ marginTop: 14, padding: "10px 14px", borderRadius: 8, fontSize: 13,
+                      background: msg.type === "error" ? "#fdecea" : "#e8f5e9",
+                      color:      msg.type === "error" ? "#c62828" : "#2e7d32" }}>
+          {msg.text}
+        </div>
+      )}
+
+      <div style={{ marginTop: 22, display: "flex", gap: 10, flexWrap: "wrap" }}>
+        <button
+          style={{ padding: "10px 20px", borderRadius: 8, background: "#1a73e8", color: "#fff",
+                   border: "none", fontWeight: 600, fontSize: 14, cursor: "pointer" }}
+          disabled={saving}
+          onClick={save}
+        >
+          {saving ? "Saving…" : "Save preferences"}
+        </button>
+        <button
+          style={{ padding: "10px 20px", borderRadius: 8, background: "#fff", color: "#1a73e8",
+                   border: "1px solid #1a73e8", fontWeight: 600, fontSize: 14, cursor: "pointer" }}
+          disabled={testing}
+          onClick={sendTest}
+        >
+          {testing ? "Sending…" : "Send test email"}
+        </button>
       </div>
     </div>
   );

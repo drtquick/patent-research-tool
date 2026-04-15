@@ -3124,6 +3124,148 @@ def pdf_proxy(pub_num):
     )
 
 
+# ── Notifications (email alerts & digests via MXroute SMTP) ─────────────────
+
+@app.route("/api/settings/notifications", methods=["GET"])
+@require_auth
+def get_notification_settings():
+    try:
+        snap = db.collection("users").document(request.uid) \
+                  .collection("settings").document("notifications").get()
+        prefs = snap.to_dict() if snap.exists else {}
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    # Defaults
+    return jsonify({
+        "enabled":          prefs.get("enabled", True),
+        "daily_digest":     prefs.get("daily_digest", True),
+        "weekly_digest":    prefs.get("weekly_digest", True),
+        "event_alerts":     prefs.get("event_alerts", True),
+        "skip_empty":       prefs.get("skip_empty", True),
+        "recipient_email":  prefs.get("recipient_email", request.user_email or ""),
+    })
+
+
+@app.route("/api/settings/notifications", methods=["PATCH"])
+@require_auth
+def update_notification_settings():
+    body = request.get_json(silent=True) or {}
+    allowed = {"enabled", "daily_digest", "weekly_digest",
+               "event_alerts", "skip_empty", "recipient_email"}
+    patch = {k: v for k, v in body.items() if k in allowed}
+    if not patch:
+        return jsonify({"error": "no valid fields"}), 400
+    patch["updated_at"] = datetime.now(timezone.utc)
+    try:
+        db.collection("users").document(request.uid) \
+          .collection("settings").document("notifications").set(patch, merge=True)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    return jsonify({"ok": True, **patch})
+
+
+@app.route("/api/notifications/test", methods=["POST"])
+@require_auth
+def send_test_notification():
+    """Send a test email to the authenticated user."""
+    try:
+        import notifications as _notif
+        to = request.user_email or ""
+        if not to:
+            return jsonify({"error": "no email on account"}), 400
+        _notif.send_email(
+            to,
+            "PatentQ email test",
+            "<p>Your PatentQ alerts are wired up. You're receiving this because you clicked "
+            "<strong>Send test email</strong> in Settings.</p>"
+            "<p>If you didn't request this, ignore and contact support.</p>",
+        )
+        return jsonify({"ok": True, "sent_to": to})
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"error": str(exc)}), 500
+
+
+def _require_scheduler_key():
+    """Scheduler endpoints expect a shared admin header."""
+    want = os.environ.get("NOTIFICATIONS_ADMIN_KEY", "").strip()
+    if not want:
+        return jsonify({"error": "scheduler key not configured"}), 500
+    got = request.headers.get("X-Admin-Key", "").strip()
+    if got != want:
+        return jsonify({"error": "forbidden"}), 403
+    return None
+
+
+@app.route("/api/notifications/run-digest", methods=["POST"])
+def scheduled_run_digest():
+    """
+    Cloud Scheduler target. Runs the digest for EVERY user with notifications
+    enabled. Authenticated via X-Admin-Key header.
+      ?kind=daily    → last-7-through-next-30 window
+      ?kind=weekly   → last-7-through-next-90 window
+    """
+    err = _require_scheduler_key()
+    if err: return err
+    kind = (request.args.get("kind") or "daily").strip().lower()
+    try:
+        import notifications as _notif
+    except Exception as exc:
+        return jsonify({"error": f"notifications import: {exc}"}), 500
+
+    results = []
+    try:
+        # list every user that has any portfolio
+        users_seen: set = set()
+        for u_doc in db.collection("users").stream():
+            uid = u_doc.id
+            if uid in users_seen:
+                continue
+            users_seen.add(uid)
+            try:
+                r = _notif.send_digest(db, uid, kind=kind)
+                results.append({"uid": uid, **r})
+            except Exception as exc:
+                print(f"  digest {uid}: {exc}", flush=True)
+                results.append({"uid": uid, "sent": False, "error": str(exc)[:120]})
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"error": str(exc)}), 500
+
+    return jsonify({"kind": kind, "results": results})
+
+
+@app.route("/api/notifications/scan-events", methods=["POST"])
+def scheduled_scan_events():
+    """
+    Cloud Scheduler target. Per user, diff current family state against the
+    cached snapshot; send immediate emails on new OA / NOA / abandoned.
+    """
+    err = _require_scheduler_key()
+    if err: return err
+    try:
+        import notifications as _notif
+    except Exception as exc:
+        return jsonify({"error": f"notifications import: {exc}"}), 500
+
+    results = []
+    try:
+        for u_doc in db.collection("users").stream():
+            uid = u_doc.id
+            try:
+                r = _notif.scan_events_for_user(db, uid)
+                if r.get("sent", 0) > 0 or r.get("reason"):
+                    results.append({"uid": uid, **r})
+            except Exception as exc:
+                print(f"  event-scan {uid}: {exc}", flush=True)
+                results.append({"uid": uid, "sent": 0, "error": str(exc)[:120]})
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"error": str(exc)}), 500
+
+    return jsonify({"results": results})
+
+
 # ── Excel export (multi-sheet workbook per family) ───────────────────────────
 
 @app.route("/api/portfolios/<portfolio_id>/export.xlsx", methods=["GET"])
