@@ -1048,6 +1048,70 @@ def fetch_odp_documents(app_num: str, api_key: str) -> list[dict]:
         return []
 
 
+def fetch_odp_continuity(app_num: str, api_key: str) -> list[dict]:
+    """
+    Fetch the dedicated ODP continuity endpoint for a US application.
+
+    USPTO's /applications/{id} endpoint only returns a lightweight continuity
+    summary (often limited to direct parents).  The dedicated /continuity
+    endpoint returns the full parent/child chain including continuations,
+    CIPs, and divisionals that don't appear on the main record.
+
+    Returns a list of related-app dicts with shape:
+        { side: "parent"|"child", app_num, filing, patent, relation }
+    Empty list on any error or unsupported response.
+    """
+    clean = _clean_app_num(app_num)
+    if not clean:
+        return []
+    out: list[dict] = []
+    try:
+        for attempt in range(3):
+            resp = requests.get(
+                f"https://api.uspto.gov/api/v1/patent/applications/{clean}/continuity",
+                headers={"X-API-Key": api_key, "Accept": "application/json"},
+                timeout=20,
+            )
+            if resp.status_code in (429, 503) and attempt < 2:
+                wait = (2 ** attempt) + random.uniform(0.5, 2.0)
+                print(f"  ODP continuity {resp.status_code} — retry in {wait:.1f}s …")
+                _time.sleep(wait)
+                continue
+            if resp.status_code in (403, 404):
+                return []
+            resp.raise_for_status()
+            break
+        else:
+            return []
+        data = resp.json()
+        bag  = data.get("patentFileWrapperDataBag") or [{}]
+        for entry in bag:
+            for side, key in (("parent", "parentContinuityBag"),
+                              ("child",  "childContinuityBag")):
+                for cb in entry.get(key, []) or []:
+                    raw = (
+                        cb.get("parentApplicationNumberText")
+                        or cb.get("childApplicationNumberText")
+                        or cb.get("applicationNumberText", "")
+                    )
+                    ca = _clean_app_num(raw)
+                    if not ca:
+                        continue
+                    out.append({
+                        "side":     side,
+                        "app_num":  ca,
+                        "filing":   (cb.get("parentApplicationFilingDate")
+                                     or cb.get("childApplicationFilingDate", "")),
+                        "patent":   (cb.get("parentPatentNumber")
+                                     or cb.get("childPatentNumber", "")),
+                        "relation": (cb.get("claimParentageTypeCode")
+                                     or cb.get("continuityTypeText", "")),
+                    })
+    except Exception as exc:
+        print(f"  ODP continuity error for {clean}: {str(exc)[:80]}")
+    return out
+
+
 def fetch_us_member_via_odp(member: dict, api_key: str) -> dict | None:
     """
     Fetch US patent family member details from the USPTO Open Data Portal

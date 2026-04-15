@@ -266,7 +266,9 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
     # application we just fetched, walk parent and child continuity links
     # breadth-first until we've visited every related US app. Each newly
     # discovered app is fetched via ODP (not EPO, not GP) so its status,
-    # events, and filing info are all authoritative.
+    # events, and filing info are all authoritative. We call the dedicated
+    # /continuity endpoint for each app to get the full parent+child chain
+    # (the main /applications/{id} endpoint only carries direct parents).
     if api_key:
         known = {tracker._clean_app_num(m.get("app_num", "")) for m in family_details}
         known.discard("")
@@ -278,32 +280,28 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
             if not cur or cur in visited:
                 continue
             visited.add(cur)
-            # Either find the already-hydrated member or fetch a fresh ODP record
-            existing = next(
-                (m for m in family_details
-                 if tracker._clean_app_num(m.get("app_num", "")) == cur),
-                None,
-            )
-            if existing is not None:
-                rels = existing.get("related_us_apps") or []
-            else:
+
+            # Ensure this app is in family_details. If not, fetch via ODP.
+            if cur not in known:
                 stub = {"pub_num": f"US{cur}", "app_num": cur, "country": "US",
                         "href": "", "title": "", "date": "", "lang": ""}
-                det = tracker.fetch_us_member_via_odp(stub, api_key)
-                if not det or det.get("fetch_error"):
-                    continue
-                # Re-run through fetch_member_details so status/docs are consistent
                 det_full = tracker.fetch_member_details(
                     stub, 0, 0, odp_api_key=api_key
                 )
-                family_details.append(det_full)
-                extras.append(det_full)
-                known.add(cur)
-                rels = det_full.get("related_us_apps") or []
+                if det_full and not det_full.get("fetch_error"):
+                    family_details.append(det_full)
+                    extras.append(det_full)
+                    known.add(cur)
+
+            # Walk the full continuity chain for this app via the dedicated
+            # /continuity endpoint (richer than the basic bag fields).
+            rels = tracker.fetch_odp_continuity(cur, api_key)
+            print(f"    continuity {cur}: {len(rels)} link(s)")
             for rel in rels:
                 rel_app = rel.get("app_num", "")
                 if rel_app and rel_app not in visited:
                     queue.append(rel_app)
+
         print(f"  ODP continuity BFS: +{len(extras)} US member(s)")
 
     # ── Build summaries + dashboard from (possibly enriched) family ──────────
