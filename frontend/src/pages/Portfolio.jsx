@@ -2,6 +2,7 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 import PrintBar from "../PrintBar";
+import AssignmentsTab from "../AssignmentsTab";
 import DocumentsPanel from "../DocumentsPanel";
 import { useIsMobile } from "../useIsMobile";
 
@@ -203,6 +204,9 @@ export default function Portfolio() {
   const [viewingGroup, setViewingGroup] = useState(null);    // { id, name, dashboard_html } or ad-hoc preview
   const [groupSaveName, setGroupSaveName] = useState("");
   const groupIframeRef = useRef(null);
+
+  // ── Dashboard tab (Family Dashboard vs Assignments vs …) ─────────────────
+  const [activeTab, setActiveTab] = useState("dashboard");
 
   const iframeRef         = useRef(null);
   const notesRef          = useRef({});   // always-current notes for the open dashboard
@@ -927,17 +931,43 @@ export default function Portfolio() {
             ⚠️ Refresh failed: {refreshError} — your cached dashboard is still shown below.
           </div>
         )}
-        <PrintBar iframeRef={iframeRef} />
-        <div style={styles.iframeWrap}>
-          <iframe
-            ref={iframeRef}
-            title="Patent Dashboard"
-            style={styles.iframe}
-            srcDoc={viewing.dashboard_html}
-            sandbox="allow-scripts allow-same-origin allow-modals allow-popups"
-            onLoad={handleIframeLoad}
-          />
+        <div style={styles.tabBar}>
+          {[
+            { key: "dashboard",   label: "📊 Family Dashboard" },
+            { key: "assignments", label: "🏛 Assignments" },
+          ].map((t) => (
+            <button
+              key={t.key}
+              onClick={() => setActiveTab(t.key)}
+              style={{
+                ...styles.tabBtn,
+                ...(activeTab === t.key ? styles.tabBtnActive : {}),
+              }}
+            >
+              {t.label}
+            </button>
+          ))}
         </div>
+        {activeTab === "dashboard" && (
+          <>
+            <PrintBar iframeRef={iframeRef} />
+            <div style={styles.iframeWrap}>
+              <iframe
+                ref={iframeRef}
+                title="Patent Dashboard"
+                style={styles.iframe}
+                srcDoc={viewing.dashboard_html}
+                sandbox="allow-scripts allow-same-origin allow-modals allow-popups"
+                onLoad={handleIframeLoad}
+              />
+            </div>
+          </>
+        )}
+        {activeTab === "assignments" && (
+          <div style={styles.iframeWrap}>
+            <AssignmentsTab portfolioId={viewingId} />
+          </div>
+        )}
       </div>
     );
   }
@@ -1189,6 +1219,12 @@ const styles = {
     color: "#856404", fontSize: 13, lineHeight: 1.5,
   },
   iframe:      { width: "100%", height: "85vh", border: "none", display: "block" },
+  tabBar:      { display: "flex", gap: 4, marginBottom: 8 },
+  tabBtn:      { padding: "8px 16px", borderRadius: "8px 8px 0 0",
+    border: "1px solid #e0e0e0", borderBottom: "none", background: "#f8f9fa",
+    cursor: "pointer", fontSize: 13, fontWeight: 600, color: "#666" },
+  tabBtnActive:{ background: "#fff", color: "#1a73e8",
+    borderTop: "3px solid #1a73e8", boxShadow: "0 -1px 0 #fff" },
   groupsWrap:  { marginBottom: 20, padding: "12px 16px", background: "#f8f9fa",
     borderRadius: 10, border: "1px solid #e0e0e0" },
   groupsHeader:{ display: "flex", alignItems: "baseline", justifyContent: "space-between",

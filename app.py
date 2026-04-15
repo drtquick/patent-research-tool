@@ -1633,6 +1633,84 @@ def list_searches():
         return jsonify({"error": str(exc)}), 500
 
 
+# ── Assignments (USPTO Assignment chain per family member) ─────────────────
+
+@app.route("/api/portfolios/<portfolio_id>/assignments", methods=["GET"])
+@require_auth
+def get_portfolio_assignments(portfolio_id):
+    """
+    Return the full USPTO assignment chain for every US family member in the
+    portfolio. Response shape:
+    {
+        "members": [
+            {
+                "pub_num":         "US12178560B2",
+                "app_num":         "17134990",
+                "display_number":  "US 12,178,560 B2",
+                "status":          "granted",
+                "assignments":     [ <assignment events>, ... ],
+                "current_assignees": [ "VETOLOGY INNOVATIONS, LLC" ]
+            },
+            ...
+        ],
+        "unique_assignees": [ "VETOLOGY INNOVATIONS, LLC", ... ]
+    }
+    Used by the Assignments tab on the dashboard.
+    """
+    try:
+        ref = (
+            db.collection("users").document(request.uid)
+              .collection("portfolios").document(portfolio_id)
+        )
+        snap = ref.get()
+        if not snap.exists:
+            return jsonify({"error": "Not found"}), 404
+        data = snap.to_dict() or {}
+        family = data.get("family", []) or []
+
+        api_key = os.environ.get("USPTO_ODP_API_KEY", "").strip()
+        out_members: list[dict] = []
+        unique: dict[str, int] = {}
+
+        for m in family:
+            pub = (m.get("pub_num") or "").upper()
+            if not pub.startswith("US") and m.get("country") != "US":
+                continue
+            app_num = tracker._clean_app_num(m.get("app_num", ""))
+            if not app_num:
+                continue
+            assigns = tracker.fetch_odp_assignments(app_num, api_key) if api_key else []
+            # Current assignees = assignees from the most recent ASSIGNMENT
+            # OF ASSIGNORS INTEREST; skip security interests / mergers unless
+            # no plain assignment exists.
+            current: list[str] = []
+            plain = [a for a in assigns
+                     if "ASSIGNMENT OF ASSIGNOR" in (a.get("conveyance") or "").upper()]
+            pick = plain[-1] if plain else (assigns[-1] if assigns else None)
+            if pick:
+                current = [e["name"] for e in pick.get("assignees", []) if e.get("name")]
+            display = m.get("pub_num", "")
+            if m.get("status") == "granted":
+                display = tracker._format_us_patent_num(display) or display
+            out_members.append({
+                "pub_num":           m.get("pub_num", ""),
+                "app_num":           app_num,
+                "display_number":    display,
+                "status":            m.get("status", "unknown"),
+                "assignments":       assigns,
+                "current_assignees": current,
+            })
+            for name in current:
+                if name:
+                    unique[name] = unique.get(name, 0) + 1
+
+        unique_list = sorted(unique.keys(), key=lambda n: (-unique[n], n))
+        return jsonify({"members": out_members, "unique_assignees": unique_list})
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"error": str(exc)}), 500
+
+
 # ── Patentee groups (combined multi-family dashboards) ───────────────────────
 
 def _render_combined_dashboard(group_name: str, members: list[dict]) -> str:

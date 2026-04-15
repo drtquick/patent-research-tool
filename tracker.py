@@ -1048,6 +1048,85 @@ def fetch_odp_documents(app_num: str, api_key: str) -> list[dict]:
         return []
 
 
+def fetch_odp_assignments(app_num: str, api_key: str) -> list[dict]:
+    """
+    Fetch the USPTO assignment chain for a US application from the ODP
+    /applications/{id}/assignment endpoint. Returns a list of assignment
+    events sorted oldest-first with shape:
+        {
+            "recorded_date":     "YYYY-MM-DD",
+            "execution_date":    "YYYY-MM-DD",  # earliest assignor exec date
+            "conveyance":        "ASSIGNMENT OF ASSIGNOR'S INTEREST" | "SECURITY AGREEMENT" | ...,
+            "assignors":         [ {name, execution_date}, ... ],
+            "assignees":         [ {name, city, state, country}, ... ],
+            "reel_frame":        "058854/0814",
+            "document_url":      "https://assignmentcenter.uspto.gov/...",
+            "pages":             33
+        }
+    Empty list on error or no assignments.
+    """
+    clean = _clean_app_num(app_num)
+    if not clean:
+        return []
+    try:
+        for attempt in range(3):
+            resp = requests.get(
+                f"https://api.uspto.gov/api/v1/patent/applications/{clean}/assignment",
+                headers={"X-API-Key": api_key, "Accept": "application/json"},
+                timeout=20,
+            )
+            if resp.status_code in (429, 503) and attempt < 2:
+                wait = (2 ** attempt) + random.uniform(0.5, 2.0)
+                _time.sleep(wait)
+                continue
+            if resp.status_code in (404, 403):
+                return []
+            resp.raise_for_status()
+            break
+        else:
+            return []
+        data = resp.json()
+        bag  = (data.get("patentFileWrapperDataBag") or [{}])[0]
+        raw  = bag.get("assignmentBag") or []
+        out: list[dict] = []
+        for a in raw:
+            assignors = []
+            earliest_exec = ""
+            for s in a.get("assignorBag", []) or []:
+                ed = s.get("executionDate", "") or ""
+                if ed and (not earliest_exec or ed < earliest_exec):
+                    earliest_exec = ed
+                assignors.append({
+                    "name":            (s.get("assignorName") or "").strip(),
+                    "execution_date":  ed,
+                })
+            assignees = []
+            for e in a.get("assigneeBag", []) or []:
+                addr = e.get("assigneeAddress") or {}
+                assignees.append({
+                    "name":     (e.get("assigneeNameText") or "").strip(),
+                    "city":     addr.get("cityName", ""),
+                    "state":    addr.get("ictStateCode") or addr.get("geographicRegionCode", ""),
+                    "country":  addr.get("ictCountryCode", ""),
+                })
+            out.append({
+                "recorded_date":  a.get("assignmentRecordedDate", "") or "",
+                "execution_date": earliest_exec,
+                "conveyance":     (a.get("conveyanceText") or "").strip(),
+                "assignors":      assignors,
+                "assignees":      assignees,
+                "reel_frame":     a.get("reelAndFrameNumber", ""),
+                "document_url":   a.get("assignmentDocumentLocationURI", ""),
+                "pages":          a.get("pageTotalQuantity", 0),
+            })
+        # Oldest first — natural flow of the chain
+        out.sort(key=lambda x: x.get("recorded_date") or "")
+        return out
+    except Exception as exc:
+        print(f"  ODP assignments error for {clean}: {str(exc)[:80]}")
+        return []
+
+
 def fetch_odp_continuity(app_num: str, api_key: str) -> list[dict]:
     """
     Fetch the dedicated ODP continuity endpoint for a US application.

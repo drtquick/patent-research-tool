@@ -89,6 +89,10 @@ export const api = {
   deletePortfolioFile: (id, fileId) =>
     authFetch(`/api/portfolios/${id}/files/${fileId}`, { method: "DELETE" }),
 
+  // Assignment chain per US family member
+  getPortfolioAssignments: (id) =>
+    authFetch(`/api/portfolios/${id}/assignments`),
+
   // ── Patentee groups (combined multi-family dashboards) ───────────────────
 
   listPatenteeGroups: () => authFetch("/api/patentee-groups"),
