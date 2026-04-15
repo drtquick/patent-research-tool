@@ -560,6 +560,31 @@ export default function Portfolio() {
               )}
               {aiResult && (
                 <div style={aiStyles.resultWrap}>
+                  {aiResult.error && (
+                    <div style={aiStyles.errorBox}>
+                      <strong>Analysis error:</strong> {aiResult.error}
+                      {aiResult.raw_response && (
+                        <details style={{ marginTop: 8 }}>
+                          <summary style={{ cursor: "pointer", fontSize: 12 }}>Raw response</summary>
+                          <pre style={{ fontSize: 11, background: "#fff", padding: 8, borderRadius: 4, overflow: "auto", maxHeight: 200 }}>
+                            {aiResult.raw_response}
+                          </pre>
+                        </details>
+                      )}
+                    </div>
+                  )}
+                  {!aiResult.error && !aiResult.rejections && !aiResult.overview && !aiResult.oa_type && (
+                    <div style={{ padding: 14, background: "#fff7ed", border: "1px solid #fed7aa",
+                                  borderRadius: 8, color: "#c2410c", fontSize: 13 }}>
+                      Analysis returned, but in an unexpected shape. Download the PDF below and review manually.
+                      <details style={{ marginTop: 8 }}>
+                        <summary style={{ cursor: "pointer", fontSize: 12 }}>Response JSON</summary>
+                        <pre style={{ fontSize: 11, background: "#fff", padding: 8, borderRadius: 4, overflow: "auto", maxHeight: 300 }}>
+                          {JSON.stringify(aiResult, null, 2)}
+                        </pre>
+                      </details>
+                    </div>
+                  )}
                   {/* OA Type + Deadlines + PDF */}
                   <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 16, alignItems: "center" }}>
                     {aiResult.oa_type && (

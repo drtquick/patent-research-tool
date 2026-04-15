@@ -1178,6 +1178,16 @@ def fetch_us_member_via_odp(member: dict, api_key: str) -> dict | None:
         result["filing_date"]  = meta.get("filingDate",  "") or ""
         result["grant_date"]   = meta.get("grantDate",   "") or ""
         result["app_num"]      = _clean_app_num(bag.get("applicationNumberText") or app_num)
+        # Upgrade the stub pub_num to the real publication number when ODP
+        # has one. This matters for pending apps whose initial stub was
+        # just "US{app_num}"; the PDF button and EPO lookups need the real
+        # publication (e.g. "US2023325714A1" or "US12178560B2").
+        patent_number = (meta.get("patentNumber") or "").strip()
+        earliest_pub  = (meta.get("earliestPublicationNumber") or "").strip()
+        if patent_number:
+            result["pub_num"] = f"US{patent_number}B2"
+        elif earliest_pub:
+            result["pub_num"] = earliest_pub
         result["member_title"] = (meta.get("inventionTitle") or "").strip() or result["member_title"]
         result["status"]       = _odp_status_to_standard(
                                      meta.get("applicationStatusDescriptionText", ""))

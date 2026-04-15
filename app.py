@@ -2055,6 +2055,15 @@ def ai_analyze_oa():
         else:
             return jsonify({"error": "OA PDF download failed"}), 502
 
+        # Log the response shape so we can see what Claude returned
+        _keys = list(result.keys()) if isinstance(result, dict) else "not-a-dict"
+        print(f"  Analyze OA: Claude returned keys={_keys}")
+        if result.get("error"):
+            print(f"  Analyze OA: error = {result.get('error')}")
+            _raw = result.get("raw_response", "")
+            if _raw:
+                print(f"  Analyze OA: raw_response[:500] = {_raw[:500]}")
+
         # Attach convenience fields to the result
         if pdf_url:
             result["pdf_url"]      = pdf_url
