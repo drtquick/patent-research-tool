@@ -4,6 +4,7 @@ import { api } from "../api";
 import PrintBar from "../PrintBar";
 import AssignmentsTab from "../AssignmentsTab";
 import PriorArtTab from "../PriorArtTab";
+import ClaimsTab from "../ClaimsTab";
 import DocumentsPanel from "../DocumentsPanel";
 import { useIsMobile } from "../useIsMobile";
 
@@ -935,8 +936,9 @@ export default function Portfolio() {
         <div style={styles.tabBar}>
           {[
             { key: "dashboard",   label: "📊 Family Dashboard" },
-            { key: "assignments", label: "🏛 Assignments" },
+            { key: "claims",      label: "📋 Claims" },
             { key: "prior_art",   label: "📚 Prior Art" },
+            { key: "assignments", label: "🏛 Assignments" },
           ].map((t) => (
             <button
               key={t.key}
@@ -968,6 +970,11 @@ export default function Portfolio() {
         {activeTab === "assignments" && (
           <div style={styles.iframeWrap}>
             <AssignmentsTab portfolioId={viewingId} />
+          </div>
+        )}
+        {activeTab === "claims" && (
+          <div style={styles.iframeWrap}>
+            <ClaimsTab portfolioId={viewingId} />
           </div>
         )}
         {activeTab === "prior_art" && (

@@ -218,6 +218,100 @@ class PatentAI:
 
     # ── Public methods ────────────────────────────────────────────────────────
 
+    def extract_independent_claims_from_pdf(self, pdf_bytes: bytes,
+                                            context: Optional[dict] = None) -> list[dict]:
+        """
+        Ask Claude to read a USPTO patent or claims PDF and return the
+        independent claims only (those that don't reference another claim).
+        Each claim: { "num": "1", "text": "...full claim text..." }.
+        Maintains leading roman/latin numeral, keeps original indentation
+        for element steps when possible.
+        """
+        import base64 as _b64
+        if not pdf_bytes:
+            return []
+        pdf_b64 = _b64.b64encode(pdf_bytes).decode("ascii")
+
+        ctx_hdr = ""
+        if context:
+            ctx_hdr = (
+                f"Document is for US application/patent "
+                f"{context.get('pub_num', '')} / app "
+                f"{context.get('app_num', '')} "
+                f"(status: {context.get('status', '')})."
+            )
+
+        schema = """
+Return ONE JSON object:
+{ "claims": [ { "num": "1", "text": "...verbatim claim text..." }, ... ] }
+
+Rules:
+- Extract ONLY independent claims — claims that do NOT begin with "The X of claim N" / "According to claim N" / similar. Skip dependent claims entirely.
+- Preserve the claim verbatim. Keep element list formatting as printed (e.g., "(a)", "(b)") when the original uses them. Use \\n where there is a paragraph break.
+- If the PDF has multiple versions (as-filed vs amended vs canceled), use the MOST RECENT set. If claims are marked with strike-throughs / underlines, use the clean (amended) text without the markup.
+- Omit claims marked CANCELED / CANCELLED / WITHDRAWN.
+- If no independent claims are present, return { "claims": [] }.
+Output JSON ONLY, no surrounding prose.
+"""
+
+        user_blocks = [
+            {"type": "document", "source": {"type": "base64",
+                                             "media_type": "application/pdf", "data": pdf_b64}},
+            {"type": "text", "text": f"{ctx_hdr}\n\nExtract the independent claims.\n\n{schema}"},
+        ]
+        try:
+            response = self.client.messages.create(
+                model=self.MODEL,
+                max_tokens=8000,
+                system="You are an expert at reading US patent documents and extracting verbatim claim text. Output JSON only.",
+                messages=[{"role": "user", "content": user_blocks}],
+            )
+            raw = response.content[0].text.strip()
+            if raw.startswith("```"):
+                lines = raw.split("\n")
+                raw = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
+                raw = raw.strip()
+            data = json.loads(raw)
+            claims = data.get("claims") or []
+            return [{"num": str(c.get("num", "")).strip(),
+                     "text": (c.get("text") or "").strip()} for c in claims]
+        except Exception as exc:
+            print(f"  extract_independent_claims_from_pdf: {exc}")
+            return []
+
+    def summarize_claim_differences(self, claim_sets: list[dict]) -> str:
+        """
+        Given a list of { identifier, claims: [...] } (one per family member),
+        produce a concise comparison paragraph highlighting how the independent
+        claims differ across the family — scope breadth, common elements, and
+        key distinguishing limitations.
+        """
+        if not claim_sets:
+            return ""
+        lines = ["Compare these US patent/application claim sets and produce a short paragraph (3-6 sentences) that:"]
+        lines.append("- identifies the common inventive concept,")
+        lines.append("- notes the key scope differences across the independent claims,")
+        lines.append("- points out any claim set that is materially narrower or broader than the others,")
+        lines.append("- avoids legal conclusions; keep it factual and comparative.")
+        lines.append("")
+        for cs in claim_sets:
+            lines.append(f"=== {cs.get('identifier','?')} ===")
+            for c in cs.get("claims") or []:
+                lines.append(f"Claim {c.get('num','?')}: {c.get('text','')[:1500]}")
+            lines.append("")
+        user = "\n".join(lines)
+        try:
+            response = self.client.messages.create(
+                model=self.MODEL,
+                max_tokens=800,
+                system="You are a patent attorney summarizing claim scope differences. Write one tight paragraph, no headings, no bullet points.",
+                messages=[{"role": "user", "content": user}],
+            )
+            return response.content[0].text.strip()
+        except Exception as exc:
+            print(f"  summarize_claim_differences: {exc}")
+            return ""
+
     def extract_references_from_pdf(self, pdf_bytes: bytes, doc_type: str = "IDS") -> list[dict]:
         """
         Ask Claude to read a USPTO prior-art PDF (IDS / 1449 / 892 Notice of

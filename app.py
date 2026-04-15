@@ -1635,6 +1635,123 @@ def list_searches():
 
 # ── Assignments (USPTO Assignment chain per family member) ─────────────────
 
+def _find_best_claims_doc(app_num: str, api_key: str) -> dict | None:
+    """
+    For a pending US application, pick the PDF most likely to contain the
+    CURRENT claim set. Preference order: CLM (Claims as amended) > CLAIM >
+    most recent REM (Applicant Arguments/Remarks — also carries amended
+    claims) > SPEC (original specification). Returns the doc dict or None.
+    """
+    try:
+        docs = tracker.fetch_odp_documents(app_num, api_key) or []
+    except Exception:
+        return None
+    by_code_latest: dict[str, dict] = {}
+    for d in sorted(docs, key=lambda x: x.get("date", ""), reverse=True):
+        code = (d.get("code") or "").upper()
+        if code not in by_code_latest and d.get("download_url"):
+            by_code_latest[code] = d
+    for code in ("CLM", "CLAIM", "CLM.AM", "REM", "SPEC"):
+        if code in by_code_latest:
+            return by_code_latest[code]
+    return None
+
+
+def _get_claims_for_member(member: dict, request_uid: str | None = None) -> list[dict]:
+    """
+    Fetch the independent claims for a US family member:
+      - Granted: pull the patent PDF (via /api/pdf logic) and run Claude extractor.
+      - Pending:  pull the latest CLM (or equivalent) from IFW and run Claude extractor.
+    Results cached in Firestore at users/{uid}/ai_claims_cache/{app_num}__{doc_hash}.
+    """
+    import hashlib as _hl
+    import requests as _rq
+
+    app_num = tracker._clean_app_num(member.get("app_num", ""))
+    pub_num = member.get("pub_num", "")
+    if not app_num and not pub_num:
+        return []
+    api_key = os.environ.get("USPTO_ODP_API_KEY", "").strip()
+
+    # Decide which PDF to send
+    doc_source = ""
+    doc_sig    = ""
+    pdf_bytes: bytes | None = None
+
+    if member.get("status") == "granted":
+        # Fetch the granted patent PDF — the same multi-source helper we use
+        # for the tile PDF button.
+        doc_source = "patent_pdf"
+        try:
+            pdf_bytes = _download_patent_pdf(pub_num)
+            doc_sig = pub_num
+        except Exception as exc:
+            print(f"  claims {pub_num}: patent PDF download failed ({exc})", flush=True)
+            pdf_bytes = None
+    else:
+        if not api_key:
+            return []
+        doc = _find_best_claims_doc(app_num, api_key)
+        if not doc:
+            return []
+        doc_source = (doc.get("code") or "").upper()
+        doc_sig    = f"{doc.get('code')}:{doc.get('date')}"
+        try:
+            resp = _rq.get(doc["download_url"],
+                           headers={"X-API-Key": api_key}, timeout=30)
+            resp.raise_for_status()
+            pdf_bytes = resp.content
+        except Exception as exc:
+            print(f"  claims {app_num}: {doc.get('code')} download failed ({exc})", flush=True)
+            return []
+
+    if not pdf_bytes:
+        return []
+
+    cache_id = f"{app_num or pub_num}__{_hl.sha1(doc_sig.encode()).hexdigest()[:16]}"
+    cache_ref = None
+    if request_uid:
+        try:
+            cache_ref = (
+                db.collection("users").document(request_uid)
+                  .collection("ai_claims_cache")
+            )
+            snap = cache_ref.document(cache_id).get()
+            if snap.exists:
+                return (snap.to_dict() or {}).get("claims", []) or []
+        except Exception:
+            cache_ref = None
+
+    try:
+        from ai_engine import PatentAI
+        ai = PatentAI()
+    except Exception as exc:
+        print(f"  claims: PatentAI init failed ({exc})", flush=True)
+        return []
+
+    claims = ai.extract_independent_claims_from_pdf(
+        pdf_bytes,
+        context={"pub_num": pub_num, "app_num": app_num,
+                 "status": member.get("status", "")},
+    )
+    print(f"  claims {app_num or pub_num} ({doc_source}): {len(claims)} independent", flush=True)
+
+    if cache_ref is not None:
+        try:
+            cache_ref.document(cache_id).set({
+                "app_num":    app_num,
+                "pub_num":    pub_num,
+                "claims":     claims,
+                "doc_source": doc_source,
+                "doc_sig":    doc_sig,
+                "cached_at":  datetime.now(timezone.utc),
+            })
+        except Exception as exc:
+            print(f"  claims cache save failed ({exc})", flush=True)
+
+    return claims
+
+
 def _ai_scan_pending_references(app_num: str, request_uid: str | None = None) -> list[dict]:
     """
     Pull the latest IDS (applicant) and 892 (examiner) PDFs for a pending US
@@ -1732,6 +1849,71 @@ def _ai_scan_pending_references(app_num: str, request_uid: str | None = None) ->
             print(f"  ai_scan_refs {app_num}: cache save failed ({exc})", flush=True)
 
     return refs
+
+
+@app.route("/api/portfolios/<portfolio_id>/claims", methods=["GET"])
+@require_auth
+def get_portfolio_claims(portfolio_id):
+    """
+    Return independent claims per US family member plus an AI-authored
+    summary of how they differ. Results are cached so repeat loads on
+    unchanged claim sets cost zero Claude tokens.
+
+    Query params:
+      summary=1  → also run the AI comparative summary across all members
+    """
+    do_summary = (request.args.get("summary") or "").strip() in ("1", "true", "yes")
+    try:
+        ref = (
+            db.collection("users").document(request.uid)
+              .collection("portfolios").document(portfolio_id)
+        )
+        snap = ref.get()
+        if not snap.exists:
+            return jsonify({"error": "Not found"}), 404
+        data = snap.to_dict() or {}
+        family = data.get("family", []) or []
+
+        out_members: list[dict] = []
+        for m in family:
+            pub = (m.get("pub_num") or "").upper()
+            if not pub.startswith("US") and m.get("country") != "US":
+                continue
+            if m.get("status") in ("abandoned", "expired", "rejected", "lapsed"):
+                continue
+            claims = _get_claims_for_member(m, request_uid=request.uid)
+            display = m.get("pub_num", "")
+            if m.get("status") == "granted":
+                display = tracker._format_us_patent_num(display) or display
+            out_members.append({
+                "pub_num":        m.get("pub_num", ""),
+                "app_num":        tracker._clean_app_num(m.get("app_num", "")),
+                "display_number": display,
+                "status":         m.get("status", "unknown"),
+                "claims":         claims,
+            })
+
+        summary_text = ""
+        if do_summary and any(c.get("claims") for c in out_members):
+            try:
+                from ai_engine import PatentAI
+                _ai = PatentAI()
+                sets = [
+                    {"identifier": c.get("display_number") or c.get("pub_num"),
+                     "claims":     c.get("claims") or []}
+                    for c in out_members if c.get("claims")
+                ]
+                summary_text = _ai.summarize_claim_differences(sets)
+            except Exception as exc:
+                print(f"  claims summary failed ({exc})", flush=True)
+
+        return jsonify({
+            "members":        out_members,
+            "summary":        summary_text,
+        })
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"error": str(exc)}), 500
 
 
 @app.route("/api/portfolios/<portfolio_id>/prior-art", methods=["GET"])

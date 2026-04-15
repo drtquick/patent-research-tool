@@ -93,6 +93,10 @@ export const api = {
   getPortfolioAssignments: (id) =>
     authFetch(`/api/portfolios/${id}/assignments`),
 
+  // Claims summary: independent claims per US member + optional AI summary
+  getPortfolioClaims: (id, { summary = false } = {}) =>
+    authFetch(`/api/portfolios/${id}/claims${summary ? "?summary=1" : ""}`),
+
   // Aggregated prior-art citations per US family member.
   // Pass { aiScan: true } to ALSO run Claude against the latest IDS + 892
   // PDFs on pending apps. Results are cached in Firestore by doc set hash.
