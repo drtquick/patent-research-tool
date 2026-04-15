@@ -2021,6 +2021,28 @@ def ai_analyze():
         return jsonify({"error": f"AI analysis failed: {exc}"}), 500
 
 
+_STORAGE_CLIENT = None
+def _get_storage_client():
+    """
+    Build a Google Cloud Storage client using the Firebase service-account
+    credentials (which include a private key for signing URLs). The default
+    Cloud Run compute credentials can't sign blobs.
+    """
+    global _STORAGE_CLIENT
+    if _STORAGE_CLIENT is not None:
+        return _STORAGE_CLIENT
+    from google.cloud import storage as _gcs
+    sa_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
+    if sa_json:
+        import json as _json
+        from google.oauth2 import service_account as _sa
+        creds = _sa.Credentials.from_service_account_info(_json.loads(sa_json))
+        _STORAGE_CLIENT = _gcs.Client(project="patent-research-tool", credentials=creds)
+    else:
+        _STORAGE_CLIENT = _gcs.Client(project="patent-research-tool")
+    return _STORAGE_CLIENT
+
+
 def _parse_patent_number(reference: str) -> str:
     """
     Extract a normalized patent/publication number from a free-form citation
@@ -2087,9 +2109,8 @@ def _attach_prior_art_to_tile(result: dict, uid: str, portfolio_id: str,
                 print(f"  Prior art {pnum}: no PDF available")
                 continue
             # Upload to Storage
-            from google.cloud import storage as _gcs
-            client = _gcs.Client(project="patent-research-tool")
-            bucket = client.bucket("patent-research-tool.appspot.com")
+            client = _get_storage_client()
+            bucket = client.bucket("patent-research-tool-files")
             safe_pub = pub_num.replace("/", "_")
             storage_path = f"users/{uid}/prior_art/{portfolio_id}/{safe_pub}/{pnum}.pdf"
             blob = bucket.blob(storage_path)
@@ -2140,9 +2161,8 @@ def _upload_oa_pdf(pdf_bytes: bytes, uid: str, portfolio_id: str,
     a signed URL valid for 24 hours. Returns empty string on any failure.
     """
     try:
-        from google.cloud import storage as _gcs
-        client = _gcs.Client(project="patent-research-tool")
-        bucket = client.bucket("patent-research-tool.appspot.com")
+        client = _get_storage_client()
+        bucket = client.bucket("patent-research-tool-files")
         safe_pub = pub_num.replace("/", "_")
         code     = (oa_doc.get("code") or "OA").upper()
         date     = (oa_doc.get("date") or "").replace("-", "")
