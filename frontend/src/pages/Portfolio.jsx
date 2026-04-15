@@ -5,6 +5,7 @@ import PrintBar from "../PrintBar";
 import AssignmentsTab from "../AssignmentsTab";
 import PriorArtTab from "../PriorArtTab";
 import ClaimsTab from "../ClaimsTab";
+import TimelineTab from "../TimelineTab";
 import DocumentsPanel from "../DocumentsPanel";
 import { useIsMobile } from "../useIsMobile";
 
@@ -936,6 +937,7 @@ export default function Portfolio() {
         <div style={styles.tabBar}>
           {[
             { key: "dashboard",   label: "📊 Family Dashboard" },
+            { key: "timeline",    label: "🕒 Timeline" },
             { key: "claims",      label: "📋 Claims" },
             { key: "prior_art",   label: "📚 Prior Art" },
             { key: "assignments", label: "🏛 Assignments" },
@@ -970,6 +972,11 @@ export default function Portfolio() {
         {activeTab === "assignments" && (
           <div style={styles.iframeWrap}>
             <AssignmentsTab portfolioId={viewingId} />
+          </div>
+        )}
+        {activeTab === "timeline" && (
+          <div style={styles.iframeWrap}>
+            <TimelineTab portfolioId={viewingId} />
           </div>
         )}
         {activeTab === "claims" && (

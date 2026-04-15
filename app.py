@@ -1851,6 +1851,116 @@ def _ai_scan_pending_references(app_num: str, request_uid: str | None = None) ->
     return refs
 
 
+@app.route("/api/portfolios/<portfolio_id>/timeline", methods=["GET"])
+@require_auth
+def get_portfolio_timeline(portfolio_id):
+    """
+    Build a filing-timeline graph of every US application/patent in the
+    family plus the continuation links between them. Each node is a US app;
+    each edge is a parent/child continuity relationship (CON/CIP/DIV/PRO).
+    Response:
+      { nodes: [ { app_num, pub_num, display, status, filing_date, grant_date,
+                   is_provisional, is_pct, patent_number } ],
+        edges: [ { from_app, to_app, relation } ] }
+    """
+    try:
+        ref = (
+            db.collection("users").document(request.uid)
+              .collection("portfolios").document(portfolio_id)
+        )
+        snap = ref.get()
+        if not snap.exists:
+            return jsonify({"error": "Not found"}), 404
+        data = snap.to_dict() or {}
+        family = data.get("family", []) or []
+
+        api_key = os.environ.get("USPTO_ODP_API_KEY", "").strip()
+        nodes: dict[str, dict] = {}
+
+        def _pretty_display(app_num: str, m: dict | None) -> str:
+            if m and m.get("status") == "granted":
+                return tracker._format_us_patent_num(m.get("pub_num", "")) or m.get("pub_num", "")
+            return tracker._format_us_app_num(app_num) or app_num
+
+        # Seed with US members from the portfolio
+        for m in family:
+            pub = (m.get("pub_num") or "").upper()
+            if not pub.startswith("US") and m.get("country") != "US":
+                continue
+            app = tracker._clean_app_num(m.get("app_num", ""))
+            if not app:
+                continue
+            is_prov = bool(app[:2] in ("60", "61", "62", "63"))
+            nodes[app] = {
+                "app_num":        app,
+                "pub_num":        m.get("pub_num", ""),
+                "display":        _pretty_display(app, m),
+                "status":         m.get("status", "unknown"),
+                "filing_date":    m.get("filing_date") or m.get("date") or "",
+                "grant_date":     m.get("grant_date", "") or "",
+                "is_provisional": is_prov,
+                "is_pct":         False,
+                "in_portfolio":   True,
+            }
+
+        # Walk continuity from each seed to discover additional US apps
+        edges: list[dict] = []
+        edge_keys: set = set()
+        if api_key:
+            visited: set = set()
+            queue: list = list(nodes.keys())
+            while queue:
+                cur = queue.pop(0)
+                if cur in visited:
+                    continue
+                visited.add(cur)
+                rels = tracker.fetch_odp_continuity(cur, api_key)
+                for r in rels:
+                    other = r.get("app_num", "")
+                    raw   = (r.get("app_raw") or "").upper()
+                    if not other:
+                        continue
+                    # Skip PCT pointers — the WO member already represents them.
+                    if raw.startswith("PCT"):
+                        continue
+                    # Discover new node
+                    if other not in nodes:
+                        nodes[other] = {
+                            "app_num":        other,
+                            "pub_num":        r.get("patent") and f"US{r['patent']}B2" or f"US{other}",
+                            "display":        _pretty_display(other, None),
+                            "status":         "unknown",
+                            "filing_date":    r.get("filing", "") or "",
+                            "grant_date":     "",
+                            "is_provisional": other[:2] in ("60","61","62","63"),
+                            "is_pct":         False,
+                            "in_portfolio":   False,
+                            "patent_number":  r.get("patent", "") or "",
+                        }
+                        queue.append(other)
+                    # Record edge parent → child
+                    if r.get("side") == "parent":
+                        a, b = other, cur
+                    else:
+                        a, b = cur, other
+                    ek = f"{a}>{b}:{r.get('relation','')}"
+                    if ek not in edge_keys:
+                        edge_keys.add(ek)
+                        edges.append({
+                            "from_app":  a,
+                            "to_app":    b,
+                            "relation":  (r.get("relation") or "").upper(),
+                        })
+
+        return jsonify({
+            "nodes": list(nodes.values()),
+            "edges": edges,
+        })
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.route("/api/portfolios/<portfolio_id>/claims", methods=["GET"])
 @require_auth
 def get_portfolio_claims(portfolio_id):

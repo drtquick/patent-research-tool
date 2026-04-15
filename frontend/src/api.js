@@ -93,6 +93,10 @@ export const api = {
   getPortfolioAssignments: (id) =>
     authFetch(`/api/portfolios/${id}/assignments`),
 
+  // Family filing timeline + continuation graph
+  getPortfolioTimeline: (id) =>
+    authFetch(`/api/portfolios/${id}/timeline`),
+
   // Claims summary: independent claims per US member + optional AI summary
   getPortfolioClaims: (id, { summary = false } = {}) =>
     authFetch(`/api/portfolios/${id}/claims${summary ? "?summary=1" : ""}`),
