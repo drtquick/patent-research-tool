@@ -1254,14 +1254,18 @@ def fetch_member_details(member: dict, idx: int, total: int,
             err = (odp_result or {}).get("fetch_error", "unknown")
             print(f"ODP-err({err[:40]}), falling back to GP")
 
-    # ── Standard path: Google Patents ───────────────────────────────────────
+    # ── Standard path: Google Patents (non-US fallback) ─────────────────────
+    # Google Patents is aggressively rate-limiting and often returns 503 for
+    # long sequences. We keep retries low so a blocked GP doesn't stall the
+    # whole search, and on failure we fall back to the EPO-family biblio data
+    # we already have (country, pub_num, app_num, pub_date/app_date, kind).
     result = {
         **member,
         "status":        infer_status(pub_num),
         "events":        [],
         "rejections":    [],
         "backward_refs": [],
-        "filing_date":   "",
+        "filing_date":   member.get("date", "") or "",
         "grant_date":    "",
         "member_title":  member.get("title", ""),
         "fetch_error":   None,
@@ -1271,12 +1275,12 @@ def fetch_member_details(member: dict, idx: int, total: int,
 
     print(f"  [{idx:>2}/{total}] {pub_num:<22} … ", end="", flush=True)
     try:
-        page  = fetch_page(member["href"])
+        page  = fetch_page(member["href"], max_retries=1)
         metas = get_metas(page)
         dates = metas.get("DC.date", [])
-        result["filing_date"]   = dates[0] if dates else ""
+        result["filing_date"]   = dates[0] if dates else result["filing_date"]
         result["grant_date"]    = dates[1] if len(dates) > 1 else ""
-        result["app_num"]       = _first(metas.get("citation_patent_application_number", [])) or ""
+        result["app_num"]       = _first(metas.get("citation_patent_application_number", [])) or member.get("app_num", "")
         result["member_title"]  = (metas.get("DC.title", [""])[0] or member.get("title", "")).strip()
         result["status"]        = infer_status(pub_num, page)
         result["events"]        = parse_legal_events(page)
@@ -1286,15 +1290,13 @@ def fetch_member_details(member: dict, idx: int, total: int,
         )
         print("ok")
     except requests.HTTPError as e:
-        result["fetch_error"] = f"HTTP {e.response.status_code}"
-        if e.response.status_code == 404:
-            result["status"] = "unknown"
-        print(f"HTTP {e.response.status_code}")
+        # On 503/429/etc, don't block — the EPO family data we already loaded
+        # into `result` is enough to render a meaningful tile. Log but proceed.
+        print(f"GP {e.response.status_code} (using EPO biblio fallback)")
     except Exception as e:
-        result["fetch_error"] = str(e)[:60]
-        print("error")
+        print(f"error ({str(e)[:40]}) — EPO biblio fallback")
 
-    _time.sleep(0.5)
+    _time.sleep(0.1)
     return result
 
 
