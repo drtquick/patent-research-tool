@@ -19,6 +19,7 @@ function timeAgo(iso) {
    The placeholder for the input swaps based on the current selection so the
    user can see the expected format before typing. */
 const SEARCH_TYPES = [
+  { value: "auto",               label: "Auto-detect",     placeholder: "Patent number\u2026",          shortLabel: "Auto"         },
   { value: "patent_number",      label: "Patent Number",   placeholder: "e.g. US 10,123,456 B2",        shortLabel: "Patent"       },
   { value: "application_number", label: "Application No.", placeholder: "e.g. 16/123,456 or 16123456",  shortLabel: "Application"  },
   { value: "publication_number", label: "Publication No.", placeholder: "e.g. US 2020/0123456 A1",      shortLabel: "Publication"  },
@@ -30,7 +31,7 @@ export default function Navbar() {
   const isMobile  = useIsMobile(720);
 
   const [q, setQ]                     = useState("");
-  const [searchType, setSearchType]   = useState("patent_number");
+  const [searchType, setSearchType]   = useState("auto");
   const [menuOpen, setMenuOpen]       = useState(false);
   const [history, setHistory]         = useState([]);
   const [histOpen, setHistOpen]       = useState(false);
@@ -63,7 +64,7 @@ export default function Navbar() {
     e.preventDefault();
     const trimmed = q.trim();
     if (!trimmed) return;
-    const typeParam = searchType ? `&type=${searchType}` : "";
+    const typeParam = searchType && searchType !== "auto" ? `&type=${searchType}` : "";
     navigate(`/search?q=${encodeURIComponent(trimmed)}${typeParam}`);
     setQ("");
     setHistOpen(false);
@@ -72,9 +73,8 @@ export default function Navbar() {
     setHistLoaded(false);
   }
 
-  function pickHistory(patentNumber, historySearchType) {
-    const t = historySearchType || searchType || "patent_number";
-    navigate(`/search?q=${encodeURIComponent(patentNumber)}&type=${t}`);
+  function pickHistory(patentNumber) {
+    navigate(`/search?q=${encodeURIComponent(patentNumber)}`);
     setHistOpen(false);
     setMenuOpen(false);
     setHistLoaded(false);
@@ -86,7 +86,7 @@ export default function Navbar() {
     <div style={dd.wrap}>
       <div style={dd.header}>Recent searches</div>
       {history.map((h) => (
-        <button key={h.id} style={dd.item} onMouseDown={() => pickHistory(h.patent_number, h.search_type)}>
+        <button key={h.id} style={dd.item} onMouseDown={() => pickHistory(h.patent_number)}>
           <span style={dd.num}>{h.patent_number}</span>
           <span style={dd.meta}>
             {h.granted_count}✓ {h.pending_count} pending · {timeAgo(h.searched_at)}
@@ -129,7 +129,7 @@ export default function Navbar() {
     return (
       <>
         <nav style={s.navMobile}>
-          <button style={s.brandBtn} onClick={() => navigate("/portfolio")}>PatentQ<span style={s.version}>β 1.48</span></button>
+          <button style={s.brandBtn} onClick={() => navigate("/portfolio")}>PatentQ<span style={s.version}>β 1.49</span></button>
 
           <div style={{ ...s.searchFormMobile, position: "relative" }}>
             <form onSubmit={handleSearch} style={{ display: "flex", gap: 4, flex: 1 }}>
@@ -156,7 +156,6 @@ export default function Navbar() {
         {menuOpen && (
           <div style={s.mobileMenu}>
             <MobileNavLink to="/portfolio" onClick={closeMenu}>Portfolio</MobileNavLink>
-            <MobileNavLink to="/analytics" onClick={closeMenu}>Analytics</MobileNavLink>
             <MobileNavLink to="/alerts"    onClick={closeMenu}>Alerts</MobileNavLink>
             <MobileNavLink to="/settings"  onClick={closeMenu}>Settings</MobileNavLink>
             <div style={s.menuDivider} />
@@ -172,7 +171,7 @@ export default function Navbar() {
   /* ── Desktop layout ─────────────────────────────────── */
   return (
     <nav style={s.nav}>
-      <button style={s.brandBtn} onClick={() => navigate("/portfolio")}>PatentQ<span style={s.version}>β 1.48</span></button>
+      <button style={s.brandBtn} onClick={() => navigate("/portfolio")}>PatentQ<span style={s.version}>β 1.49</span></button>
 
       <div style={{ position: "relative", flex: 1, maxWidth: 520, minWidth: 220 }}>
         <form onSubmit={handleSearch} style={s.searchForm}>
@@ -193,7 +192,6 @@ export default function Navbar() {
 
       <div style={s.links}>
         <NavLink to="/portfolio" style={navStyle}>Portfolio</NavLink>
-        <NavLink to="/analytics" style={navStyle}>Analytics</NavLink>
         <NavLink to="/alerts"    style={navStyle}>Alerts</NavLink>
         <NavLink to="/settings"  style={navStyle}>Settings</NavLink>
       </div>

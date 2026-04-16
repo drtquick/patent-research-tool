@@ -85,142 +85,6 @@ def require_auth(f):
     return wrapper
 
 
-# ── AI deadline annotator ────────────────────────────────────────────────────
-
-def _ai_deadline_cache_key(member: dict) -> str:
-    """
-    Stable hash of a pending app's event state — changes whenever a new event
-    or OA document arrives, invalidating the cached Claude result.
-    """
-    import hashlib as _hl
-    app_num = (member.get("app_num") or "").strip()
-    parts = [app_num, member.get("status", "")]
-    for ev in (member.get("events") or [])[-40:]:
-        parts.append(f"{ev.get('date','')}|{ev.get('code','')}|{(ev.get('title') or '')[:60]}")
-    for d in (member.get("oa_documents") or [])[:25]:
-        parts.append(f"{d.get('date','')}|{d.get('code','')}")
-    return _hl.sha1("::".join(parts).encode()).hexdigest()[:24]
-
-
-def _annotate_ai_deadlines(family_details: list, request_uid: str | None = None) -> None:
-    """
-    For every pending US family member, call Claude to compute the smart
-    next-deadline based on the full file history and attach it to the member
-    as `ai_deadline`. Cached in Firestore under
-    users/{uid}/ai_deadline_cache/{app_num}__{event_hash} so repeat scrapes
-    don't re-spend tokens on unchanged histories.
-
-    Non-fatal: any AI error leaves ai_deadline unset; the tile renderer then
-    falls back to the deterministic rule set.
-    """
-    if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
-        return
-    try:
-        from ai_engine import PatentAI
-    except Exception as exc:
-        print(f"  ai_deadline: import failed ({exc})")
-        return
-
-    cache_ref = None
-    if request_uid:
-        try:
-            cache_ref = db.collection("users").document(request_uid) \
-                         .collection("ai_deadline_cache")
-        except Exception:
-            cache_ref = None
-
-    import re as _re
-    from datetime import date as _dt
-
-    def _would_be_abandoned(m: dict) -> bool:
-        """Mirror the abandoned/lapsed categorization from generate_dashboard_html."""
-        app = _re.sub(r"[^\d]", "", (m.get("app_num") or ""))
-        # Expired US provisional (60/61/62/63 prefix, >12 months old)
-        if _re.match(r"^(60|61|62|63)", app):
-            fd = m.get("filing_date") or ""
-            try:
-                if (_dt.today() - _dt.fromisoformat(fd[:10])).days >= 365:
-                    return True
-            except Exception:
-                pass
-        # PCT (WO) pending past 30 months
-        pub = (m.get("pub_num") or "").upper()
-        if pub.startswith("WO"):
-            fd = m.get("filing_date") or ""
-            try:
-                d = _dt.fromisoformat(fd[:10])
-                if (_dt.today().year - d.year) * 12 + (_dt.today().month - d.month) >= 30:
-                    return True
-            except Exception:
-                pass
-        return False
-
-    ai = None
-    for m in family_details:
-        if m.get("country") != "US" and not m.get("pub_num", "").startswith("US"):
-            continue
-        if m.get("status") not in ("pending", "unknown"):
-            continue
-        if m.get("data_not_available"):
-            continue
-        # Don't spend tokens on tiles that will end up in Abandoned & Lapsed —
-        # no response due is implied for those.
-        if _would_be_abandoned(m):
-            continue
-
-        key = _ai_deadline_cache_key(m)
-        app_num = (m.get("app_num") or "").strip()
-        if not app_num:
-            continue
-        cache_id = f"{app_num}__{key}"
-
-        # Cache hit?
-        if cache_ref is not None:
-            try:
-                snap = cache_ref.document(cache_id).get()
-                if snap.exists:
-                    cached = snap.to_dict() or {}
-                    m["ai_deadline"] = cached.get("result") or cached
-                    continue
-            except Exception:
-                pass
-
-        if ai is None:
-            try:
-                ai = PatentAI()
-            except Exception as exc:
-                print(f"  ai_deadline: PatentAI init failed ({exc})")
-                return
-
-        try:
-            result = ai.analyze_next_deadline(m)
-        except Exception as exc:
-            print(f"  ai_deadline {app_num}: call failed ({exc})")
-            continue
-
-        if not result or result.get("error"):
-            err_msg = (result or {}).get("error", "no result") if result else "no result"
-            print(f"  ai_deadline {app_num}: {err_msg}")
-            # Short-circuit on out-of-credits — no point calling Claude again
-            # for every remaining pending member.
-            if result and result.get("out_of_credits"):
-                print("  ai_deadline: credits exhausted, skipping remaining members")
-                break
-            continue
-
-        m["ai_deadline"] = result
-        if cache_ref is not None:
-            try:
-                cache_ref.document(cache_id).set({
-                    "result":     result,
-                    "app_num":    app_num,
-                    "event_hash": key,
-                    "cached_at":  datetime.now(timezone.utc),
-                })
-            except Exception:
-                pass
-
-
 # ── Core search logic ─────────────────────────────────────────────────────────
 
 def _is_us_app_num(raw: str) -> bool:
@@ -273,10 +137,8 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
     assignees = [a.get("applicantNameText", "").strip() for a in applicants_raw if a.get("applicantNameText")]
 
     # Build the single family member directly from the ODP data already fetched above.
-    # Do NOT call fetch_us_member_via_odp here — we already have the bag. Instead
-    # extract the same fields (events + continuity) inline so the primary member
-    # carries related_us_apps, which the BFS below uses to discover every US
-    # family member authoritatively via ODP.
+    # Do NOT call fetch_us_member_via_odp here — that would make a redundant second
+    # ODP request for the same application number and is likely to trigger a 429.
     events    = tracker._odp_events_to_standard(bag.get("eventDataBag", []))
     rej_codes = {"CTNF", "CTFR", "MCTNF", "MCTFR"}
     member = {
@@ -288,49 +150,19 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
     }
     oa_documents = tracker.fetch_odp_documents(clean, api_key)
 
-    # Extract continuity (parent/child US apps) from the primary bag. Must
-    # read the side-specific field so the related app (not the current one)
-    # gets recorded.
-    primary_related: list[dict] = []
-    for cb in bag.get("parentContinuityBag", []) or []:
-        _clean_rel = tracker._clean_app_num(cb.get("parentApplicationNumberText", ""))
-        if not _clean_rel:
-            continue
-        primary_related.append({
-            "side":     "parent",
-            "app_num":  _clean_rel,
-            "filing":   cb.get("parentApplicationFilingDate", ""),
-            "patent":   cb.get("parentPatentNumber", ""),
-            "relation": cb.get("claimParentageTypeCode", "")
-                        or cb.get("claimParentageTypeCodeDescriptionText", ""),
-        })
-    for cb in bag.get("childContinuityBag", []) or []:
-        _clean_rel = tracker._clean_app_num(cb.get("childApplicationNumberText", ""))
-        if not _clean_rel:
-            continue
-        primary_related.append({
-            "side":     "child",
-            "app_num":  _clean_rel,
-            "filing":   cb.get("childApplicationFilingDate", ""),
-            "patent":   cb.get("childPatentNumber", ""),
-            "relation": cb.get("claimParentageTypeCode", "")
-                        or cb.get("claimParentageTypeCodeDescriptionText", ""),
-        })
-
     family_details = [{
         **member,
-        "status":           tracker._odp_status_to_standard(
-                                meta.get("applicationStatusDescriptionText", "")),
-        "events":           events,
-        "rejections":       [e["title"] for e in events if e.get("code") in rej_codes],
-        "backward_refs":    [],
-        "filing_date":      filing,
-        "grant_date":       grant,
-        "member_title":     title,
-        "fetch_error":      None,
-        "lang":             "",
-        "oa_documents":     oa_documents,
-        "related_us_apps":  primary_related,
+        "status":        tracker._odp_status_to_standard(
+                             meta.get("applicationStatusDescriptionText", "")),
+        "events":        events,
+        "rejections":    [e["title"] for e in events if e.get("code") in rej_codes],
+        "backward_refs": [],
+        "filing_date":   filing,
+        "grant_date":    grant,
+        "member_title":  title,
+        "fetch_error":   None,
+        "lang":          "",
+        "oa_documents":  oa_documents,
     }]
 
     metas = {
@@ -363,12 +195,9 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
                 if family_xml:
                     epo_members = tracker.parse_epo_family(family_xml)
                     if epo_members:
-                        # ODP is authoritative for US — only pull non-US
-                        # members from EPO INPADOC. US family members
-                        # (including sibling continuations) are discovered
-                        # via the ODP continuity BFS further below.
-                        non_us = [em for em in epo_members
-                                  if em.get("country") != "US"]
+                        # Build a family list of non-US members; fetch details
+                        # via GP/EPO for each so they render as normal tiles.
+                        non_us = [em for em in epo_members if em.get("country") != "US"]
                         extra_family_raw = []
                         for em in non_us:
                             norm_pub = tracker.normalize(em["pub_num"])
@@ -401,99 +230,6 @@ def _run_search_from_odp(app_num_raw: str) -> dict:
                             discrepancies = list(pub_discrepancies or [])
                         except Exception as exc:
                             print(f"  family merge skipped: {exc}")
-
-    # Build a PCT lookup so BFS can skip entries that already appear as WO
-    # tiles. EPO's WO member's app_num field carries the PCT international
-    # number (e.g. "US2020066580"); we normalize to its 10-digit serial here.
-    def _pct_core(raw: str) -> str:
-        import re as _re3
-        s = (raw or "").upper()
-        # strip PCT/ and separators
-        s = _re3.sub(r"^PCT[/\-_]?", "", s)
-        digits = _re3.sub(r"[^\d]", "", s)
-        return digits if len(digits) >= 10 else ""
-
-    pct_known: set = set()
-    for _m in family_details:
-        if tracker.country_code(_m.get("pub_num", "")) == "WO":
-            core = _pct_core(_m.get("app_num", ""))
-            if core:
-                pct_known.add(core)
-
-    def _is_pct_serial(app_clean: str, raw: str = "") -> bool:
-        """PCT if: raw starts with 'PCT' (case-insensitive and separator-agnostic),
-        or cleaned is 10+ digits year-prefixed, or matches an existing WO tile."""
-        if not app_clean:
-            return False
-        if raw:
-            r = raw.upper().replace(" ", "").replace("/", "").replace("-", "")
-            if r.startswith("PCT"):
-                return True
-        if app_clean in pct_known:
-            return True
-        return (
-            len(app_clean) >= 10
-            and app_clean[:2] in ("19", "20")
-            and app_clean[:4].isdigit()
-        )
-
-    # ── ODP-first continuity BFS: discover the full US family via ODP ────────
-    # ODP is authoritative for US information. Starting from the primary US
-    # application we just fetched, walk parent and child continuity links
-    # breadth-first until we've visited every related US app. Each newly
-    # discovered app is fetched via ODP (not EPO, not GP) so its status,
-    # events, and filing info are all authoritative. We call the dedicated
-    # /continuity endpoint for each app to get the full parent+child chain
-    # (the main /applications/{id} endpoint only carries direct parents).
-    if api_key:
-        known = {tracker._clean_app_num(m.get("app_num", "")) for m in family_details}
-        known.discard("")
-        visited: set = set()
-        queue: list = [(clean, "")]  # (app_num, raw_form_if_known)
-        extras: list = []
-        while queue:
-            cur, cur_raw = queue.pop(0)
-            if not cur or cur in visited:
-                continue
-            visited.add(cur)
-
-            # PCT-style serial? Already represented by the WO tile from EPO;
-            # don't create a duplicate US tile for the US-RO administrative
-            # record. Still walk it to discover further continuity though.
-            if _is_pct_serial(cur, cur_raw):
-                rels = tracker.fetch_odp_continuity(cur, api_key)
-                print(f"    continuity {cur} (PCT, no tile): {len(rels)} link(s)")
-                for rel in rels:
-                    rel_app = rel.get("app_num", "")
-                    if rel_app and rel_app not in visited:
-                        queue.append((rel_app, rel.get("app_raw", "")))
-                continue
-
-            # Ensure this app is in family_details. If not, fetch via ODP.
-            if cur not in known:
-                stub = {"pub_num": f"US{cur}", "app_num": cur, "country": "US",
-                        "href": "", "title": "", "date": "", "lang": ""}
-                det_full = tracker.fetch_member_details(
-                    stub, 0, 0, odp_api_key=api_key
-                )
-                if det_full and not det_full.get("fetch_error"):
-                    family_details.append(det_full)
-                    extras.append(det_full)
-                    known.add(cur)
-
-            # Walk the full continuity chain for this app via the dedicated
-            # /continuity endpoint (richer than the basic bag fields).
-            rels = tracker.fetch_odp_continuity(cur, api_key)
-            print(f"    continuity {cur}: {len(rels)} link(s)")
-            for rel in rels:
-                rel_app = rel.get("app_num", "")
-                if rel_app and rel_app not in visited:
-                    queue.append((rel_app, rel.get("app_raw", "")))
-
-        print(f"  ODP continuity BFS: +{len(extras)} US member(s)")
-
-    # ── AI deadline analysis for every pending US member ────────────────────
-    _annotate_ai_deadlines(family_details, request_uid=getattr(request, "uid", None))
 
     # ── Build summaries + dashboard from (possibly enriched) family ──────────
     dashboard_html = tracker.generate_dashboard_html(
@@ -670,24 +406,67 @@ def _run_search(patent_input: str, search_type: str = "auto") -> dict:
                         })
 
     # ── Decide which family list and metas to use ─────────────────────────────
-    # Authoritative sources: ODP (US) and EPO (non-US). Google Patents is NOT
-    # used here — it's only kept as a PDF fallback in the /api/pdf endpoint.
     claims: list = []
-    # URL shown on the hero "Espacenet / ODP" links only; not fetched.
-    url = f"https://worldwide.espacenet.com/patent/search?q=pn%3D{tracker.normalize(patent_input)}"
+    gp_url = f"https://patents.google.com/patent/{tracker.normalize(patent_input)}/en"
 
     if epo_family:
+        # EPO gave us a family — use it.  Try GP just for claims (non-fatal).
         metas  = epo_metas if epo_metas.get("citation_patent_number") else {}
         family = epo_family
+        url    = gp_url
+        try:
+            gp_html = tracker.fetch_page(url)
+            claims  = tracker.parse_claims(gp_html)
+            # If EPO biblio was empty, fall back to GP metas
+            if not metas:
+                gp_metas = tracker.get_metas(gp_html)
+                if gp_metas.get("citation_patent_number"):
+                    metas = gp_metas
+        except Exception:
+            pass  # claims are nice-to-have; don't fail the whole search
+
     else:
-        # EPO returned no family — still may have biblio for the primary.
-        family = []
-        metas  = epo_metas or {}
+        # EPO failed entirely — fall back to GP for everything
+        url       = tracker.build_url(patent_input)
+        html      = None
+        last_exc  = None
+        candidates = [url]
+        if "B2/en" in url:
+            candidates += [
+                url.replace("B2/en", "B1/en"),
+                url.replace("B2/en", "A1/en"),
+                url.replace("B2/en", "A2/en"),
+            ]
+        elif "B1/en" in url:
+            candidates += [url.replace("B1/en", "B2/en")]
+        bare = f"https://patents.google.com/patent/{tracker.normalize(patent_input)}/en"
+        if bare not in candidates:
+            candidates.append(bare)
+
+        for candidate in candidates:
+            try:
+                html = tracker.fetch_page(candidate)
+                url  = candidate
+                break
+            except _req.HTTPError as exc:
+                last_exc = exc
+                if exc.response.status_code != 404:
+                    raise
+            except Exception:
+                raise
+
+        if html is None:
+            raise ValueError(
+                f"Patent '{patent_input}' was not found. "
+                "EPO OPS and Google Patents both failed to return data for this patent."
+            )
+
+        metas  = tracker.get_metas(html)
+        family = tracker.parse_family(html)
+        claims = tracker.parse_claims(html)
 
     if not metas.get("citation_patent_number"):
-        raise ValueError(
-            f"Patent '{patent_input}' was not found via EPO OPS / USPTO ODP."
-        )
+        raise ValueError(f"No patent data found for '{patent_input}'")
 
     # ── Canonical patent number ───────────────────────────────────────────────
     raw_meta   = tracker._first(metas.get("citation_patent_number", [])) or ""
@@ -702,94 +481,12 @@ def _run_search(patent_input: str, search_type: str = "auto") -> dict:
     dates = metas.get("DC.date", [])
 
     # ── Fetch family member prosecution details ───────────────────────────────
-    # US members → ODP (resolves app_num via EPO biblio if needed); others → GP
+    # US members → ODP (when app_num available); others → GP page scrape
     total          = len(family)
     family_details = [
         tracker.fetch_member_details(m, i + 1, total, odp_api_key=odp_key)
         for i, m in enumerate(family)
     ]
-
-    # ── Pull in abandoned / unpublished US continuations via ODP continuity ──
-    # INPADOC family data from EPO frequently misses abandoned continuations,
-    # CIPs, and divisionals whose US publications never entered INPADOC.
-    #
-    # Two paths run here:
-    #  (1) per-member walk — every US member we just fetched exposes its own
-    #      parent/child continuity bag via result["related_us_apps"]. We add
-    #      any referenced US apps we haven't already seen.
-    #  (2) primary-app pull — if any US member is in the family, we also look
-    #      up the FULL continuity chain seeded from that app's parent/child
-    #      bags and again merge any new apps. Catches the common case where
-    #      the per-member ODP calls all 404'd (recent unpublished apps).
-    if odp_key:
-        known = {tracker._clean_app_num(m.get("app_num", "")) for m in family_details}
-        known.discard("")
-        extras_seen: set[str] = set()
-        extras: list[dict] = []
-
-        # (1) per-member walk
-        for m in list(family_details):
-            for rel in m.get("related_us_apps") or []:
-                rel_app = rel.get("app_num", "")
-                if not rel_app or rel_app in known or rel_app in extras_seen:
-                    continue
-                extras_seen.add(rel_app)
-                extras.append({
-                    "pub_num": f"US{rel['patent']}B2" if rel.get("patent") else f"US{rel_app}",
-                    "app_num": rel_app,
-                    "href":    "",
-                    "title":   "",
-                    "country": "US",
-                    "date":    rel.get("filing", ""),
-                    "lang":    "",
-                })
-
-        # (2) primary-app continuity fetch — BFS through parent/child links
-        _us_primaries = [m for m in family_details
-                         if tracker.country_code(m.get("pub_num", "")) == "US"
-                         and m.get("app_num")]
-        _seed_apps = [tracker._clean_app_num(m["app_num"]) for m in _us_primaries]
-        _visited: set[str] = set(known)
-        _queue = [a for a in _seed_apps if a]
-        while _queue:
-            _app = _queue.pop(0)
-            if _app in _visited:
-                continue
-            _visited.add(_app)
-            try:
-                stub = {"pub_num": f"US{_app}", "app_num": _app, "country": "US",
-                        "href": "", "title": "", "date": "", "lang": ""}
-                det = tracker.fetch_us_member_via_odp(stub, odp_key)
-                if not det or det.get("fetch_error"):
-                    continue
-                for rel in det.get("related_us_apps", []) or []:
-                    rel_app = rel.get("app_num", "")
-                    if rel_app and rel_app not in _visited and rel_app not in extras_seen:
-                        _queue.append(rel_app)
-                        if rel_app not in known:
-                            extras_seen.add(rel_app)
-                            extras.append({
-                                "pub_num": (f"US{rel['patent']}B2"
-                                            if rel.get("patent") else f"US{rel_app}"),
-                                "app_num": rel_app,
-                                "href":    "",
-                                "title":   "",
-                                "country": "US",
-                                "date":    rel.get("filing", ""),
-                                "lang":    "",
-                            })
-            except Exception as exc:
-                print(f"  continuity BFS skipped {_app}: {exc}")
-
-        print(f"  continuity merge: adding {len(extras)} US app(s) discovered via ODP")
-        for j, stub in enumerate(extras):
-            try:
-                det = tracker.fetch_member_details(
-                    stub, total + j + 1, total + len(extras), odp_api_key=odp_key
-                )
-                family_details.append(det)
-            except Exception as exc:
-                print(f"  continuity merge skipped {stub.get('app_num')}: {exc}")
 
     # ── ODP ↔ EPO cross-validation for US members ────────────────────────────
     status_discrepancies: list = []
@@ -866,9 +563,6 @@ def _run_search(patent_input: str, search_type: str = "auto") -> dict:
                 "google_app": "",
                 "note":       sd["note"],
             })
-
-    # ── AI deadline analysis for every pending US member ────────────────────
-    _annotate_ai_deadlines(family_details, request_uid=getattr(request, "uid", None))
 
     dashboard_html = tracker.generate_dashboard_html(
         metas, family_details, url, patent_input, claims,
@@ -1245,11 +939,52 @@ def refresh_portfolio_data(portfolio_id: str):
         for m in stored_family
     ]
 
+    # ── Load overrides (manual edits + manual tiles) ──────────────────────
+    overrides = {}
+    try:
+        for od in _overrides_col(request.uid, portfolio_id).stream():
+            overrides[od.id] = od.to_dict()
+    except Exception:
+        pass  # If overrides fail to load, proceed without them
+
+    # Add any manually-created tiles that aren't already in the members list
+    for okey, ov in overrides.items():
+        if not ov.get("is_manual"):
+            continue
+        f = ov.get("fields", {})
+        already = any(
+            (m.get("app_num", "").replace("/", "_").replace(",", "") == okey
+             or m.get("pub_num", "").replace("/", "_").replace(",", "") == okey)
+            for m in members
+        )
+        if not already:
+            members.append({
+                "pub_num": f.get("pub_num") or f.get("app_num", ""),
+                "app_num": f.get("app_num", ""),
+                "href":    "",
+                "title":   f.get("title", ""),
+                "country": f.get("country", "US"),
+            })
+
     total = len(members)
     family_details = [
         tracker.fetch_member_details(m, i + 1, total, odp_api_key=odp_key)
         for i, m in enumerate(members)
     ]
+
+    # ── Apply field-level overrides on top of API data ───────────────────
+    for m in family_details:
+        mkey_app = (m.get("app_num") or "").replace("/", "_").replace(",", "")
+        mkey_pub = (m.get("pub_num") or "").replace("/", "_").replace(",", "")
+        ov = overrides.get(mkey_app) or overrides.get(mkey_pub)
+        if ov:
+            for fk, fv in ov.get("fields", {}).items():
+                if fv:  # Only override if the user actually set a value
+                    m[fk] = fv
+            if ov.get("is_manual"):
+                m["is_manual"] = True
+            else:
+                m["has_overrides"] = True
 
     # If we have main_metas from the initial scrape, use those.
     # Otherwise reconstruct a minimal version from stored fields.
@@ -1626,581 +1361,9 @@ def list_searches():
                 "granted_count": d.get("granted_count", 0),
                 "pending_count": d.get("pending_count", 0),
                 "searched_at":   sat.isoformat() if hasattr(sat, "isoformat") else str(sat or ""),
-                "search_type":   d.get("search_type", ""),
             })
         return jsonify({"searches": results})
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
-
-
-# ── Assignments (USPTO Assignment chain per family member) ─────────────────
-
-def _find_best_claims_doc(app_num: str, api_key: str) -> dict | None:
-    """
-    For a pending US application, pick the PDF most likely to contain the
-    CURRENT claim set. Preference order: CLM (Claims as amended) > CLAIM >
-    most recent REM (Applicant Arguments/Remarks — also carries amended
-    claims) > SPEC (original specification). Returns the doc dict or None.
-    """
-    try:
-        docs = tracker.fetch_odp_documents(app_num, api_key) or []
-    except Exception:
-        return None
-    by_code_latest: dict[str, dict] = {}
-    for d in sorted(docs, key=lambda x: x.get("date", ""), reverse=True):
-        code = (d.get("code") or "").upper()
-        if code not in by_code_latest and d.get("download_url"):
-            by_code_latest[code] = d
-    for code in ("CLM", "CLAIM", "CLM.AM", "REM", "SPEC"):
-        if code in by_code_latest:
-            return by_code_latest[code]
-    return None
-
-
-def _get_claims_for_member(member: dict, request_uid: str | None = None) -> list[dict]:
-    """
-    Fetch the independent claims for a US family member:
-      - Granted: pull the patent PDF (via /api/pdf logic) and run Claude extractor.
-      - Pending:  pull the latest CLM (or equivalent) from IFW and run Claude extractor.
-    Results cached in Firestore at users/{uid}/ai_claims_cache/{app_num}__{doc_hash}.
-    """
-    import hashlib as _hl
-    import requests as _rq
-
-    app_num = tracker._clean_app_num(member.get("app_num", ""))
-    pub_num = member.get("pub_num", "")
-    if not app_num and not pub_num:
-        return []
-    api_key = os.environ.get("USPTO_ODP_API_KEY", "").strip()
-
-    # Decide which PDF to send
-    doc_source = ""
-    doc_sig    = ""
-    pdf_bytes: bytes | None = None
-
-    if member.get("status") == "granted":
-        # Fetch the granted patent PDF — the same multi-source helper we use
-        # for the tile PDF button.
-        doc_source = "patent_pdf"
-        try:
-            pdf_bytes = _download_patent_pdf(pub_num)
-            doc_sig = pub_num
-        except Exception as exc:
-            print(f"  claims {pub_num}: patent PDF download failed ({exc})", flush=True)
-            pdf_bytes = None
-    else:
-        if not api_key:
-            return []
-        doc = _find_best_claims_doc(app_num, api_key)
-        if not doc:
-            return []
-        doc_source = (doc.get("code") or "").upper()
-        doc_sig    = f"{doc.get('code')}:{doc.get('date')}"
-        try:
-            resp = _rq.get(doc["download_url"],
-                           headers={"X-API-Key": api_key}, timeout=30)
-            resp.raise_for_status()
-            pdf_bytes = resp.content
-        except Exception as exc:
-            print(f"  claims {app_num}: {doc.get('code')} download failed ({exc})", flush=True)
-            return []
-
-    if not pdf_bytes:
-        return []
-
-    cache_id = f"{app_num or pub_num}__{_hl.sha1(doc_sig.encode()).hexdigest()[:16]}"
-    cache_ref = None
-    if request_uid:
-        try:
-            cache_ref = (
-                db.collection("users").document(request_uid)
-                  .collection("ai_claims_cache")
-            )
-            snap = cache_ref.document(cache_id).get()
-            if snap.exists:
-                return (snap.to_dict() or {}).get("claims", []) or []
-        except Exception:
-            cache_ref = None
-
-    try:
-        from ai_engine import PatentAI
-        ai = PatentAI()
-    except Exception as exc:
-        print(f"  claims: PatentAI init failed ({exc})", flush=True)
-        return []
-
-    claims = ai.extract_independent_claims_from_pdf(
-        pdf_bytes,
-        context={"pub_num": pub_num, "app_num": app_num,
-                 "status": member.get("status", "")},
-    )
-    print(f"  claims {app_num or pub_num} ({doc_source}): {len(claims)} independent", flush=True)
-
-    if cache_ref is not None:
-        try:
-            cache_ref.document(cache_id).set({
-                "app_num":    app_num,
-                "pub_num":    pub_num,
-                "claims":     claims,
-                "doc_source": doc_source,
-                "doc_sig":    doc_sig,
-                "cached_at":  datetime.now(timezone.utc),
-            })
-        except Exception as exc:
-            print(f"  claims cache save failed ({exc})", flush=True)
-
-    return claims
-
-
-def _ai_scan_pending_references(app_num: str, request_uid: str | None = None) -> list[dict]:
-    """
-    Pull the latest IDS (applicant) and 892 (examiner) PDFs for a pending US
-    application and ask Claude to extract structured cited references. Cached
-    in Firestore by app_num + hash of (doc_code, doc_date) pairs so unchanged
-    document sets cost zero tokens on repeat calls.
-    """
-    import hashlib as _hl
-    import requests as _rq
-
-    if not app_num:
-        return []
-    api_key = os.environ.get("USPTO_ODP_API_KEY", "").strip()
-    if not api_key:
-        return []
-
-    try:
-        docs = tracker.fetch_odp_documents(app_num, api_key) or []
-    except Exception as exc:
-        print(f"  ai_scan_refs {app_num}: docs fetch failed ({exc})", flush=True)
-        return []
-
-    # Pick most-recent of each relevant code
-    picks: list[tuple[str, dict]] = []  # (doc_type_label, doc)
-    seen_codes = set()
-    for d in sorted(docs, key=lambda x: x.get("date", ""), reverse=True):
-        code = (d.get("code") or "").upper()
-        if code in ("IDS", "1449") and "IDS" not in seen_codes and d.get("download_url"):
-            picks.append(("IDS", d))
-            seen_codes.add("IDS")
-        elif code == "892" and "892" not in seen_codes and d.get("download_url"):
-            picks.append(("892", d))
-            seen_codes.add("892")
-
-    if not picks:
-        return []
-
-    # Cache key — changes when any picked doc's (code,date) changes
-    cache_sig = _hl.sha1(
-        "|".join(f"{t}:{d.get('date','')}:{d.get('code','')}" for t, d in picks).encode()
-    ).hexdigest()[:20]
-    cache_id = f"{app_num}__{cache_sig}"
-
-    cache_ref = None
-    if request_uid:
-        try:
-            cache_ref = (
-                db.collection("users").document(request_uid)
-                  .collection("ai_prior_art_cache")
-            )
-            snap = cache_ref.document(cache_id).get()
-            if snap.exists:
-                return (snap.to_dict() or {}).get("refs", []) or []
-        except Exception:
-            cache_ref = None
-
-    # Build PatentAI lazily
-    try:
-        from ai_engine import PatentAI
-        ai = PatentAI()
-    except Exception as exc:
-        print(f"  ai_scan_refs {app_num}: PatentAI init failed ({exc})", flush=True)
-        return []
-
-    refs: list[dict] = []
-    headers = {"X-API-Key": api_key}
-    for doc_type, d in picks:
-        url = d.get("download_url", "")
-        try:
-            resp = _rq.get(url, headers=headers, timeout=30)
-            if resp.status_code != 200 or not resp.content:
-                print(f"  ai_scan_refs {app_num}: {doc_type} download HTTP {resp.status_code}", flush=True)
-                continue
-            extracted = ai.extract_references_from_pdf(resp.content, doc_type=doc_type)
-            # Stamp source + doc date
-            for r in extracted:
-                r.setdefault("source_doc_code", d.get("code", ""))
-                r.setdefault("source_doc_date", d.get("date", ""))
-            print(f"  ai_scan_refs {app_num}: {doc_type} → {len(extracted)} refs", flush=True)
-            refs.extend(extracted)
-        except Exception as exc:
-            print(f"  ai_scan_refs {app_num}: {doc_type} error ({exc})", flush=True)
-
-    # Save cache
-    if cache_ref is not None:
-        try:
-            cache_ref.document(cache_id).set({
-                "app_num":   app_num,
-                "refs":      refs,
-                "picks":     [{"type": t, "code": d.get("code"), "date": d.get("date")}
-                              for t, d in picks],
-                "cached_at": datetime.now(timezone.utc),
-            })
-        except Exception as exc:
-            print(f"  ai_scan_refs {app_num}: cache save failed ({exc})", flush=True)
-
-    return refs
-
-
-@app.route("/api/portfolios/<portfolio_id>/timeline", methods=["GET"])
-@require_auth
-def get_portfolio_timeline(portfolio_id):
-    """
-    Build a filing-timeline graph of every US application/patent in the
-    family plus the continuation links between them. Each node is a US app;
-    each edge is a parent/child continuity relationship (CON/CIP/DIV/PRO).
-    Response:
-      { nodes: [ { app_num, pub_num, display, status, filing_date, grant_date,
-                   is_provisional, is_pct, patent_number } ],
-        edges: [ { from_app, to_app, relation } ] }
-    """
-    try:
-        ref = (
-            db.collection("users").document(request.uid)
-              .collection("portfolios").document(portfolio_id)
-        )
-        snap = ref.get()
-        if not snap.exists:
-            return jsonify({"error": "Not found"}), 404
-        data = snap.to_dict() or {}
-        family = data.get("family", []) or []
-
-        api_key = os.environ.get("USPTO_ODP_API_KEY", "").strip()
-        nodes: dict[str, dict] = {}
-
-        def _pretty_display(app_num: str, m: dict | None) -> str:
-            if m and m.get("status") == "granted":
-                return tracker._format_us_patent_num(m.get("pub_num", "")) or m.get("pub_num", "")
-            return tracker._format_us_app_num(app_num) or app_num
-
-        # Seed with US members from the portfolio
-        for m in family:
-            pub = (m.get("pub_num") or "").upper()
-            if not pub.startswith("US") and m.get("country") != "US":
-                continue
-            app = tracker._clean_app_num(m.get("app_num", ""))
-            if not app:
-                continue
-            is_prov = bool(app[:2] in ("60", "61", "62", "63"))
-            nodes[app] = {
-                "app_num":        app,
-                "pub_num":        m.get("pub_num", ""),
-                "display":        _pretty_display(app, m),
-                "status":         m.get("status", "unknown"),
-                "filing_date":    m.get("filing_date") or m.get("date") or "",
-                "grant_date":     m.get("grant_date", "") or "",
-                "is_provisional": is_prov,
-                "is_pct":         False,
-                "in_portfolio":   True,
-            }
-
-        # Walk continuity from each seed to discover additional US apps
-        edges: list[dict] = []
-        edge_keys: set = set()
-        if api_key:
-            visited: set = set()
-            queue: list = list(nodes.keys())
-            while queue:
-                cur = queue.pop(0)
-                if cur in visited:
-                    continue
-                visited.add(cur)
-                rels = tracker.fetch_odp_continuity(cur, api_key)
-                for r in rels:
-                    other = r.get("app_num", "")
-                    raw   = (r.get("app_raw") or "").upper()
-                    if not other:
-                        continue
-                    # Skip PCT pointers — the WO member already represents them.
-                    if raw.startswith("PCT"):
-                        continue
-                    # Discover new node
-                    if other not in nodes:
-                        nodes[other] = {
-                            "app_num":        other,
-                            "pub_num":        r.get("patent") and f"US{r['patent']}B2" or f"US{other}",
-                            "display":        _pretty_display(other, None),
-                            "status":         "unknown",
-                            "filing_date":    r.get("filing", "") or "",
-                            "grant_date":     "",
-                            "is_provisional": other[:2] in ("60","61","62","63"),
-                            "is_pct":         False,
-                            "in_portfolio":   False,
-                            "patent_number":  r.get("patent", "") or "",
-                        }
-                        queue.append(other)
-                    # Record edge parent → child
-                    if r.get("side") == "parent":
-                        a, b = other, cur
-                    else:
-                        a, b = cur, other
-                    ek = f"{a}>{b}:{r.get('relation','')}"
-                    if ek not in edge_keys:
-                        edge_keys.add(ek)
-                        edges.append({
-                            "from_app":  a,
-                            "to_app":    b,
-                            "relation":  (r.get("relation") or "").upper(),
-                        })
-
-        return jsonify({
-            "nodes": list(nodes.values()),
-            "edges": edges,
-        })
-    except Exception as exc:
-        traceback.print_exc()
-        return jsonify({"error": str(exc)}), 500
-
-
-@app.route("/api/portfolios/<portfolio_id>/claims", methods=["GET"])
-@require_auth
-def get_portfolio_claims(portfolio_id):
-    """
-    Return independent claims per US family member plus an AI-authored
-    summary of how they differ. Results are cached so repeat loads on
-    unchanged claim sets cost zero Claude tokens.
-
-    Query params:
-      summary=1  → also run the AI comparative summary across all members
-    """
-    do_summary = (request.args.get("summary") or "").strip() in ("1", "true", "yes")
-    try:
-        ref = (
-            db.collection("users").document(request.uid)
-              .collection("portfolios").document(portfolio_id)
-        )
-        snap = ref.get()
-        if not snap.exists:
-            return jsonify({"error": "Not found"}), 404
-        data = snap.to_dict() or {}
-        family = data.get("family", []) or []
-
-        out_members: list[dict] = []
-        for m in family:
-            pub = (m.get("pub_num") or "").upper()
-            if not pub.startswith("US") and m.get("country") != "US":
-                continue
-            if m.get("status") in ("abandoned", "expired", "rejected", "lapsed"):
-                continue
-            claims = _get_claims_for_member(m, request_uid=request.uid)
-            display = m.get("pub_num", "")
-            if m.get("status") == "granted":
-                display = tracker._format_us_patent_num(display) or display
-            out_members.append({
-                "pub_num":        m.get("pub_num", ""),
-                "app_num":        tracker._clean_app_num(m.get("app_num", "")),
-                "display_number": display,
-                "status":         m.get("status", "unknown"),
-                "claims":         claims,
-            })
-
-        summary_text = ""
-        if do_summary and any(c.get("claims") for c in out_members):
-            try:
-                from ai_engine import PatentAI
-                _ai = PatentAI()
-                sets = [
-                    {"identifier": c.get("display_number") or c.get("pub_num"),
-                     "claims":     c.get("claims") or []}
-                    for c in out_members if c.get("claims")
-                ]
-                summary_text = _ai.summarize_claim_differences(sets)
-            except Exception as exc:
-                print(f"  claims summary failed ({exc})", flush=True)
-
-        return jsonify({
-            "members":        out_members,
-            "summary":        summary_text,
-        })
-    except Exception as exc:
-        traceback.print_exc()
-        return jsonify({"error": str(exc)}), 500
-
-
-@app.route("/api/portfolios/<portfolio_id>/prior-art", methods=["GET"])
-@require_auth
-def get_portfolio_prior_art(portfolio_id):
-    """
-    Return aggregated prior-art citations for every US family member.
-    For granted patents we pull structured <patcit>/<nplcit> from EPO biblio
-    (authoritative mirror of USPTO citation data). For pending apps, add
-    ai_scan=1 to the query string to run Claude against the latest IDS and
-    892 PDFs and merge the extracted references in.
-    """
-    ai_scan = (request.args.get("ai_scan") or "").strip() in ("1", "true", "yes")
-    try:
-        ref = (
-            db.collection("users").document(request.uid)
-              .collection("portfolios").document(portfolio_id)
-        )
-        snap = ref.get()
-        if not snap.exists:
-            return jsonify({"error": "Not found"}), 404
-        data = snap.to_dict() or {}
-        family = data.get("family", []) or []
-
-        epo_key    = os.environ.get("EPO_CONSUMER_KEY",    "").strip()
-        epo_secret = os.environ.get("EPO_CONSUMER_SECRET", "").strip()
-        token = (tracker.epo_get_token(epo_key, epo_secret)
-                 if epo_key and epo_secret else None)
-
-        out_members: list[dict] = []
-        dedup: dict[str, dict] = {}
-
-        for m in family:
-            pub = (m.get("pub_num") or "").upper()
-            if not pub.startswith("US") and m.get("country") != "US":
-                continue
-            refs: list[dict] = []
-            if token:
-                docdb = tracker.patent_to_docdb(pub)
-                if docdb:
-                    biblio_xml = tracker.fetch_epo_biblio(docdb, token)
-                    if biblio_xml:
-                        refs = tracker.parse_epo_references_cited(biblio_xml)
-
-            # For pending US apps, optionally augment with AI-extracted refs
-            # from the latest IDS + 892 PDFs.
-            if ai_scan and m.get("status") in ("pending", "unknown"):
-                ai_refs = _ai_scan_pending_references(
-                    tracker._clean_app_num(m.get("app_num", "")),
-                    request_uid=request.uid,
-                )
-                # De-dup against EPO-biblio refs by (country, number)
-                seen = {(r.get("country", ""), r.get("number", "")) for r in refs}
-                for r in ai_refs:
-                    key = (r.get("country", ""), r.get("number", ""))
-                    if r.get("type") == "patent" and key in seen:
-                        continue
-                    r.setdefault("display", r.get("text", "")[:120])
-                    refs.append(r)
-
-            display = m.get("pub_num", "")
-            if m.get("status") == "granted":
-                display = tracker._format_us_patent_num(display) or display
-
-            for r in refs:
-                # Dedup key: country+number for patent, first 80 chars of text for NPL
-                if r.get("type") == "patent":
-                    key = f"{r.get('country','')}{r.get('number','')}"
-                else:
-                    key = "NPL:" + (r.get("text") or r.get("display") or "")[:80]
-                if key not in dedup:
-                    dedup[key] = {
-                        "key": key,
-                        "display":  r.get("display", ""),
-                        "type":     r.get("type", "patent"),
-                        "country":  r.get("country", ""),
-                        "number":   r.get("number", ""),
-                        "kind":     r.get("kind", ""),
-                        "category": r.get("category", ""),
-                        "citing_members": [],
-                    }
-                dedup[key]["citing_members"].append(m.get("pub_num", ""))
-
-            out_members.append({
-                "pub_num":         m.get("pub_num", ""),
-                "app_num":         tracker._clean_app_num(m.get("app_num", "")),
-                "display_number":  display,
-                "status":          m.get("status", "unknown"),
-                "references":      refs,
-            })
-
-        dedup_list = sorted(
-            dedup.values(),
-            key=lambda r: (-len(r["citing_members"]), r["type"], r["display"])
-        )
-        return jsonify({
-            "members":           out_members,
-            "dedup_references":  dedup_list,
-        })
-    except Exception as exc:
-        traceback.print_exc()
-        return jsonify({"error": str(exc)}), 500
-
-
-@app.route("/api/portfolios/<portfolio_id>/assignments", methods=["GET"])
-@require_auth
-def get_portfolio_assignments(portfolio_id):
-    """
-    Return the full USPTO assignment chain for every US family member in the
-    portfolio. Response shape:
-    {
-        "members": [
-            {
-                "pub_num":         "US12178560B2",
-                "app_num":         "17134990",
-                "display_number":  "US 12,178,560 B2",
-                "status":          "granted",
-                "assignments":     [ <assignment events>, ... ],
-                "current_assignees": [ "VETOLOGY INNOVATIONS, LLC" ]
-            },
-            ...
-        ],
-        "unique_assignees": [ "VETOLOGY INNOVATIONS, LLC", ... ]
-    }
-    Used by the Assignments tab on the dashboard.
-    """
-    try:
-        ref = (
-            db.collection("users").document(request.uid)
-              .collection("portfolios").document(portfolio_id)
-        )
-        snap = ref.get()
-        if not snap.exists:
-            return jsonify({"error": "Not found"}), 404
-        data = snap.to_dict() or {}
-        family = data.get("family", []) or []
-
-        api_key = os.environ.get("USPTO_ODP_API_KEY", "").strip()
-        out_members: list[dict] = []
-        unique: dict[str, int] = {}
-
-        for m in family:
-            pub = (m.get("pub_num") or "").upper()
-            if not pub.startswith("US") and m.get("country") != "US":
-                continue
-            app_num = tracker._clean_app_num(m.get("app_num", ""))
-            if not app_num:
-                continue
-            assigns = tracker.fetch_odp_assignments(app_num, api_key) if api_key else []
-            # Current assignees = assignees from the most recent ASSIGNMENT
-            # OF ASSIGNORS INTEREST; skip security interests / mergers unless
-            # no plain assignment exists.
-            current: list[str] = []
-            plain = [a for a in assigns
-                     if "ASSIGNMENT OF ASSIGNOR" in (a.get("conveyance") or "").upper()]
-            pick = plain[-1] if plain else (assigns[-1] if assigns else None)
-            if pick:
-                current = [e["name"] for e in pick.get("assignees", []) if e.get("name")]
-            display = m.get("pub_num", "")
-            if m.get("status") == "granted":
-                display = tracker._format_us_patent_num(display) or display
-            out_members.append({
-                "pub_num":           m.get("pub_num", ""),
-                "app_num":           app_num,
-                "display_number":    display,
-                "status":            m.get("status", "unknown"),
-                "assignments":       assigns,
-                "current_assignees": current,
-            })
-            for name in current:
-                if name:
-                    unique[name] = unique.get(name, 0) + 1
-
-        unique_list = sorted(unique.keys(), key=lambda n: (-unique[n], n))
-        return jsonify({"members": out_members, "unique_assignees": unique_list})
-    except Exception as exc:
-        traceback.print_exc()
         return jsonify({"error": str(exc)}), 500
 
 
@@ -2462,1196 +1625,148 @@ def preview_patentee_group():
         return jsonify({"error": str(exc)}), 500
 
 
-# ── AI prosecution assistant ─────────────────────────────────────────────────
+# ── Tile Overrides (manual edits & manually-added tiles) ─────────────────────
 
-def _find_family_member(portfolio_id: str, pub_num: str) -> tuple[object, dict | None]:
-    """Return (portfolio_ref, member_dict) or (portfolio_ref, None) if not found."""
-    port_ref = (
-        db.collection("users").document(request.uid)
-          .collection("portfolios").document(portfolio_id)
+def _overrides_col(uid: str, portfolio_id: str):
+    """Firestore subcollection ref for tile overrides."""
+    return (
+        db.collection("users").document(uid)
+        .collection("portfolios").document(portfolio_id)
+        .collection("overrides")
     )
-    snap = port_ref.get()
-    if not snap.exists:
-        return port_ref, None
-    data = snap.to_dict() or {}
-    family = data.get("family", []) or []
-    member = next((m for m in family if m.get("pub_num") == pub_num), None)
-    return port_ref, member
 
 
-def _download_oa_text(member: dict) -> tuple[str, dict | None]:
-    """
-    Download the most recent office-action PDF for this family member via the
-    USPTO ODP and extract the text. Returns (text, doc_meta). Empty text
-    string if no OA is available or extraction fails.
-    """
-    import io as _io
-    import requests as _rq
-
-    # Accept the common OA codes plus a few related examination actions
-    # so the Analyze OA feature works on restriction requirements, advisory
-    # actions, and Ex Parte Quayle actions in addition to CTNF/CTFR.
-    OA_CODES = {
-        "CTNF", "CTFR", "MCTNF", "MCTFR",       # non-final / final (+misc)
-        "CTRS",                                  # restriction requirement
-        "CTAV",                                  # advisory action
-        "CTEQ", "QUAYLE",                        # ex parte Quayle
-        "CTNT", "CTNR",                          # additional variants
-    }
-
-    # Start from whatever the member already carries (fast path after a fresh
-    # scrape). If empty — which is normal when loading from Firestore cache,
-    # since the summary doesn't include oa_documents — re-fetch from ODP.
-    oa_docs = member.get("oa_documents") or []
-    if not oa_docs:
-        app_num = (member.get("app_num") or "").strip()
-        if app_num:
-            try:
-                oa_docs = tracker.fetch_odp_documents(
-                    app_num, os.environ.get("USPTO_ODP_API_KEY", "")
-                ) or []
-            except Exception as exc:
-                print(f"  Analyze OA: ODP documents fetch failed for {app_num}: {exc}")
-
-    oa_doc = next(
-        (d for d in sorted(oa_docs, key=lambda x: x.get("date", ""), reverse=True)
-         if (d.get("code") or "").upper() in OA_CODES and d.get("download_url")),
-        None,
-    )
-    if not oa_doc:
-        _codes = sorted({(d.get("code") or "").upper() for d in oa_docs})
-        print(f"  Analyze OA: no matching OA in {len(oa_docs)} docs. Codes seen: {_codes[:20]}")
-        return "", None
-
-    print(f"  Analyze OA: downloading {oa_doc.get('code')} {oa_doc.get('date')} "
-          f"{oa_doc.get('download_url','')[:80]}", flush=True)
-    try:
-        resp = _rq.get(
-            oa_doc["download_url"],
-            headers={"X-API-Key": os.environ.get("USPTO_ODP_API_KEY", "")},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        pdf_bytes = resp.content
-        print(f"  Analyze OA: PDF downloaded — {len(pdf_bytes)} bytes")
-    except Exception as exc:
-        print(f"  Analyze OA: download failed: {exc}")
-        return "", oa_doc
-
-    # Attach bytes to the doc meta so callers can save or send to Claude directly
-    oa_doc["_pdf_bytes"] = pdf_bytes
-
-    # Extract text with pypdf (lightweight, pure-python)
-    try:
-        from pypdf import PdfReader
-        reader = PdfReader(_io.BytesIO(pdf_bytes))
-        text   = "\n".join((page.extract_text() or "") for page in reader.pages)
-        text = text.strip()
-        print(f"  Analyze OA: pypdf extracted {len(text)} chars from {len(reader.pages)} pages")
-        return text, oa_doc
-    except Exception as exc:
-        print(f"  Analyze OA: pypdf extraction failed: {exc}")
-        return "", oa_doc
-
-
-@app.route("/api/ai/analyze", methods=["POST"])
+@app.route("/api/portfolios/<portfolio_id>/overrides", methods=["GET"])
 @require_auth
-def ai_analyze():
-    """
-    Run AI prosecution analysis on one family member.
-    Body: { "portfolio_id": "...", "pub_num": "..." }
-    Cached at users/{uid}/portfolios/{pid}/ai_analysis/{pub_num}.
-    """
-    body = request.get_json(silent=True) or {}
-    portfolio_id = (body.get("portfolio_id") or "").strip()
-    pub_num      = (body.get("pub_num") or "").strip()
-    if not portfolio_id or not pub_num:
-        return jsonify({"error": "portfolio_id and pub_num are required"}), 400
-
+def list_overrides(portfolio_id: str):
+    """Return all tile overrides (edits + manual tiles) for a portfolio."""
     try:
-        from ai_engine import PatentAI
-    except ImportError as exc:
-        return jsonify({"error": f"AI engine unavailable: {exc}"}), 500
-
-    port_ref, member = _find_family_member(portfolio_id, pub_num)
-    if member is None:
-        return jsonify({"error": "portfolio or family member not found"}), 404
-
-    try:
-        ai     = PatentAI()
-        result = ai.analyze_prosecution(member)
-        doc_id = pub_num.replace("/", "_")
-        port_ref.collection("ai_analysis").document(doc_id).set({
-            **result,
-            "analyzed_at": datetime.now(timezone.utc),
-            "pub_num":     pub_num,
-            "kind":        "prosecution",
-        })
-        return jsonify(result)
-    except Exception as exc:
-        traceback.print_exc()
-        return jsonify({"error": f"AI analysis failed: {exc}"}), 500
-
-
-_STORAGE_CLIENT = None
-def _get_storage_client():
-    """
-    Build a Google Cloud Storage client using the Firebase service-account
-    credentials (which include a private key for signing URLs). The default
-    Cloud Run compute credentials can't sign blobs.
-    """
-    global _STORAGE_CLIENT
-    if _STORAGE_CLIENT is not None:
-        return _STORAGE_CLIENT
-    from google.cloud import storage as _gcs
-    sa_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
-    if sa_json:
-        import json as _json
-        from google.oauth2 import service_account as _sa
-        creds = _sa.Credentials.from_service_account_info(_json.loads(sa_json))
-        _STORAGE_CLIENT = _gcs.Client(project="patent-research-tool", credentials=creds)
-    else:
-        _STORAGE_CLIENT = _gcs.Client(project="patent-research-tool")
-    return _STORAGE_CLIENT
-
-
-def _parse_patent_number(reference: str) -> str:
-    """
-    Extract a normalized patent/publication number from a free-form citation
-    string like 'Smith et al., US 10,123,456 B2'. Returns CCNNNKIND (e.g.
-    'US10123456B2') or '' if no valid number found.
-    """
-    import re as _re
-    if not reference:
-        return ""
-    s = reference.upper()
-    # Match CC (2 letters) + number with optional separators + optional kind
-    m = _re.search(
-        r"\b([A-Z]{2})[\s\-]*((?:\d[\d,\s]{4,13}\d))(?:[\s\-]*([A-Z]\d?))?\b",
-        s,
-    )
-    if not m:
-        return ""
-    cc   = m.group(1)
-    num  = _re.sub(r"[,\s\-]", "", m.group(2))
-    kind = (m.group(3) or "").strip()
-    # Sanity: skip year references (e.g. "2023" by itself)
-    if len(num) < 5:
-        return ""
-    return f"{cc}{num}{kind}"
-
-
-def _download_patent_pdf(pub_num: str) -> bytes | None:
-    """Reuse the PDF proxy's multi-source download, returning the bytes."""
-    import re as _re
-    clean = _re.sub(r"[^A-Z0-9]", "", (pub_num or "").upper())
-    if not clean:
-        return None
-    docdb = tracker.patent_to_docdb(clean)
-    pdf   = _epo_fullimage_pdf(docdb) if docdb else None
-    if not pdf and clean.startswith("US"):
-        pdf = _uspto_pdf(clean)
-    if not pdf:
-        pdf = _google_patents_pdf(clean)
-    return pdf
-
-
-def _attach_prior_art_to_tile(result: dict, uid: str, portfolio_id: str,
-                              pub_num: str) -> list[dict]:
-    """
-    For each cited prior-art reference, download the PDF, upload it to
-    Cloud Storage, and create a portfolio_files entry scoped to this tile
-    (tile_pub_num=pub_num) so it shows up in that tile's Files panel.
-    Returns a list of {pub_num, download_url, storage_path, title} dicts so
-    the frontend can also show them inline in the OA analysis panel.
-    """
-    cites = (result.get("cited_prior_art") or [])
-    if not cites:
-        return []
-
-    attachments: list[dict] = []
-    for cite in cites:
-        ref   = (cite.get("reference") or "").strip()
-        pnum  = _parse_patent_number(ref)
-        if not pnum:
-            continue
-        try:
-            pdf = _download_patent_pdf(pnum)
-            if not pdf:
-                print(f"  Prior art {pnum}: no PDF available")
-                continue
-            # Upload to Storage
-            client = _get_storage_client()
-            bucket = client.bucket("patent-research-tool-files")
-            safe_pub = pub_num.replace("/", "_")
-            storage_path = f"users/{uid}/prior_art/{portfolio_id}/{safe_pub}/{pnum}.pdf"
-            blob = bucket.blob(storage_path)
-            blob.upload_from_string(pdf, content_type="application/pdf")
-            from datetime import timedelta as _td
-            url = blob.generate_signed_url(expiration=_td(hours=24), method="GET")
-            # Add portfolio_files entry so the tile's Files button surfaces it.
-            # Save BOTH tile_pub_num and tile_app_num so the Files panel can
-            # match even if the tile's pub_num was later upgraded.
-            try:
-                # Derive the app_num of the tile this analysis was run from
-                _tile_ref, _tile_member = _find_family_member(portfolio_id, pub_num)
-                _tile_app = (_tile_member or {}).get("app_num", "") if _tile_member else ""
-                (
-                    db.collection("users").document(uid)
-                      .collection("portfolios").document(portfolio_id)
-                      .collection("files")
-                      .add({
-                          "name":          f"{pnum}.pdf",
-                          "type":          "prior_art",
-                          "tile_pub_num":  pub_num,
-                          "tile_app_num":  _tile_app,
-                          "storage_path":  storage_path,
-                          "download_url":  url,
-                          "reference":     ref,
-                          "source_pub":    pnum,
-                          "uploaded_at":   datetime.now(timezone.utc),
-                      })
-                )
-            except Exception as exc:
-                print(f"  Prior art file record failed for {pnum}: {exc}")
-            attachments.append({
-                "pub_num":      pnum,
-                "download_url": url,
-                "reference":    ref,
-                "title":        cite.get("relevance", "")[:120],
-            })
-            print(f"  Prior art {pnum}: attached ({len(pdf)} bytes)")
-        except Exception as exc:
-            print(f"  Prior art {pnum}: failed ({exc})")
-    return attachments
-
-
-def _upload_oa_pdf(pdf_bytes: bytes, uid: str, portfolio_id: str,
-                   pub_num: str, oa_doc: dict) -> str:
-    """
-    Save the office-action PDF to Firebase default Storage bucket and return
-    a signed URL valid for 24 hours. Returns empty string on any failure.
-    """
-    try:
-        client = _get_storage_client()
-        bucket = client.bucket("patent-research-tool-files")
-        safe_pub = pub_num.replace("/", "_")
-        code     = (oa_doc.get("code") or "OA").upper()
-        date     = (oa_doc.get("date") or "").replace("-", "")
-        path     = f"users/{uid}/oa_pdfs/{portfolio_id}/{safe_pub}__{date}_{code}.pdf"
-        blob = bucket.blob(path)
-        blob.upload_from_string(pdf_bytes, content_type="application/pdf")
-        from datetime import timedelta as _td
-        url = blob.generate_signed_url(expiration=_td(hours=24), method="GET")
-        return url
-    except Exception as exc:
-        print(f"  Analyze OA: storage upload failed: {exc}")
-        return ""
-
-
-@app.route("/api/ai/analyze-oa", methods=["POST"])
-@require_auth
-def ai_analyze_oa():
-    """
-    Download the most recent office action, try text extraction, fall back to
-    sending the PDF directly to Claude for scanned docs, and save the PDF to
-    Cloud Storage with a signed URL returned alongside the analysis.
-    Body: { "portfolio_id": "...", "pub_num": "..." }
-    """
-    body = request.get_json(silent=True) or {}
-    portfolio_id = (body.get("portfolio_id") or "").strip()
-    pub_num      = (body.get("pub_num") or "").strip()
-    if not portfolio_id or not pub_num:
-        return jsonify({"error": "portfolio_id and pub_num are required"}), 400
-
-    try:
-        from ai_engine import PatentAI
-    except ImportError as exc:
-        return jsonify({"error": f"AI engine unavailable: {exc}"}), 500
-
-    port_ref, member = _find_family_member(portfolio_id, pub_num)
-    if member is None:
-        return jsonify({"error": "portfolio or family member not found"}), 404
-
-    oa_text, oa_doc = _download_oa_text(member)
-    if oa_doc is None:
-        return jsonify({"error": "No office action PDF available for analysis"}), 404
-
-    pdf_bytes = oa_doc.get("_pdf_bytes") or b""
-    pdf_url   = ""
-    if pdf_bytes:
-        pdf_url = _upload_oa_pdf(
-            pdf_bytes, request.uid, portfolio_id, pub_num, oa_doc
-        )
-        # Also write a portfolio_files record scoped to this tile so the OA
-        # PDF appears under the tile's Files button.
-        if pdf_url:
-            try:
-                _oa_name = (
-                    f"OA_{(oa_doc.get('date') or '').replace('-','')}"
-                    f"_{(oa_doc.get('code') or 'OA')}.pdf"
-                )
-                db.collection("users").document(request.uid) \
-                  .collection("portfolios").document(portfolio_id) \
-                  .collection("files").add({
-                      "name":          _oa_name,
-                      "type":          "office_action",
-                      "tile_pub_num":  pub_num,
-                      "tile_app_num":  (member or {}).get("app_num", ""),
-                      "download_url":  pdf_url,
-                      "oa_date":       oa_doc.get("date", ""),
-                      "oa_code":       oa_doc.get("code", ""),
-                      "uploaded_at":   datetime.now(timezone.utc),
-                  })
-            except Exception as exc:
-                print(f"  Analyze OA: file record save failed: {exc}", flush=True)
-
-    try:
-        ai = PatentAI()
-        if oa_text and len(oa_text) > 200:
-            print(f"  Analyze OA: using text-mode analysis ({len(oa_text)} chars)")
-            result = ai.analyze_office_action(member, oa_text, oa_doc)
-        elif pdf_bytes:
-            print(f"  Analyze OA: pypdf extract empty — using PDF-direct mode")
-            result = ai.analyze_office_action_pdf(member, pdf_bytes, oa_doc)
-        else:
-            return jsonify({"error": "OA PDF download failed"}), 502
-
-        # Log the response shape so we can see what Claude returned
-        _keys = list(result.keys()) if isinstance(result, dict) else "not-a-dict"
-        print(f"  Analyze OA: Claude returned keys={_keys}")
-        if result.get("error"):
-            print(f"  Analyze OA: error = {result.get('error')}")
-            _raw = result.get("raw_response", "")
-            if _raw:
-                print(f"  Analyze OA: raw_response[:500] = {_raw[:500]}")
-
-        # Attach convenience fields to the result
-        if pdf_url:
-            result["pdf_url"]      = pdf_url
-            result["pdf_filename"] = f"{pub_num}_{(oa_doc.get('date') or '').replace('-','')}_{(oa_doc.get('code') or 'OA')}.pdf"
-        result["oa_code"] = oa_doc.get("code", "")
-        result["oa_date"] = oa_doc.get("date", "")
-
-        # Download every cited prior-art reference, save to Storage, and
-        # link each file to this tile via the portfolio_files collection so
-        # they appear under the tile's Files button.
-        try:
-            attachments = _attach_prior_art_to_tile(
-                result, request.uid, portfolio_id, pub_num
-            )
-            if attachments:
-                result["prior_art_downloads"] = attachments
-        except Exception as exc:
-            print(f"  Prior art attach pass failed: {exc}")
-
-        doc_id = pub_num.replace("/", "_")
-        port_ref.collection("ai_analysis").document(f"{doc_id}__oa").set({
-            **{k: v for k, v in result.items() if k != "_pdf_bytes"},
-            "analyzed_at": datetime.now(timezone.utc),
-            "pub_num":     pub_num,
-            "kind":        "office_action",
-        })
-        # Don't leak bytes in the JSON response
-        if isinstance(oa_doc, dict):
-            oa_doc.pop("_pdf_bytes", None)
-        return jsonify(result)
-    except Exception as exc:
-        traceback.print_exc()
-        return jsonify({"error": f"OA analysis failed: {exc}"}), 500
-
-
-@app.route("/api/ai/analyze/<portfolio_id>/<path:pub_num>", methods=["GET"])
-@require_auth
-def ai_get_cached_analysis(portfolio_id, pub_num):
-    """Return the cached AI analysis (prosecution kind) for this family member."""
-    try:
-        doc_id = pub_num.replace("/", "_")
-        snap = (
-            db.collection("users").document(request.uid)
-              .collection("portfolios").document(portfolio_id)
-              .collection("ai_analysis").document(doc_id).get()
-        )
-        if not snap.exists:
-            return jsonify({"error": "no cached analysis"}), 404
-        return jsonify(snap.to_dict())
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
-
-
-@app.route("/api/ai/portfolio-summary", methods=["POST"])
-@require_auth
-def ai_portfolio_summary():
-    """AI portfolio-wide summary: urgent items, patterns, recommendations."""
-    try:
-        from ai_engine import PatentAI
-    except ImportError as exc:
-        return jsonify({"error": f"AI engine unavailable: {exc}"}), 500
-    try:
-        docs = (
-            db.collection("users").document(request.uid)
-              .collection("portfolios").stream()
-        )
-        entries = []
+        docs = _overrides_col(request.uid, portfolio_id).stream()
+        overrides = {}
         for d in docs:
-            entry = d.to_dict() or {}
-            entry["id"] = d.id
-            entries.append(entry)
-        if not entries:
-            return jsonify({
-                "executive_summary": "Portfolio is empty.",
-                "urgent_items": [],
-                "portfolio_health": {"total_active": 0, "needs_attention": 0, "on_track": 0},
-                "patterns": [],
-                "recommendations": [],
-            })
-        ai     = PatentAI()
-        result = ai.analyze_portfolio(entries)
-        return jsonify(result)
+            overrides[d.id] = d.to_dict()
+        return jsonify({"overrides": overrides})
     except Exception as exc:
-        traceback.print_exc()
-        return jsonify({"error": f"Portfolio summary failed: {exc}"}), 500
+        return jsonify({"error": str(exc)}), 500
 
 
-# ── PDF streamer (per-tile PDF button) ────────────────────────────────────────
-
-def _epo_fullimage_pdf(docdb: str) -> bytes | None:
+@app.route("/api/portfolios/<portfolio_id>/overrides/<tile_key>", methods=["PUT"])
+@require_auth
+def save_override(portfolio_id: str, tile_key: str):
     """
-    Stream the full patent or published-application image from EPO OPS.
-    Two-step: (1) GET /images to get an image-link for the PUBLICATION image,
-              (2) GET that image-link as PDF.
-    Returns PDF bytes, or None on failure.
+    Save field-level overrides for one tile.
+    tile_key is the app_num (sanitized) or pub_num used to identify the tile.
+    Body: { "fields": { "title": "...", "status": "granted", ... },
+            "is_manual": false }
+    Only the fields present in the body are stored as overrides.
     """
-    import requests as _rq
+    body = request.get_json(silent=True) or {}
+    fields = body.get("fields", {})
+    is_manual = body.get("is_manual", False)
+    if not fields and not is_manual:
+        return jsonify({"error": "No fields provided"}), 400
 
-    epo_key    = os.environ.get("EPO_CONSUMER_KEY",    "").strip()
-    epo_secret = os.environ.get("EPO_CONSUMER_SECRET", "").strip()
-    if not epo_key or not epo_secret:
-        return None
-    token = tracker.epo_get_token(epo_key, epo_secret)
-    if not token:
-        return None
+    # Sanitize tile_key (replace slashes which break Firestore paths)
+    safe_key = tile_key.replace("/", "_").replace(",", "")
 
-    # 1) Discover the publication-image endpoint + page count
     try:
-        info = _rq.get(
-            f"https://ops.epo.org/3.2/rest-services/published-data/publication/docdb/{docdb}/images",
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/xml"},
-            timeout=15,
-        )
-        if info.status_code != 200:
-            print(f"  EPO images lookup HTTP {info.status_code}")
-            return None
-        import re as _re
-        xml = info.text
-        # Find the first document-instance whose desc is FullDocument/PublicationImage
-        # and capture its link + number-of-pages.
-        best = None
-        for m in _re.finditer(
-            r'<ops:document-instance[^>]*desc="([^"]+)"[^>]*link="([^"]+)"[^>]*number-of-pages="(\d+)"',
-            xml, _re.IGNORECASE,
-        ):
-            desc, link, pages = m.group(1), m.group(2), int(m.group(3))
-            if desc.lower() in ("fulldocument", "publicationimage"):
-                best = (desc, link, pages)
-                break
-            if best is None:
-                best = (desc, link, pages)
-        if not best:
-            # Fallback: any link in the response
-            link_m = _re.search(r'<ops:document-instance[^>]*link="([^"]+)"[^>]*number-of-pages="(\d+)"', xml)
-            if link_m:
-                best = ("Any", link_m.group(1), int(link_m.group(2)))
-        if not best:
-            return None
-        _, link, pages = best
+        ref = _overrides_col(request.uid, portfolio_id).document(safe_key)
+        data = {
+            "fields":     fields,
+            "is_manual":  is_manual,
+            "updated_at": datetime.now(timezone.utc),
+        }
+        ref.set(data, merge=True)
+        return jsonify({"ok": True, "tile_key": safe_key})
     except Exception as exc:
-        print(f"  EPO images lookup error: {exc}")
-        return None
+        return jsonify({"error": str(exc)}), 500
 
-    # 2) Pull the PDF for "Range=1-N" which returns the consolidated PDF
+
+@app.route("/api/portfolios/<portfolio_id>/overrides/<tile_key>", methods=["DELETE"])
+@require_auth
+def delete_override(portfolio_id: str, tile_key: str):
+    """Remove all overrides for a tile (revert to API data)."""
+    safe_key = tile_key.replace("/", "_").replace(",", "")
     try:
-        # Link is relative like "published-data/images/US/.../PA/fullimage"
-        pdf_url = f"https://ops.epo.org/3.2/rest-services/{link}.pdf?Range=1-{pages}"
-        resp = _rq.get(
-            pdf_url,
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/pdf"},
-            timeout=60,
-        )
-        if resp.status_code == 200 and resp.content[:4] == b"%PDF":
-            return resp.content
-        print(f"  EPO fullimage HTTP {resp.status_code} ({len(resp.content)} bytes)")
+        _overrides_col(request.uid, portfolio_id).document(safe_key).delete()
+        return jsonify({"ok": True})
     except Exception as exc:
-        print(f"  EPO fullimage error: {exc}")
-    return None
+        return jsonify({"error": str(exc)}), 500
 
 
-def _google_patents_pdf(pub_num_clean: str) -> bytes | None:
+@app.route("/api/portfolios/<portfolio_id>/tiles", methods=["POST"])
+@require_auth
+def add_manual_tile(portfolio_id: str):
     """
-    Fallback PDF source that works for most jurisdictions (JP, EP, CN, DE, KR, etc.).
-    Google Patents embeds a <meta name="citation_pdf_url"> tag on each patent page
-    pointing at a publicly hosted PDF on patentimages.storage.googleapis.com.
-    We scrape that URL once, then fetch the PDF.
+    Add a manually-created family member tile.
+    Body: { "app_num": "19/276,489", "pub_num": "", "title": "...",
+            "country": "US", "status": "pending", "filing_date": "2025-03-15", ... }
+    Stores as an override with is_manual=True, and appends to the portfolio's
+    family summary so it appears on rescrape.
     """
-    import re as _re
-    import requests as _rq
+    body = request.get_json(silent=True) or {}
+    app_num = (body.get("app_num") or "").strip()
+    pub_num = (body.get("pub_num") or "").strip()
+    if not app_num and not pub_num:
+        return jsonify({"error": "app_num or pub_num is required"}), 400
 
-    clean = _re.sub(r"[^A-Z0-9]", "", (pub_num_clean or "").upper())
-    if not clean:
-        return None
+    # Use app_num as the tile key (or pub_num if no app_num)
+    tile_key = (app_num or pub_num).replace("/", "_").replace(",", "")
+    country = (body.get("country") or "US").upper()[:2]
 
-    headers = {
-        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/120.0 Safari/537.36"),
-        "Accept-Language": "en",
+    fields = {
+        "app_num":     app_num,
+        "pub_num":     pub_num or app_num,
+        "title":       body.get("title", ""),
+        "country":     country,
+        "status":      body.get("status", "pending"),
+        "filing_date": body.get("filing_date", ""),
+        "grant_date":  body.get("grant_date", ""),
+        "inventors":   body.get("inventors", ""),
+        "assignee":    body.get("assignee", ""),
     }
 
-    # Candidate URLs — try multiple normalizations because pub number formats
-    # vary across sources (EPO drops the leading zero on the serial; USPTO
-    # keeps it).  For a US pre-grant publication like US20230325714A1, EPO's
-    # form is US2023325714A1 (10 digits) while Google / USPTO want the
-    # 11-digit form.  We try the raw form first, then an augmented form that
-    # inserts a zero between the 4-digit year and the 6-digit serial, then
-    # finally drop the kind code entirely.
-    _no_kind = _re.sub(r"[A-Z]+\d*$", "", clean)
-    candidates = [f"https://patents.google.com/patent/{clean}/en"]
-
-    # If US pub in EPO form (US + year + 6-digit serial + kind), try zero-pad
-    _m_us_epo = _re.match(r"^(US)(\d{4})(\d{6})([A-Z]\d?)$", clean)
-    if _m_us_epo:
-        padded = f"{_m_us_epo.group(1)}{_m_us_epo.group(2)}0{_m_us_epo.group(3)}{_m_us_epo.group(4)}"
-        candidates.append(f"https://patents.google.com/patent/{padded}/en")
-
-    # Also try without kind code
-    candidates.append(f"https://patents.google.com/patent/{_no_kind}/en")
-    seen = set()
-    for page_url in candidates:
-        if page_url in seen:
-            continue
-        seen.add(page_url)
-        try:
-            page = _rq.get(page_url, headers=headers, timeout=15, allow_redirects=True)
-            if page.status_code != 200:
-                continue
-            m = _re.search(
-                r'<meta\s+name="citation_pdf_url"\s+content="([^"]+)"',
-                page.text, _re.IGNORECASE,
-            )
-            if not m:
-                continue
-            pdf_url = m.group(1)
-            resp = _rq.get(pdf_url, headers=headers, timeout=60, allow_redirects=True)
-            if resp.status_code == 200 and resp.content[:4] == b"%PDF":
-                return resp.content
-        except Exception as exc:
-            print(f"  Google Patents PDF lookup error for {page_url}: {exc}")
-            continue
-    return None
-
-
-def _uspto_pdf(pub_num_clean: str) -> bytes | None:
-    """
-    Fallback PDF source for US documents via USPTO PatentsView imagewrapper CDN.
-    Works for both granted patents and published applications, no auth required.
-    """
-    import re as _re
-    import requests as _rq
-
-    # Strip leading "US" and kind code to get the core digit string.
-    core = _re.sub(r"^US", "", pub_num_clean)
-    core = _re.sub(r"[A-Z]\d?$", "", core)
-    if not core:
-        return None
-
-    # USPTO image-server direct PDF download (public, no auth). Pattern works for
-    # both granted patents (9-10 digit patent #) and pre-grant publications (11-digit
-    # year-prefixed number).
-    urls = [
-        f"https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/{core}",
-        f"https://patentimages.storage.googleapis.com/pdfs/{core}.pdf",  # secondary cache
-    ]
-    for u in urls:
-        try:
-            resp = _rq.get(u, timeout=45, allow_redirects=True,
-                           headers={"User-Agent": "PatentQ/1.0"})
-            if resp.status_code == 200 and resp.content[:4] == b"%PDF":
-                return resp.content
-        except Exception:
-            continue
-    return None
-
-
-@app.route("/api/pdf/<pub_num>", methods=["GET"])
-def pdf_proxy(pub_num):
-    """
-    Stream the granted-patent PDF (for granted) or the published-application PDF
-    (for pending) as inline application/pdf.  Input: CC+NUM+KIND style pub number
-    like 'US12178560B2' or 'US20260059078A1'.
-
-    Primary source: EPO OPS full-image PDF (needs our consumer key/secret).
-    Fallback: USPTO image-server direct download for US documents.
-    """
-    import re as _re
-    from flask import Response
-
-    clean = _re.sub(r"[^A-Z0-9]", "", (pub_num or "").upper())
-    if not clean:
-        return jsonify({"error": "invalid publication number"}), 400
-
-    docdb = tracker.patent_to_docdb(clean)
-    pdf   = _epo_fullimage_pdf(docdb) if docdb else None
-    if not pdf and clean.startswith("US"):
-        pdf = _uspto_pdf(clean)
-    # Google Patents mirror — covers most jurisdictions where EPO OPS full-image
-    # isn't available (JP, CN, KR, etc.) and where USPTO doesn't apply.
-    if not pdf:
-        pdf = _google_patents_pdf(clean)
-
-    if not pdf:
-        return jsonify({
-            "error": (
-                f"No PDF available for {clean}. EPO OPS, USPTO, and Google Patents "
-                f"all failed to return a PDF. The document may not have a "
-                f"published image yet."
-            )
-        }), 404
-
-    return Response(
-        pdf,
-        mimetype="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{clean}.pdf"'},
-    )
-
-
-# ── Notifications (email alerts & digests via MXroute SMTP) ─────────────────
-
-@app.route("/api/settings/notifications", methods=["GET"])
-@require_auth
-def get_notification_settings():
     try:
-        snap = db.collection("users").document(request.uid) \
-                  .collection("settings").document("notifications").get()
-        prefs = snap.to_dict() if snap.exists else {}
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
-    # Defaults
-    return jsonify({
-        "enabled":          prefs.get("enabled", True),
-        "daily_digest":     prefs.get("daily_digest", True),
-        "weekly_digest":    prefs.get("weekly_digest", True),
-        "event_alerts":     prefs.get("event_alerts", True),
-        "skip_empty":       prefs.get("skip_empty", True),
-        "recipient_email":  prefs.get("recipient_email", request.user_email or ""),
-    })
+        # Save override
+        ref = _overrides_col(request.uid, portfolio_id).document(tile_key)
+        ref.set({
+            "fields":     fields,
+            "is_manual":  True,
+            "updated_at": datetime.now(timezone.utc),
+        })
 
-
-@app.route("/api/settings/notifications", methods=["PATCH"])
-@require_auth
-def update_notification_settings():
-    body = request.get_json(silent=True) or {}
-    allowed = {"enabled", "daily_digest", "weekly_digest",
-               "event_alerts", "skip_empty", "recipient_email"}
-    patch = {k: v for k, v in body.items() if k in allowed}
-    if not patch:
-        return jsonify({"error": "no valid fields"}), 400
-    patch["updated_at"] = datetime.now(timezone.utc)
-    try:
-        db.collection("users").document(request.uid) \
-          .collection("settings").document("notifications").set(patch, merge=True)
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
-    return jsonify({"ok": True, **patch})
-
-
-@app.route("/api/notifications/test", methods=["POST"])
-@require_auth
-def send_test_notification():
-    """Send a test email to the authenticated user."""
-    try:
-        import notifications as _notif
-        to = request.user_email or ""
-        if not to:
-            return jsonify({"error": "no email on account"}), 400
-        _notif.send_email(
-            to,
-            "PatentQ email test",
-            "<p>Your PatentQ alerts are wired up. You're receiving this because you clicked "
-            "<strong>Send test email</strong> in Settings.</p>"
-            "<p>If you didn't request this, ignore and contact support.</p>",
-        )
-        return jsonify({"ok": True, "sent_to": to})
-    except Exception as exc:
-        traceback.print_exc()
-        return jsonify({"error": str(exc)}), 500
-
-
-def _require_scheduler_key():
-    """Scheduler endpoints expect a shared admin header."""
-    want = os.environ.get("NOTIFICATIONS_ADMIN_KEY", "").strip()
-    if not want:
-        return jsonify({"error": "scheduler key not configured"}), 500
-    got = request.headers.get("X-Admin-Key", "").strip()
-    if got != want:
-        return jsonify({"error": "forbidden"}), 403
-    return None
-
-
-@app.route("/api/notifications/run-digest", methods=["POST"])
-def scheduled_run_digest():
-    """
-    Cloud Scheduler target. Runs the digest for EVERY user with notifications
-    enabled. Authenticated via X-Admin-Key header.
-      ?kind=daily    → last-7-through-next-30 window
-      ?kind=weekly   → last-7-through-next-90 window
-    """
-    err = _require_scheduler_key()
-    if err: return err
-    kind = (request.args.get("kind") or "daily").strip().lower()
-    try:
-        import notifications as _notif
-    except Exception as exc:
-        return jsonify({"error": f"notifications import: {exc}"}), 500
-
-    results = []
-    try:
-        # Collect every unique uid from the portfolios collection group.
-        # (Firestore subcollections don't create parent docs automatically, so
-        # db.collection("users").stream() misses users who have data but no
-        # explicit parent doc.)
-        users_seen: set = set()
-        for p_doc in db.collection_group("portfolios").stream():
-            parent = p_doc.reference.parent.parent  # users/{uid}/portfolios → users/{uid}
-            if parent is None:
-                continue
-            uid = parent.id
-            if uid in users_seen:
-                continue
-            users_seen.add(uid)
-            try:
-                r = _notif.send_digest(db, uid, kind=kind)
-                results.append({"uid": uid, **r})
-            except Exception as exc:
-                print(f"  digest {uid}: {exc}", flush=True)
-                results.append({"uid": uid, "sent": False, "error": str(exc)[:120]})
-    except Exception as exc:
-        traceback.print_exc()
-        return jsonify({"error": str(exc)}), 500
-
-    return jsonify({"kind": kind, "results": results})
-
-
-@app.route("/api/notifications/scan-events", methods=["POST"])
-def scheduled_scan_events():
-    """
-    Cloud Scheduler target. Per user, diff current family state against the
-    cached snapshot; send immediate emails on new OA / NOA / abandoned.
-    """
-    err = _require_scheduler_key()
-    if err: return err
-    try:
-        import notifications as _notif
-    except Exception as exc:
-        return jsonify({"error": f"notifications import: {exc}"}), 500
-
-    results = []
-    try:
-        users_seen: set = set()
-        for p_doc in db.collection_group("portfolios").stream():
-            parent = p_doc.reference.parent.parent
-            if parent is None:
-                continue
-            uid = parent.id
-            if uid in users_seen:
-                continue
-            users_seen.add(uid)
-            try:
-                r = _notif.scan_events_for_user(db, uid)
-                if r.get("sent", 0) > 0 or r.get("reason"):
-                    results.append({"uid": uid, **r})
-            except Exception as exc:
-                print(f"  event-scan {uid}: {exc}", flush=True)
-                results.append({"uid": uid, "sent": 0, "error": str(exc)[:120]})
-    except Exception as exc:
-        traceback.print_exc()
-        return jsonify({"error": str(exc)}), 500
-
-    return jsonify({"results": results})
-
-
-# ── Excel export (multi-sheet workbook per family) ───────────────────────────
-
-@app.route("/api/portfolios/<portfolio_id>/export.xlsx", methods=["GET"])
-@require_auth
-def export_portfolio_xlsx(portfolio_id):
-    """
-    Streams a multi-sheet Excel workbook for a single family. Sheets:
-      Summary     — one row per family member with pub/app number, status, dates, title
-      Deadlines   — upcoming deadlines, fees, and annuities across the family
-      Claims      — extracted independent claims per US member (cached)
-      Prior Art   — references cited (EPO biblio + cached AI scan if present)
-      Assignments — per-member assignment chain
-      Fees        — maintenance fees (US granted) + annuities (foreign)
-    """
-    try:
-        from openpyxl import Workbook
-        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-        from openpyxl.utils import get_column_letter
-    except ImportError:
-        return jsonify({"error": "openpyxl not installed"}), 500
-
-    ref = (
-        db.collection("users").document(request.uid)
-          .collection("portfolios").document(portfolio_id)
-    )
-    snap = ref.get()
-    if not snap.exists:
-        return jsonify({"error": "Not found"}), 404
-    data = snap.to_dict() or {}
-    family = data.get("family") or []
-
-    wb = Workbook()
-    bold  = Font(bold=True, color="FFFFFF")
-    hdrfill = PatternFill("solid", fgColor="1A73E8")
-    wrap  = Alignment(wrap_text=True, vertical="top")
-    thin  = Side(border_style="thin", color="E0E0E0")
-    box   = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-    def write_sheet(name: str, headers: list[str], rows: list[list]) -> None:
-        ws = wb.create_sheet(name) if name != "Summary" else wb.active
-        if name == "Summary":
-            ws.title = "Summary"
-        for c, h in enumerate(headers, 1):
-            cell = ws.cell(row=1, column=c, value=h)
-            cell.font = bold
-            cell.fill = hdrfill
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-            cell.border = box
-        for ri, row in enumerate(rows, 2):
-            for ci, val in enumerate(row, 1):
-                cell = ws.cell(row=ri, column=ci, value=val if val is not None else "")
-                cell.alignment = wrap
-                cell.border = box
-        # Width autofit (simple heuristic)
-        for c in range(1, len(headers) + 1):
-            max_len = max([len(str(headers[c - 1]))] +
-                          [len(str((r[c - 1] if c - 1 < len(r) else "") or "")) for r in rows])
-            ws.column_dimensions[get_column_letter(c)].width = min(60, max(12, max_len + 2))
-        ws.row_dimensions[1].height = 20
-        ws.freeze_panes = "A2"
-
-    # ── Summary ────────────────────────────────────────────────────────────
-    summary_rows = []
-    for m in family:
-        pub  = m.get("pub_num", "")
-        app  = tracker._clean_app_num(m.get("app_num", ""))
-        disp = pub
-        if (m.get("status") == "granted" and pub.upper().startswith("US")):
-            disp = tracker._format_us_patent_num(pub) or pub
-        elif m.get("country") == "US" and app:
-            disp = tracker._format_us_app_num(app)
-        summary_rows.append([
-            m.get("country", ""),
-            disp,
-            pub,
-            app,
-            m.get("status", ""),
-            m.get("filing_date", ""),
-            m.get("grant_date", ""),
-            m.get("title", ""),
-            m.get("next_deadline_label", ""),
-            m.get("next_deadline_date", ""),
-        ])
-    write_sheet(
-        "Summary",
-        ["Country", "Display", "Publication #", "Application #", "Status",
-         "Filed", "Granted", "Title", "Next Deadline", "Due"],
-        summary_rows,
-    )
-
-    # ── Deadlines ──────────────────────────────────────────────────────────
-    try:
-        dls = _compute_deadlines(data)
-    except Exception:
-        dls = []
-    dl_rows = [[
-        d.get("due_date", ""),
-        d.get("country", ""),
-        d.get("patent_number", ""),
-        d.get("pub_num", ""),
-        d.get("type", ""),
-        d.get("label", ""),
-        d.get("amount_usd", "") if d.get("amount_usd") is not None else "",
-        d.get("currency", ""),
-        d.get("status", ""),
-    ] for d in sorted(dls, key=lambda r: r.get("due_date", ""))]
-    write_sheet(
-        "Deadlines",
-        ["Due Date", "Country", "Family", "Pub #", "Type", "Label",
-         "Amount (USD)", "Currency", "Status"],
-        dl_rows,
-    )
-
-    # ── Claims ─────────────────────────────────────────────────────────────
-    claim_rows: list = []
-    try:
-        claims_cache = (
+        # Also append to the portfolio's family summary so it shows up everywhere
+        port_ref = (
             db.collection("users").document(request.uid)
-              .collection("ai_claims_cache").stream()
+            .collection("portfolios").document(portfolio_id)
         )
-        for doc in claims_cache:
-            c = doc.to_dict() or {}
-            for ci in c.get("claims", []):
-                claim_rows.append([
-                    c.get("pub_num", ""),
-                    c.get("app_num", ""),
-                    ci.get("num", ""),
-                    ci.get("text", ""),
-                ])
-    except Exception:
-        pass
-    write_sheet(
-        "Claims",
-        ["Pub #", "App #", "Claim #", "Text"],
-        claim_rows,
-    )
+        port_doc = port_ref.get()
+        if port_doc.exists:
+            stored = port_doc.to_dict()
+            family = stored.get("family", [])
+            # Check if already present
+            exists = any(
+                (m.get("app_num", "").replace("/","_").replace(",","") == tile_key
+                 or m.get("pub_num", "").replace("/","_").replace(",","") == tile_key)
+                for m in family
+            )
+            if not exists:
+                family.append({
+                    "pub_num":   pub_num or app_num,
+                    "app_num":   app_num,
+                    "country":   country,
+                    "status":    fields["status"],
+                    "title":     fields["title"],
+                    "filing_date": fields["filing_date"],
+                    "grant_date":  fields["grant_date"],
+                    "href":      "",
+                    "is_manual": True,
+                })
+                port_ref.update({"family": family})
 
-    # ── Prior Art ──────────────────────────────────────────────────────────
-    pa_rows: list = []
-    epo_key    = os.environ.get("EPO_CONSUMER_KEY", "").strip()
-    epo_secret = os.environ.get("EPO_CONSUMER_SECRET", "").strip()
-    token = (tracker.epo_get_token(epo_key, epo_secret)
-             if epo_key and epo_secret else None)
-    if token:
-        for m in family:
-            pub = (m.get("pub_num") or "").upper()
-            if not pub.startswith("US"):
-                continue
-            docdb = tracker.patent_to_docdb(pub)
-            if not docdb:
-                continue
-            bib = tracker.fetch_epo_biblio(docdb, token)
-            if not bib:
-                continue
-            for r in tracker.parse_epo_references_cited(bib):
-                pa_rows.append([
-                    m.get("pub_num", ""),
-                    r.get("type", ""),
-                    r.get("display", ""),
-                    r.get("country", ""),
-                    r.get("number", ""),
-                    r.get("kind", ""),
-                    r.get("category", ""),
-                    r.get("cited_by", ""),
-                    r.get("cited_phase", ""),
-                ])
-    write_sheet(
-        "Prior Art",
-        ["Citing Pub", "Type", "Display", "Country", "Number", "Kind",
-         "Category", "Cited By", "Phase"],
-        pa_rows,
-    )
-
-    # ── Assignments ────────────────────────────────────────────────────────
-    asn_rows: list = []
-    api_key = os.environ.get("USPTO_ODP_API_KEY", "").strip()
-    if api_key:
-        for m in family:
-            if (m.get("country") or "") != "US":
-                continue
-            app_num = tracker._clean_app_num(m.get("app_num", ""))
-            if not app_num:
-                continue
-            assigns = tracker.fetch_odp_assignments(app_num, api_key) or []
-            for a in assigns:
-                assignors = "; ".join(x.get("name", "") for x in a.get("assignors", []))
-                assignees = "; ".join(x.get("name", "") for x in a.get("assignees", []))
-                asn_rows.append([
-                    m.get("pub_num", ""),
-                    a.get("recorded_date", ""),
-                    a.get("execution_date", ""),
-                    a.get("conveyance", ""),
-                    assignors,
-                    assignees,
-                    a.get("reel_frame", ""),
-                    a.get("document_url", ""),
-                ])
-    write_sheet(
-        "Assignments",
-        ["Member", "Recorded", "Execution", "Conveyance",
-         "Assignors", "Assignees", "Reel/Frame", "Doc URL"],
-        asn_rows,
-    )
-
-    # ── Fees ───────────────────────────────────────────────────────────────
-    fee_rows = [[
-        d.get("due_date", ""),
-        d.get("country", ""),
-        d.get("patent_number", ""),
-        d.get("pub_num", ""),
-        d.get("type", ""),
-        d.get("label", ""),
-        d.get("amount_usd", ""),
-        d.get("amount_local", "") if d.get("amount_local") is not None else "",
-        d.get("currency", ""),
-    ] for d in dls if d.get("type") in ("maintenance", "annuity")]
-    write_sheet(
-        "Fees",
-        ["Due Date", "Country", "Family", "Pub #", "Type", "Label",
-         "Amount (USD)", "Amount (Local)", "Currency"],
-        fee_rows,
-    )
-
-    # Stream
-    import io
-    out = io.BytesIO()
-    wb.save(out)
-    out.seek(0)
-    filename = f"PatentQ_{(data.get('patent_number') or portfolio_id)}.xlsx"
-    from flask import send_file
-    return send_file(
-        out,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        as_attachment=True,
-        download_name=filename,
-    )
-
-
-# ── Portfolio-wide analytics ─────────────────────────────────────────────────
-
-@app.route("/api/analytics", methods=["GET"])
-@require_auth
-def get_analytics():
-    """
-    Return cross-portfolio aggregates the /analytics dashboard uses:
-      totals, status counts, jurisdictions, deadlines by time window,
-      assignees (from cached family_summary data), rejection grounds,
-      and fee burden projection (maintenance + annuity) by year.
-
-    Heavy fee/annuity computation reuses the helpers in tracker.py
-    that the Alerts page already relies on.
-    """
-    from datetime import date as _dt, timedelta as _td
-    today = _dt.today()
-
-    try:
-        docs = (
-            db.collection("users").document(request.uid)
-              .collection("portfolios").stream()
-        )
+        return jsonify({"ok": True, "tile_key": tile_key, "fields": fields})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
-
-    families: list[dict] = []
-    for doc in docs:
-        d = doc.to_dict() or {}
-        d["id"] = doc.id
-        families.append(d)
-
-    # Core counts
-    total_families  = len(families)
-    total_members   = 0
-    status_counts   = {"granted": 0, "pending": 0, "abandoned": 0, "unknown": 0}
-    country_counts: dict[str, int] = {}
-    assignee_family: dict[str, set] = {}   # assignee_name -> set of family ids
-    rejection_counts: dict[str, int] = {}  # ground → count across pending apps
-
-    # Deadlines buckets
-    windows = {"30": 0, "60": 0, "90": 0, "overdue": 0}
-    next_deadline_list: list[dict] = []
-
-    # Fee burden by year (USD, US maintenance + foreign annuities combined)
-    fees_by_year: dict[int, float] = {}
-
-    for fam in families:
-        family = fam.get("family") or []
-        total_members += len(family)
-        # Assignee rollup for whole family
-        for a in (fam.get("assignees") or []):
-            if a:
-                assignee_family.setdefault(a.strip(), set()).add(fam["id"])
-
-        for m in family:
-            st = (m.get("status") or "unknown").lower()
-            if st not in status_counts:
-                st = "unknown"
-            status_counts[st] += 1
-            country_counts[m.get("country") or "??"] = country_counts.get(m.get("country") or "??", 0) + 1
-
-            dl_label = m.get("next_deadline_label", "") or ""
-            dl_date  = m.get("next_deadline_date", "")  or ""
-            if dl_date:
-                try:
-                    d = _dt.fromisoformat(dl_date[:10])
-                    delta = (d - today).days
-                    if delta < 0:
-                        windows["overdue"] += 1
-                    elif delta <= 30:
-                        windows["30"] += 1
-                    elif delta <= 60:
-                        windows["60"] += 1
-                    elif delta <= 90:
-                        windows["90"] += 1
-                    # Include in the Top 20 upcoming list for UI display
-                    if delta >= -30:
-                        next_deadline_list.append({
-                            "patent_number": fam.get("patent_number", ""),
-                            "pub_num":       m.get("pub_num", ""),
-                            "country":       m.get("country", ""),
-                            "label":         dl_label,
-                            "date":          dl_date,
-                            "days_out":      delta,
-                            "status":        st,
-                            "portfolio_id":  fam.get("id", ""),
-                        })
-                except Exception:
-                    pass
-
-        # Compute fee burden for this family via existing deadlines helper
-        try:
-            dls = _compute_deadlines(fam)
-            for row in dls:
-                dt = row.get("due_date") or ""
-                try:
-                    yr = int(dt[:4])
-                    fees_by_year[yr] = fees_by_year.get(yr, 0.0) + float(row.get("amount_usd") or 0)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    # Assignee list sorted by number of families owned
-    assignees = sorted(
-        ({"name": n, "family_count": len(f)} for n, f in assignee_family.items()),
-        key=lambda x: (-x["family_count"], x["name"]),
-    )[:20]
-
-    # Country list sorted by member count
-    countries = sorted(
-        ({"country": c, "count": n} for c, n in country_counts.items()),
-        key=lambda x: -x["count"],
-    )
-
-    next_deadline_list.sort(key=lambda r: r["date"])
-    upcoming = next_deadline_list[:25]
-
-    fee_rows = sorted(
-        ({"year": y, "amount_usd": round(v)} for y, v in fees_by_year.items()),
-        key=lambda x: x["year"],
-    )
-
-    return jsonify({
-        "totals": {
-            "families":      total_families,
-            "members":       total_members,
-        },
-        "status":            status_counts,
-        "jurisdictions":     countries,
-        "deadline_windows":  windows,
-        "upcoming":          upcoming,
-        "assignees":         assignees,
-        "fee_burden":        fee_rows,
-    })
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
