@@ -1245,11 +1245,52 @@ def refresh_portfolio_data(portfolio_id: str):
         for m in stored_family
     ]
 
+    # ── Load overrides (manual edits + manual tiles) ──────────────────────
+    overrides = {}
+    try:
+        for od in _overrides_col(request.uid, portfolio_id).stream():
+            overrides[od.id] = od.to_dict()
+    except Exception:
+        pass  # If overrides fail to load, proceed without them
+
+    # Add any manually-created tiles that aren't already in the members list
+    for okey, ov in overrides.items():
+        if not ov.get("is_manual"):
+            continue
+        f = ov.get("fields", {})
+        already = any(
+            (m.get("app_num", "").replace("/", "_").replace(",", "") == okey
+             or m.get("pub_num", "").replace("/", "_").replace(",", "") == okey)
+            for m in members
+        )
+        if not already:
+            members.append({
+                "pub_num": f.get("pub_num") or f.get("app_num", ""),
+                "app_num": f.get("app_num", ""),
+                "href":    "",
+                "title":   f.get("title", ""),
+                "country": f.get("country", "US"),
+            })
+
     total = len(members)
     family_details = [
         tracker.fetch_member_details(m, i + 1, total, odp_api_key=odp_key)
         for i, m in enumerate(members)
     ]
+
+    # ── Apply field-level overrides on top of API data ───────────────────
+    for m in family_details:
+        mkey_app = (m.get("app_num") or "").replace("/", "_").replace(",", "")
+        mkey_pub = (m.get("pub_num") or "").replace("/", "_").replace(",", "")
+        ov = overrides.get(mkey_app) or overrides.get(mkey_pub)
+        if ov:
+            for fk, fv in ov.get("fields", {}).items():
+                if fv:  # Only override if the user actually set a value
+                    m[fk] = fv
+            if ov.get("is_manual"):
+                m["is_manual"] = True
+            else:
+                m["has_overrides"] = True
 
     # If we have main_metas from the initial scrape, use those.
     # Otherwise reconstruct a minimal version from stored fields.
@@ -3652,6 +3693,143 @@ def get_analytics():
         "assignees":         assignees,
         "fee_burden":        fee_rows,
     })
+
+
+# ── Tile Overrides (manual edits & manually-added tiles) ─────────────────────
+
+def _overrides_col(uid: str, portfolio_id: str):
+    """Firestore subcollection ref for tile overrides."""
+    return (
+        db.collection("users").document(uid)
+        .collection("portfolios").document(portfolio_id)
+        .collection("overrides")
+    )
+
+
+@app.route("/api/portfolios/<portfolio_id>/overrides", methods=["GET"])
+@require_auth
+def list_overrides(portfolio_id: str):
+    """Return all tile overrides (edits + manual tiles) for a portfolio."""
+    try:
+        docs = _overrides_col(request.uid, portfolio_id).stream()
+        overrides = {}
+        for d in docs:
+            overrides[d.id] = d.to_dict()
+        return jsonify({"overrides": overrides})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/portfolios/<portfolio_id>/overrides/<tile_key>", methods=["PUT"])
+@require_auth
+def save_override(portfolio_id: str, tile_key: str):
+    """
+    Save field-level overrides for one tile.
+    tile_key is the app_num (sanitized) or pub_num used to identify the tile.
+    Body: { "fields": { "title": "...", "status": "granted", ... },
+            "is_manual": false }
+    Only the fields present in the body are stored as overrides.
+    """
+    body = request.get_json(silent=True) or {}
+    fields = body.get("fields", {})
+    is_manual = body.get("is_manual", False)
+    if not fields and not is_manual:
+        return jsonify({"error": "No fields provided"}), 400
+
+    safe_key = tile_key.replace("/", "_").replace(",", "")
+
+    try:
+        ref = _overrides_col(request.uid, portfolio_id).document(safe_key)
+        data = {
+            "fields":     fields,
+            "is_manual":  is_manual,
+            "updated_at": datetime.now(timezone.utc),
+        }
+        ref.set(data, merge=True)
+        return jsonify({"ok": True, "tile_key": safe_key})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/portfolios/<portfolio_id>/overrides/<tile_key>", methods=["DELETE"])
+@require_auth
+def delete_override(portfolio_id: str, tile_key: str):
+    """Remove all overrides for a tile (revert to API data)."""
+    safe_key = tile_key.replace("/", "_").replace(",", "")
+    try:
+        _overrides_col(request.uid, portfolio_id).document(safe_key).delete()
+        return jsonify({"ok": True})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/portfolios/<portfolio_id>/tiles", methods=["POST"])
+@require_auth
+def add_manual_tile(portfolio_id: str):
+    """
+    Add a manually-created family member tile.
+    Body: { "app_num": "19/276,489", "pub_num": "", "title": "...",
+            "country": "US", "status": "pending", "filing_date": "2025-03-15", ... }
+    """
+    body = request.get_json(silent=True) or {}
+    app_num = (body.get("app_num") or "").strip()
+    pub_num = (body.get("pub_num") or "").strip()
+    if not app_num and not pub_num:
+        return jsonify({"error": "app_num or pub_num is required"}), 400
+
+    tile_key = (app_num or pub_num).replace("/", "_").replace(",", "")
+    country = (body.get("country") or "US").upper()[:2]
+
+    fields = {
+        "app_num":     app_num,
+        "pub_num":     pub_num or app_num,
+        "title":       body.get("title", ""),
+        "country":     country,
+        "status":      body.get("status", "pending"),
+        "filing_date": body.get("filing_date", ""),
+        "grant_date":  body.get("grant_date", ""),
+        "inventors":   body.get("inventors", ""),
+        "assignee":    body.get("assignee", ""),
+    }
+
+    try:
+        ref = _overrides_col(request.uid, portfolio_id).document(tile_key)
+        ref.set({
+            "fields":     fields,
+            "is_manual":  True,
+            "updated_at": datetime.now(timezone.utc),
+        })
+
+        port_ref = (
+            db.collection("users").document(request.uid)
+            .collection("portfolios").document(portfolio_id)
+        )
+        port_doc = port_ref.get()
+        if port_doc.exists:
+            stored = port_doc.to_dict()
+            family = stored.get("family", [])
+            exists = any(
+                (m.get("app_num", "").replace("/","_").replace(",","") == tile_key
+                 or m.get("pub_num", "").replace("/","_").replace(",","") == tile_key)
+                for m in family
+            )
+            if not exists:
+                family.append({
+                    "pub_num":   pub_num or app_num,
+                    "app_num":   app_num,
+                    "country":   country,
+                    "status":    fields["status"],
+                    "title":     fields["title"],
+                    "filing_date": fields["filing_date"],
+                    "grant_date":  fields["grant_date"],
+                    "href":      "",
+                    "is_manual": True,
+                })
+                port_ref.update({"family": family})
+
+        return jsonify({"ok": True, "tile_key": tile_key, "fields": fields})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

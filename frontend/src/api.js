@@ -187,4 +187,26 @@ export const api = {
 
   aiPortfolioSummary: () =>
     authFetch("/api/ai/portfolio-summary", { method: "POST" }),
+
+  // ── Tile overrides (manual edits & manually-added tiles) ────────────────
+
+  listOverrides: (portfolioId) =>
+    authFetch(`/api/portfolios/${portfolioId}/overrides`),
+
+  saveOverride: (portfolioId, tileKey, fields, isManual = false) =>
+    authFetch(`/api/portfolios/${portfolioId}/overrides/${encodeURIComponent(tileKey)}`, {
+      method: "PUT",
+      body: JSON.stringify({ fields, is_manual: isManual }),
+    }),
+
+  deleteOverride: (portfolioId, tileKey) =>
+    authFetch(`/api/portfolios/${portfolioId}/overrides/${encodeURIComponent(tileKey)}`, {
+      method: "DELETE",
+    }),
+
+  addManualTile: (portfolioId, tileData) =>
+    authFetch(`/api/portfolios/${portfolioId}/tiles`, {
+      method: "POST",
+      body: JSON.stringify(tileData),
+    }),
 };

@@ -7,6 +7,7 @@ import PriorArtTab from "../PriorArtTab";
 import ClaimsTab from "../ClaimsTab";
 import TimelineTab from "../TimelineTab";
 import DocumentsPanel from "../DocumentsPanel";
+import TileEditModal from "../TileEditModal";
 import { useIsMobile } from "../useIsMobile";
 
 /** Inline confirmation modal — replaces browser confirm() */
@@ -200,6 +201,10 @@ export default function Portfolio() {
   const [aiError,      setAiError]       = useState("");
   const [refreshError, setRefreshError] = useState("");
 
+  // ── Tile editing / manual tiles ─────────────────────────────────────────
+  const [editModal, setEditModal] = useState(null);   // { mode:"edit"|"add", tileData }
+  const [editSaving, setEditSaving] = useState(false);
+
   // ── Combine mode (multi-family dashboards) ──────────────────────────────
   const [groups, setGroups]             = useState([]);
   const [combineMode, setCombineMode]   = useState(false);
@@ -314,6 +319,10 @@ export default function Portfolio() {
       } else if (e.data?.type === "open-tile-ai") {
         const pubNum = e.data.pubNum;
         handleAiAnalyze(viewingId, pubNum, viewingNumber);
+      } else if (e.data?.type === "edit-tile") {
+        setEditModal({ mode: "edit", tileData: e.data.tileData });
+      } else if (e.data?.type === "add-tile") {
+        setEditModal({ mode: "add", tileData: null });
       }
     }
     window.addEventListener("message", onMessage);
@@ -417,6 +426,42 @@ export default function Portfolio() {
       setLoadingMsg("");
       setRefreshError(`Re-scrape failed: ${err.message}`);
       setTimeout(() => setRefreshError(""), 12000);
+    }
+  }
+
+  // ── Tile override handlers ────────────────────────────────────────────────
+  async function handleTileSave(fields, isManual) {
+    if (!viewingId) return;
+    setEditSaving(true);
+    try {
+      const tileKey = (fields.app_num || fields.pub_num).replace(/\//g, "_").replace(/,/g, "");
+      if (editModal?.mode === "add") {
+        await api.addManualTile(viewingId, fields);
+      } else {
+        await api.saveOverride(viewingId, tileKey, fields, isManual);
+      }
+      setEditModal(null);
+      await handleRefresh();
+    } catch (err) {
+      alert("Save failed: " + err.message);
+    } finally {
+      setEditSaving(false);
+    }
+  }
+
+  async function handleTileRevert() {
+    if (!viewingId || !editModal?.tileData) return;
+    const td = editModal.tileData;
+    const tileKey = (td.app_num || td.pub_num).replace(/\//g, "_").replace(/,/g, "");
+    setEditSaving(true);
+    try {
+      await api.deleteOverride(viewingId, tileKey);
+      setEditModal(null);
+      await handleRefresh();
+    } catch (err) {
+      alert("Revert failed: " + err.message);
+    } finally {
+      setEditSaving(false);
     }
   }
 
@@ -1009,6 +1054,16 @@ export default function Portfolio() {
           <div style={styles.iframeWrap}>
             <PriorArtTab portfolioId={viewingId} />
           </div>
+        )}
+        {editModal && (
+          <TileEditModal
+            mode={editModal.mode}
+            tileData={editModal.tileData}
+            onSave={handleTileSave}
+            onDelete={editModal.mode === "edit" ? handleTileRevert : undefined}
+            onClose={() => setEditModal(null)}
+            saving={editSaving}
+          />
         )}
       </div>
     );

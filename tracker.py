@@ -3302,6 +3302,30 @@ def _render_card(m: dict) -> str:
         f'&#128206; Files</button>'
     )
 
+    # Per-tile Edit button — sends postMessage to parent to open edit modal
+    _edit_data = _json.dumps({
+        "pub_num": m["pub_num"], "app_num": app_num,
+        "title": title, "status": status, "country": code,
+        "filing_date": filing, "grant_date": grant,
+        "is_manual": bool(m.get("is_manual")),
+    }).replace("'", "\\'").replace('"', "&quot;")
+    tile_edit_html = (
+        f'<button class="tile-edit-btn" '
+        f"onclick=\"window.parent.postMessage({{type:'edit-tile',"
+        f"tileData:JSON.parse(this.dataset.tile)}},'*')\" "
+        f'data-tile="{_edit_data}">'
+        f'&#9998; Edit</button>'
+    )
+
+    # Manual / edited indicator
+    is_manual = m.get("is_manual", False)
+    is_edited = m.get("has_overrides", False)
+    edit_badge = ""
+    if is_manual:
+        edit_badge = '<span class="tile-manual-badge">&#9998; Manual</span>'
+    elif is_edited:
+        edit_badge = '<span class="tile-edited-badge">&#9998; Edited</span>'
+
     # "Full IFW on ODP" link — shown on every US tile (pending or granted) so
     # the user can jump to the file wrapper regardless of whether ODP returned
     # document metadata. Uses the cleaned 8-digit serial.
@@ -3371,7 +3395,7 @@ def _render_card(m: dict) -> str:
     return (
         f'<div class="card" style="border-top:4px solid {border}">'
         f'  <div class="card-head">'
-        f'    <span class="card-pnum">{pnum}</span>'
+        f'    <span class="card-pnum">{pnum}{edit_badge}</span>'
         f'    <div style="display:flex;align-items:center;gap:5px;flex-shrink:0">'
         f'      <span class="card-country-chip">{flag} {cname}</span>'
         f'      {_status_badge(status)}'
@@ -3389,7 +3413,7 @@ def _render_card(m: dict) -> str:
         + oa_docs_html + err_html
         + (history_html if not m.get("oa_documents") else "")
         + notes_html
-        + f'<div class="tile-btn-row">{tile_files_html}{tile_ifw_html}</div>'
+        + f'<div class="tile-btn-row">{tile_files_html}{tile_ifw_html}{tile_edit_html}</div>'
         + '</div>'
     )
 
@@ -3864,6 +3888,28 @@ def generate_dashboard_html(
       align-items:center; line-height:1.2;
     }}
     .tile-ifw-btn:hover {{ background:#ffedd5; }}
+    .tile-edit-btn {{
+      padding:5px 12px; border-radius:6px; cursor:pointer;
+      background:#f5f3ff; border:1px solid #c4b5fd; font-size:.75rem;
+      color:#6d28d9; font-weight:600; display:inline-flex; align-items:center; gap:4px;
+    }}
+    .tile-edit-btn:hover {{ background:#ede9fe; }}
+    .tile-manual-badge {{
+      display:inline-block; background:#dbeafe; color:#1e40af; border-radius:4px;
+      padding:1px 6px; font-size:.6rem; font-weight:700; margin-left:6px;
+      vertical-align:middle;
+    }}
+    .tile-edited-badge {{
+      display:inline-block; background:#fef3c7; color:#92400e; border-radius:4px;
+      padding:1px 6px; font-size:.6rem; font-weight:700; margin-left:6px;
+      vertical-align:middle;
+    }}
+    .add-tile-btn {{
+      padding:8px 18px; border-radius:8px; cursor:pointer;
+      background:#1e40af; border:none; font-size:.82rem;
+      color:#fff; font-weight:600; display:inline-flex; align-items:center; gap:5px;
+    }}
+    .add-tile-btn:hover {{ background:#1e3a8a; }}
     .ai-badge {{
       display:inline-block; margin-left:6px; padding:1px 6px;
       background:#8b5cf6; color:#fff; border-radius:10px;
@@ -4311,6 +4357,12 @@ def generate_dashboard_html(
       <div class="stat-label">Prior Art Citations</div>
       <div class="stat-value">{len(relations)}</div>
     </div>
+  </div>
+
+  <div style="margin-bottom:1.25rem;text-align:right">
+    <button class="add-tile-btn" onclick="window.parent.postMessage({{type:'add-tile'}},'*')">
+      &#10133; Add Family Member
+    </button>
   </div>
 
   {abstract_section_html}
