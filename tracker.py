@@ -1421,7 +1421,16 @@ def fetch_member_details(member: dict, idx: int, total: int,
         result["status"] = infer_status(pub_num)
         # Cited prior art — from the EPO biblio references-cited block.
         result["references_cited"] = parse_epo_references_cited(biblio_xml)
-        print(f"ok ({len(result['references_cited'])} refs)")
+        # Prosecution / legal events from INPADOC so non-US tiles get the
+        # same event timeline US tiles have via ODP.
+        try:
+            legal_events = fetch_epo_legal_events(docdb, token)
+            if legal_events:
+                result["events"] = legal_events
+        except Exception as exc:
+            print(f" legal-skip({exc})", end="")
+        print(f"ok ({len(result['references_cited'])} refs, "
+              f"{len(result.get('events') or [])} events)")
     except requests.HTTPError as e:
         print(f"EPO HTTP {e.response.status_code} — tile uses INPADOC fallback only")
     except Exception as e:
@@ -1707,6 +1716,56 @@ def _fmt_epo_date(d: str) -> str:
     if len(d) == 8 and d.isdigit():
         return f"{d[:4]}-{d[4:6]}-{d[6:]}"
     return d
+
+
+def fetch_epo_legal_events(docdb: str, token: str) -> list[dict]:
+    """
+    Fetch INPADOC legal events for a publication from EPO OPS.
+    GET /rest-services/legal/publication/docdb/{docdb}
+    Returns a chronological list of legal events with country-specific meaning
+    (EPO, JP, DE, GB, CN via KIPO, etc.).
+    Each event: { date, code, description, category, inpadoc_desc }
+    """
+    url = f"https://ops.epo.org/3.2/rest-services/legal/publication/docdb/{docdb}"
+    try:
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/xml"},
+            timeout=20,
+        )
+        if resp.status_code in (404, 403):
+            return []
+        resp.raise_for_status()
+        xml = resp.text
+    except Exception as exc:
+        print(f"  EPO legal events error for {docdb}: {str(exc)[:80]}")
+        return []
+
+    out: list[dict] = []
+    # <ops:legal> or <legal> blocks — format varies by EPO response
+    for block in re.findall(r"<ops:legal\b[^>]*>(.*?)</ops:legal>", xml, re.DOTALL):
+        code  = _first(re.findall(r'<ops:L502EP>\s*([^<]+?)\s*</ops:L502EP>', block)).strip()
+        if not code:
+            code = _first(re.findall(r'code="([^"]+)"', block)).strip()
+        date  = _first(re.findall(r'<ops:L007EP>\s*([^<]+?)\s*</ops:L007EP>', block)).strip()
+        if not date:
+            date = _first(re.findall(r'<date>\s*([^<]+?)\s*</date>', block)).strip()
+        desc  = _first(re.findall(r'<ops:L521EP>\s*([^<]+?)\s*</ops:L521EP>', block)).strip()
+        if not desc:
+            desc = _first(re.findall(r'<ops:L500EP>\s*([^<]+?)\s*</ops:L500EP>', block)).strip()
+        category = _first(re.findall(r'<ops:L511EP>\s*([^<]+?)\s*</ops:L511EP>', block)).strip()
+        inpadoc_desc = _first(re.findall(r'<ops:L503EP>\s*([^<]+?)\s*</ops:L503EP>', block)).strip()
+        if not (code or desc):
+            continue
+        out.append({
+            "date":         _fmt_epo_date(date),
+            "code":         code,
+            "title":        desc or inpadoc_desc or code,
+            "category":     category,
+            "inpadoc_desc": inpadoc_desc,
+            "value":        "",
+        })
+    return sorted(out, key=lambda e: e.get("date") or "")
 
 
 def fetch_epo_family(docdb: str, token: str) -> Optional[str]:
