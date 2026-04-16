@@ -2,8 +2,11 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 import PrintBar from "../PrintBar";
+import AssignmentsTab from "../AssignmentsTab";
+import PriorArtTab from "../PriorArtTab";
+import ClaimsTab from "../ClaimsTab";
+import TimelineTab from "../TimelineTab";
 import DocumentsPanel from "../DocumentsPanel";
-import TileEditModal from "../TileEditModal";
 import { useIsMobile } from "../useIsMobile";
 
 /** Inline confirmation modal — replaces browser confirm() */
@@ -84,6 +87,98 @@ function _timeAgo(isoStr) {
   return `${days}d ago`;
 }
 
+function renderAnalysisMarkdown(r, pubNum) {
+  const lines = [];
+  lines.push(`# Office Action Analysis — ${pubNum}`);
+  lines.push("");
+  if (r.oa_type)       lines.push(`**Type:** ${r.oa_type}`);
+  if (r.mailing_date)  lines.push(`**Mailed:** ${r.mailing_date}`);
+  if (r.response_deadline_short)
+    lines.push(`**Response due:** ${r.response_deadline_short}${r.response_deadline_extended && r.response_deadline_extended !== r.response_deadline_short ? ` (extendable to ${r.response_deadline_extended})` : ""}`);
+  lines.push("");
+  if (r.overview) { lines.push("## Overview", r.overview, ""); }
+  if (r.rejections && r.rejections.length) {
+    lines.push(`## Rejections (${r.rejections.length})`);
+    r.rejections.forEach((rj, i) => {
+      lines.push(`### ${i + 1}. ${rj.section || rj.type || ""}`);
+      if (rj.claims_affected) lines.push(`_Claims affected:_ ${rj.claims_affected}`);
+      if (rj.summary) lines.push(rj.summary);
+      if (rj.key_argument) lines.push(`> ${rj.key_argument}`);
+      lines.push("");
+    });
+  }
+  if (r.cited_prior_art && r.cited_prior_art.length) {
+    lines.push(`## Cited Prior Art (${r.cited_prior_art.length})`);
+    r.cited_prior_art.forEach((c) => {
+      lines.push(`- **${c.reference}** — ${c.relevance || ""}`);
+    });
+    lines.push("");
+  }
+  if (r.suggested_response_strategies && r.suggested_response_strategies.length) {
+    lines.push(`## Response Strategies`);
+    r.suggested_response_strategies.forEach((s) => {
+      lines.push(`- **${s.strategy}** (${s.likelihood_of_success || "?"})`);
+      if (s.details) lines.push(`  ${s.details}`);
+    });
+    lines.push("");
+  }
+  if (r.attorney_flags && r.attorney_flags.length) {
+    lines.push(`## Attorney Flags`);
+    r.attorney_flags.forEach((f) => lines.push(`- ${f}`));
+    lines.push("");
+  }
+  if (r.pdf_url) lines.push(`---\n[Download Original OA PDF](${r.pdf_url})`);
+  return lines.join("\n");
+}
+
+function renderAnalysisPrintable(r, pubNum) {
+  const esc = (s) => String(s || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  let body = `<h1>Office Action Analysis — ${esc(pubNum)}</h1>`;
+  body += `<p>`;
+  if (r.oa_type)       body += `<strong>Type:</strong> ${esc(r.oa_type)} &nbsp; `;
+  if (r.mailing_date)  body += `<strong>Mailed:</strong> ${esc(r.mailing_date)} &nbsp; `;
+  if (r.response_deadline_short) {
+    body += `<strong>Response due:</strong> ${esc(r.response_deadline_short)}`;
+    if (r.response_deadline_extended && r.response_deadline_extended !== r.response_deadline_short)
+      body += ` (extendable to ${esc(r.response_deadline_extended)})`;
+  }
+  body += `</p>`;
+  if (r.overview)      body += `<h2>Overview</h2><p>${esc(r.overview)}</p>`;
+  if (r.rejections && r.rejections.length) {
+    body += `<h2>Rejections (${r.rejections.length})</h2>`;
+    r.rejections.forEach((rj, i) => {
+      body += `<div style="margin:10px 0;padding:10px;border-left:4px solid #c62828;background:#fff5f5"><strong>${i + 1}. ${esc(rj.section || rj.type || "")}</strong>`;
+      if (rj.claims_affected) body += `<br><em>Claims:</em> ${esc(rj.claims_affected)}`;
+      if (rj.summary)         body += `<p>${esc(rj.summary)}</p>`;
+      if (rj.key_argument)    body += `<p style="color:#555;font-style:italic">Examiner's argument: ${esc(rj.key_argument)}</p>`;
+      body += `</div>`;
+    });
+  }
+  if (r.cited_prior_art && r.cited_prior_art.length) {
+    body += `<h2>Cited Prior Art</h2><ul>`;
+    r.cited_prior_art.forEach((c) => {
+      body += `<li><strong>${esc(c.reference)}</strong>${c.relevance ? " — " + esc(c.relevance) : ""}</li>`;
+    });
+    body += `</ul>`;
+  }
+  if (r.suggested_response_strategies && r.suggested_response_strategies.length) {
+    body += `<h2>Response Strategies</h2>`;
+    r.suggested_response_strategies.forEach((s) => {
+      body += `<div style="margin:8px 0;padding:10px;border-left:4px solid #2e7d32;background:#f1f8f4"><strong>${esc(s.strategy)}</strong> <em>(${esc(s.likelihood_of_success || "?")})</em>`;
+      if (s.details) body += `<p>${esc(s.details)}</p>`;
+      body += `</div>`;
+    });
+  }
+  if (r.attorney_flags && r.attorney_flags.length) {
+    body += `<h2>Attorney Flags</h2><ul>`;
+    r.attorney_flags.forEach((f) => body += `<li>${esc(f)}</li>`);
+    body += `</ul>`;
+  }
+  return `<!doctype html><html><head><meta charset="utf-8"><title>OA Analysis — ${esc(pubNum)}</title>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:780px;margin:20px auto;padding:0 20px;color:#1a1a2e;line-height:1.55}h1{margin-top:0}h2{border-bottom:1px solid #e0e0e0;padding-bottom:4px;margin-top:24px}@media print{body{margin:10mm}}</style>
+</head><body>${body}</body></html>`;
+}
+
 export default function Portfolio() {
   const isMobile  = useIsMobile();
   const navigate  = useNavigate();
@@ -99,11 +194,11 @@ export default function Portfolio() {
   const [loadingMsg, setLoadingMsg]       = useState("");
   const [confirmTarget, setConfirmTarget] = useState(null);
   const [docsPanel,    setDocsPanel]     = useState(null); // { portfolioId, patentNumber, usAppNum }
+  const [aiPanel,      setAiPanel]       = useState(null); // { portfolioId, pubNum, patentNumber }
+  const [aiResult,     setAiResult]      = useState(null);
+  const [aiLoading,    setAiLoading]     = useState(false);
+  const [aiError,      setAiError]       = useState("");
   const [refreshError, setRefreshError] = useState("");
-
-  // ── Tile editing / manual tiles ─────────────────────────────────────────
-  const [editModal, setEditModal] = useState(null);   // { mode:"edit"|"add", tileData }
-  const [editSaving, setEditSaving] = useState(false);
 
   // ── Combine mode (multi-family dashboards) ──────────────────────────────
   const [groups, setGroups]             = useState([]);
@@ -112,6 +207,9 @@ export default function Portfolio() {
   const [viewingGroup, setViewingGroup] = useState(null);    // { id, name, dashboard_html } or ad-hoc preview
   const [groupSaveName, setGroupSaveName] = useState("");
   const groupIframeRef = useRef(null);
+
+  // ── Dashboard tab (Family Dashboard vs Assignments vs …) ─────────────────
+  const [activeTab, setActiveTab] = useState("dashboard");
 
   const iframeRef         = useRef(null);
   const notesRef          = useRef({});   // always-current notes for the open dashboard
@@ -201,11 +299,10 @@ export default function Portfolio() {
     }
   }
 
-  // Listen for postMessages from the dashboard iframe (Files, Edit, Add)
+  // Listen for per-tile postMessages from the dashboard iframe (Files + AI)
   useEffect(() => {
     function onMessage(e) {
-      if (!e.data?.type) return;
-      if (e.data.type === "open-tile-files") {
+      if (e.data?.type === "open-tile-files") {
         const pubNum  = e.data.pubNum;
         const usEntry = (viewing?.family || []).find((m) => m.country === "US");
         setDocsPanel({
@@ -214,10 +311,9 @@ export default function Portfolio() {
           usAppNum:     usEntry?.app_num || "",
           tilePubNum:   pubNum,
         });
-      } else if (e.data.type === "edit-tile") {
-        setEditModal({ mode: "edit", tileData: e.data.tileData });
-      } else if (e.data.type === "add-tile") {
-        setEditModal({ mode: "add", tileData: null });
+      } else if (e.data?.type === "open-tile-ai") {
+        const pubNum = e.data.pubNum;
+        handleAiAnalyze(viewingId, pubNum, viewingNumber);
       }
     }
     window.addEventListener("message", onMessage);
@@ -324,43 +420,6 @@ export default function Portfolio() {
     }
   }
 
-  // ── Tile override handlers ────────────────────────────────────────────────
-  async function handleTileSave(fields, isManual) {
-    if (!viewingId) return;
-    setEditSaving(true);
-    try {
-      const tileKey = (fields.app_num || fields.pub_num).replace(/\//g, "_").replace(/,/g, "");
-      if (editModal?.mode === "add") {
-        await api.addManualTile(viewingId, fields);
-      } else {
-        await api.saveOverride(viewingId, tileKey, fields, isManual);
-      }
-      setEditModal(null);
-      // Refresh the dashboard to pick up the changes
-      await handleRefresh();
-    } catch (err) {
-      alert("Save failed: " + err.message);
-    } finally {
-      setEditSaving(false);
-    }
-  }
-
-  async function handleTileRevert() {
-    if (!viewingId || !editModal?.tileData) return;
-    const td = editModal.tileData;
-    const tileKey = (td.app_num || td.pub_num).replace(/\//g, "_").replace(/,/g, "");
-    setEditSaving(true);
-    try {
-      await api.deleteOverride(viewingId, tileKey);
-      setEditModal(null);
-      await handleRefresh();
-    } catch (err) {
-      alert("Revert failed: " + err.message);
-    } finally {
-      setEditSaving(false);
-    }
-  }
-
   function handleNameChange(e) {
     const name = e.target.value;
     setFamilyName(name);
@@ -458,6 +517,62 @@ export default function Portfolio() {
     }
   }
 
+  // ── AI Office Action Analysis ─────────────────────────────────────────
+  async function handleAiAnalyze(portfolioId, pubNum, patentNumber) {
+    setAiPanel({ portfolioId, pubNum, patentNumber: patentNumber || pubNum });
+    setAiResult(null);
+    setAiError("");
+    setAiLoading(true);
+    try {
+      const result = await api.aiAnalyzeOA(portfolioId, pubNum);
+      setAiResult(result);
+    } catch (err) {
+      setAiError(err.message || "OA analysis failed");
+    } finally {
+      setAiLoading(false);
+    }
+  }
+
+  function handlePrintAnalysis() {
+    // Open a new window containing a printable version of the analysis.
+    if (!aiResult || aiResult.error) return;
+    const w = window.open("", "_blank", "width=900,height=1000");
+    if (!w) return;
+    const h = renderAnalysisPrintable(aiResult, aiPanel?.pubNum || "");
+    w.document.write(h);
+    w.document.close();
+    setTimeout(() => w.print(), 400);
+  }
+
+  function handleDownloadAnalysisMarkdown() {
+    if (!aiResult || aiResult.error) return;
+    const md = renderAnalysisMarkdown(aiResult, aiPanel?.pubNum || "");
+    const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `OA-analysis-${aiPanel?.pubNum || "patent"}.md`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  async function handleRefreshAi() {
+    if (!aiPanel) return;
+    setAiResult(null);
+    setAiError("");
+    setAiLoading(true);
+    try {
+      const result = await api.aiAnalyzeOA(aiPanel.portfolioId, aiPanel.pubNum);
+      setAiResult(result);
+    } catch (err) {
+      setAiError(err.message || "OA analysis failed");
+    } finally {
+      setAiLoading(false);
+    }
+  }
+
   // Full-page loading overlay while fresh search runs (30-60s)
   if (viewLoading) {
     const isScrape = loadingMsg.startsWith("Generating") || loadingMsg.startsWith("Refresh");
@@ -545,6 +660,224 @@ export default function Portfolio() {
             onClose={() => setDocsPanel(null)}
           />
         )}
+        {/* AI Office Action Analysis Panel */}
+        {aiPanel && (
+          <div style={aiStyles.overlay} onClick={() => { setAiPanel(null); setAiResult(null); setAiError(""); }}>
+            <div style={aiStyles.panel} onClick={(e) => e.stopPropagation()}>
+              <div style={aiStyles.header}>
+                <h3 style={aiStyles.title}>Office Action Analysis</h3>
+                <span style={aiStyles.subtitle}>{aiPanel.pubNum}</span>
+                <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
+                  {aiResult && !aiResult.error && (
+                    <>
+                      <button
+                        style={{ padding: "6px 10px", borderRadius: 6, background: "#f0f4f8",
+                                 border: "1px solid #d0d7de", cursor: "pointer", fontSize: 12, fontWeight: 600 }}
+                        onClick={() => handlePrintAnalysis()}
+                        title="Print this analysis (or Save as PDF via print dialog)"
+                      >
+                        🖨 Print / Save PDF
+                      </button>
+                      <button
+                        style={{ padding: "6px 10px", borderRadius: 6, background: "#f0f4f8",
+                                 border: "1px solid #d0d7de", cursor: "pointer", fontSize: 12, fontWeight: 600 }}
+                        onClick={() => handleDownloadAnalysisMarkdown()}
+                        title="Download the analysis as a Markdown file"
+                      >
+                        ⬇️ Save .md
+                      </button>
+                    </>
+                  )}
+                  <button style={aiStyles.closeBtn} onClick={() => { setAiPanel(null); setAiResult(null); setAiError(""); }}>✕</button>
+                </div>
+              </div>
+              {aiLoading && (
+                <div style={aiStyles.loadingWrap}>
+                  <div style={styles.spinner} />
+                  <p style={{ margin: 0, color: "#555", fontSize: 14 }}>Fetching and analyzing office action...</p>
+                  <p style={{ margin: 0, color: "#999", fontSize: 12 }}>Downloading OA from USPTO, extracting text, running AI analysis. This may take 20-30 seconds.</p>
+                </div>
+              )}
+              {aiError && (
+                <div style={aiStyles.errorBox}>
+                  <strong>Analysis failed:</strong> {aiError}
+                  <button style={aiStyles.retryBtn} onClick={handleRefreshAi}>Retry</button>
+                </div>
+              )}
+              {aiResult && (
+                <div style={aiStyles.resultWrap}>
+                  {aiResult.error && (
+                    <div style={aiStyles.errorBox}>
+                      <strong>Analysis error:</strong> {aiResult.error}
+                      {aiResult.raw_response && (
+                        <details style={{ marginTop: 8 }}>
+                          <summary style={{ cursor: "pointer", fontSize: 12 }}>Raw response</summary>
+                          <pre style={{ fontSize: 11, background: "#fff", padding: 8, borderRadius: 4, overflow: "auto", maxHeight: 200 }}>
+                            {aiResult.raw_response}
+                          </pre>
+                        </details>
+                      )}
+                    </div>
+                  )}
+                  {!aiResult.error && !aiResult.rejections && !aiResult.overview && !aiResult.oa_type && (
+                    <div style={{ padding: 14, background: "#fff7ed", border: "1px solid #fed7aa",
+                                  borderRadius: 8, color: "#c2410c", fontSize: 13 }}>
+                      Analysis returned, but in an unexpected shape. Download the PDF below and review manually.
+                      <details style={{ marginTop: 8 }}>
+                        <summary style={{ cursor: "pointer", fontSize: 12 }}>Response JSON</summary>
+                        <pre style={{ fontSize: 11, background: "#fff", padding: 8, borderRadius: 4, overflow: "auto", maxHeight: 300 }}>
+                          {JSON.stringify(aiResult, null, 2)}
+                        </pre>
+                      </details>
+                    </div>
+                  )}
+                  {/* OA Type + Deadlines + PDF */}
+                  <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 16, alignItems: "center" }}>
+                    {aiResult.oa_type && (
+                      <span style={{ ...aiStyles.urgencyTag, background: "#e3f2fd", color: "#1565c0", fontSize: 12, padding: "4px 12px" }}>
+                        {aiResult.oa_type.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase())}
+                      </span>
+                    )}
+                    {aiResult.mailing_date && (
+                      <span style={{ fontSize: 12, color: "#666", alignSelf: "center" }}>Mailed: {aiResult.mailing_date}</span>
+                    )}
+                    {aiResult.pdf_url && (
+                      <a
+                        href={aiResult.pdf_url}
+                        target="_blank"
+                        rel="noopener"
+                        download={aiResult.pdf_filename || "office-action.pdf"}
+                        style={{ marginLeft: "auto", padding: "6px 12px", borderRadius: 6,
+                                 background: "#1a73e8", color: "#fff", textDecoration: "none",
+                                 fontSize: 13, fontWeight: 600 }}
+                      >
+                        📄 Download OA PDF
+                      </a>
+                    )}
+                  </div>
+                  {(aiResult.response_deadline_short || aiResult.response_deadline_extended) && (
+                    <div style={{ background: "#fff7ed", border: "1px solid #fed7aa", borderRadius: 8, padding: "10px 14px", marginBottom: 16, fontSize: 13, color: "#c2410c" }}>
+                      <strong>Response due:</strong> {aiResult.response_deadline_short} without extension
+                      {aiResult.response_deadline_extended && aiResult.response_deadline_extended !== aiResult.response_deadline_short
+                        ? ` and ${aiResult.response_deadline_extended} with extension` : ""}
+                    </div>
+                  )}
+
+                  {/* Overview */}
+                  {aiResult.overview && (
+                    <div style={aiStyles.section}>
+                      <div style={aiStyles.sectionLabel}>Overview</div>
+                      <p style={aiStyles.summaryText}>{aiResult.overview}</p>
+                    </div>
+                  )}
+
+                  {/* Rejections */}
+                  {aiResult.rejections && aiResult.rejections.length > 0 && (
+                    <div style={aiStyles.section}>
+                      <div style={aiStyles.sectionLabel}>Rejections ({aiResult.rejections.length})</div>
+                      {aiResult.rejections.map((rej, i) => (
+                        <div key={i} style={{ ...aiStyles.actionItem, borderLeft: "4px solid #c62828" }}>
+                          <div style={aiStyles.actionHeader}>
+                            <span style={aiStyles.actionTitle}>{rej.section || rej.type}</span>
+                            {rej.claims_affected && <span style={{ fontSize: 11, color: "#666" }}>{rej.claims_affected}</span>}
+                          </div>
+                          <p style={aiStyles.actionDetails}>{rej.summary}</p>
+                          {rej.key_argument && (
+                            <p style={{ ...aiStyles.actionDetails, fontStyle: "italic", color: "#777", marginTop: 4 }}>
+                              Examiner's argument: {rej.key_argument}
+                            </p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Cited Prior Art */}
+                  {aiResult.cited_prior_art && aiResult.cited_prior_art.length > 0 && (
+                    <div style={aiStyles.section}>
+                      <div style={aiStyles.sectionLabel}>Cited Prior Art ({aiResult.cited_prior_art.length})</div>
+                      {aiResult.cited_prior_art.map((ref, i) => (
+                        <div key={i} style={{ ...aiStyles.actionItem, borderLeft: "4px solid #1a73e8" }}>
+                          <div style={{ fontWeight: 600, fontSize: 13, color: "#1a1a2e", marginBottom: 4 }}>
+                            {ref.reference}
+                            {ref.citation_type && (
+                              <span style={{ ...aiStyles.urgencyTag, background: "#e8f0fe", color: "#1a73e8", marginLeft: 8 }}>
+                                {ref.citation_type === "non-patent-literature" ? "NPL" : "Patent"}
+                              </span>
+                            )}
+                          </div>
+                          {ref.relevance && <p style={aiStyles.actionDetails}>{ref.relevance}</p>}
+                          {(() => {
+                            const dl = (aiResult.prior_art_downloads || []).find(
+                              (d) => ref.reference && ref.reference.toUpperCase().includes(d.pub_num)
+                            );
+                            if (!dl) return null;
+                            return (
+                              <a
+                                href={dl.download_url}
+                                target="_blank"
+                                rel="noopener"
+                                download={`${dl.pub_num}.pdf`}
+                                style={{ display: "inline-block", marginTop: 6, padding: "4px 10px",
+                                         borderRadius: 5, background: "#1a73e8", color: "#fff",
+                                         textDecoration: "none", fontSize: 12, fontWeight: 600 }}
+                              >
+                                📄 Download {dl.pub_num}
+                              </a>
+                            );
+                          })()}
+                        </div>
+                      ))}
+                      {aiResult.prior_art_downloads && aiResult.prior_art_downloads.length > 0 && (
+                        <p style={{ fontSize: 11, color: "#2e7d32", marginTop: 8 }}>
+                          ✓ {aiResult.prior_art_downloads.length} prior-art PDF{aiResult.prior_art_downloads.length === 1 ? "" : "s"} saved to this tile's Files
+                        </p>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Suggested Response Strategies */}
+                  {aiResult.suggested_response_strategies && aiResult.suggested_response_strategies.length > 0 && (
+                    <div style={aiStyles.section}>
+                      <div style={aiStyles.sectionLabel}>Response Strategies</div>
+                      {aiResult.suggested_response_strategies.map((s, i) => (
+                        <div key={i} style={{
+                          ...aiStyles.actionItem,
+                          borderLeft: `4px solid ${s.likelihood_of_success === "high" ? "#2e7d32" : s.likelihood_of_success === "medium" ? "#f57c00" : "#c62828"}`,
+                        }}>
+                          <div style={aiStyles.actionHeader}>
+                            <span style={aiStyles.actionTitle}>{s.strategy}</span>
+                            <span style={{
+                              ...aiStyles.urgencyTag,
+                              background: s.likelihood_of_success === "high" ? "#e8f5e9" : s.likelihood_of_success === "medium" ? "#fff3e0" : "#fdecea",
+                              color: s.likelihood_of_success === "high" ? "#2e7d32" : s.likelihood_of_success === "medium" ? "#e65100" : "#c62828",
+                            }}>{s.likelihood_of_success}</span>
+                          </div>
+                          <p style={aiStyles.actionDetails}>{s.details}</p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Attorney Flags */}
+                  {aiResult.attorney_flags && aiResult.attorney_flags.length > 0 && (
+                    <div style={{ background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 8, padding: "12px 16px", marginBottom: 16 }}>
+                      <div style={{ ...aiStyles.sectionLabel, color: "#991b1b", marginBottom: 6 }}>Attorney Attention Required</div>
+                      {aiResult.attorney_flags.map((flag, i) => (
+                        <p key={i} style={{ margin: "4px 0", fontSize: 13, color: "#991b1b", lineHeight: 1.5 }}>{flag}</p>
+                      ))}
+                    </div>
+                  )}
+
+                  <div style={aiStyles.footer}>
+                    <span style={aiStyles.footerNote}>AI-generated analysis. Attorney review required.</span>
+                    <button style={aiStyles.refreshBtn} onClick={handleRefreshAi}>Re-analyze</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
         <div style={styles.dashHeader}>
           <button
             style={styles.backBtn}
@@ -595,32 +928,87 @@ export default function Portfolio() {
           >
             🔔 Family Alerts
           </button>
+          <button
+            style={styles.refreshBtn}
+            onClick={async () => {
+              try {
+                const blob = await api.downloadPortfolioXlsx(viewingId);
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = `PatentQ_${viewingNumber}.xlsx`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
+              } catch (err) {
+                alert("Export failed: " + err.message);
+              }
+            }}
+            title="Download the family as a multi-sheet Excel workbook (Summary, Deadlines, Claims, Prior Art, Assignments, Fees)"
+          >
+            ⬇️ Excel
+          </button>
         </div>
         {refreshError && (
           <div style={styles.refreshErrorBanner}>
             ⚠️ Refresh failed: {refreshError} — your cached dashboard is still shown below.
           </div>
         )}
-        <div style={styles.iframeWrap}>
-          <iframe
-            ref={iframeRef}
-            title="Patent Dashboard"
-            style={styles.iframe}
-            srcDoc={viewing.dashboard_html}
-            sandbox="allow-scripts allow-same-origin allow-modals allow-popups"
-            onLoad={handleIframeLoad}
-          />
-          <PrintBar iframeRef={iframeRef} />
+        <div style={styles.tabBar}>
+          {[
+            { key: "dashboard",   label: "📊 Family Dashboard" },
+            { key: "timeline",    label: "🕒 Timeline" },
+            { key: "claims",      label: "📋 Claims" },
+            { key: "prior_art",   label: "📚 Prior Art" },
+            { key: "assignments", label: "🏛 Assignments" },
+          ].map((t) => (
+            <button
+              key={t.key}
+              onClick={() => setActiveTab(t.key)}
+              style={{
+                ...styles.tabBtn,
+                ...(activeTab === t.key ? styles.tabBtnActive : {}),
+              }}
+            >
+              {t.label}
+            </button>
+          ))}
         </div>
-        {editModal && (
-          <TileEditModal
-            mode={editModal.mode}
-            tileData={editModal.tileData}
-            onSave={handleTileSave}
-            onDelete={editModal.mode === "edit" ? handleTileRevert : undefined}
-            onClose={() => setEditModal(null)}
-            saving={editSaving}
-          />
+        {activeTab === "dashboard" && (
+          <>
+            <PrintBar iframeRef={iframeRef} />
+            <div style={styles.iframeWrap}>
+              <iframe
+                ref={iframeRef}
+                title="Patent Dashboard"
+                style={styles.iframe}
+                srcDoc={viewing.dashboard_html}
+                sandbox="allow-scripts allow-same-origin allow-modals allow-popups"
+                onLoad={handleIframeLoad}
+              />
+            </div>
+          </>
+        )}
+        {activeTab === "assignments" && (
+          <div style={styles.iframeWrap}>
+            <AssignmentsTab portfolioId={viewingId} />
+          </div>
+        )}
+        {activeTab === "timeline" && (
+          <div style={styles.iframeWrap}>
+            <TimelineTab portfolioId={viewingId} />
+          </div>
+        )}
+        {activeTab === "claims" && (
+          <div style={styles.iframeWrap}>
+            <ClaimsTab portfolioId={viewingId} />
+          </div>
+        )}
+        {activeTab === "prior_art" && (
+          <div style={styles.iframeWrap}>
+            <PriorArtTab portfolioId={viewingId} />
+          </div>
         )}
       </div>
     );
@@ -846,6 +1234,9 @@ const styles = {
   docsBtn:   { padding: "8px 12px", borderRadius: 8, background: "#f0f4f8",
     border: "1px solid #d0d7de", cursor: "pointer", fontSize: 13, color: "#1a1a2e",
     fontWeight: 500 },
+  aiBtn:     { padding: "8px 12px", borderRadius: 8, background: "#ede7f6",
+    border: "1px solid #ce93d8", cursor: "pointer", fontSize: 13, color: "#6a1b9a",
+    fontWeight: 600 },
   deleteBtn: { padding: "8px 14px", borderRadius: 8, background: "#fff",
     color: "#d32f2f", border: "1px solid #f5c6cb", cursor: "pointer", fontSize: 13 },
   dashHeader:  { marginBottom: 12, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" },
@@ -870,6 +1261,12 @@ const styles = {
     color: "#856404", fontSize: 13, lineHeight: 1.5,
   },
   iframe:      { width: "100%", height: "85vh", border: "none", display: "block" },
+  tabBar:      { display: "flex", gap: 4, marginBottom: 8 },
+  tabBtn:      { padding: "8px 16px", borderRadius: "8px 8px 0 0",
+    border: "1px solid #e0e0e0", borderBottom: "none", background: "#f8f9fa",
+    cursor: "pointer", fontSize: 13, fontWeight: 600, color: "#666" },
+  tabBtnActive:{ background: "#fff", color: "#1a73e8",
+    borderTop: "3px solid #1a73e8", boxShadow: "0 -1px 0 #fff" },
   groupsWrap:  { marginBottom: 20, padding: "12px 16px", background: "#f8f9fa",
     borderRadius: 10, border: "1px solid #e0e0e0" },
   groupsHeader:{ display: "flex", alignItems: "baseline", justifyContent: "space-between",
@@ -895,4 +1292,45 @@ const styles = {
     animation: "spin 1s linear infinite" },
   loadingText:    { fontSize: 18, color: "#1a1a2e", margin: 0, textAlign: "center" },
   loadingSubtext: { fontSize: 14, color: "#888", margin: 0 },
+};
+
+const aiStyles = {
+  overlay: { position: "fixed", inset: 0, background: "rgba(0,0,0,.45)",
+    display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 },
+  panel: { background: "#fff", borderRadius: 14, padding: 0, width: "90%", maxWidth: 620,
+    maxHeight: "85vh", overflow: "hidden", display: "flex", flexDirection: "column",
+    boxShadow: "0 20px 60px rgba(0,0,0,.25)" },
+  header: { display: "flex", alignItems: "center", gap: 10, padding: "18px 24px 14px",
+    borderBottom: "1px solid #e0e0e0", flexShrink: 0 },
+  title: { margin: 0, fontSize: 17, color: "#1a1a2e", fontWeight: 700 },
+  subtitle: { fontSize: 13, color: "#1a73e8", fontWeight: 600 },
+  closeBtn: { marginLeft: "auto", background: "none", border: "none", fontSize: 20,
+    cursor: "pointer", color: "#888", padding: "4px 8px", lineHeight: 1 },
+  loadingWrap: { display: "flex", flexDirection: "column", alignItems: "center",
+    gap: 14, padding: "3rem 2rem" },
+  errorBox: { margin: "1.5rem", padding: "14px 18px", borderRadius: 8, background: "#fdecea",
+    color: "#c62828", fontSize: 14, lineHeight: 1.5 },
+  retryBtn: { marginLeft: 12, padding: "4px 14px", borderRadius: 6, border: "1px solid #c62828",
+    background: "#fff", color: "#c62828", cursor: "pointer", fontSize: 13, fontWeight: 600 },
+  resultWrap: { overflowY: "auto", padding: "20px 24px" },
+  section: { marginBottom: 20 },
+  sectionLabel: { fontSize: 12, fontWeight: 700, textTransform: "uppercase",
+    letterSpacing: "0.05em", color: "#888", marginBottom: 8 },
+  summaryText: { margin: 0, fontSize: 14, color: "#333", lineHeight: 1.65 },
+  riskBadge: { display: "inline-block", padding: "5px 14px", borderRadius: 20,
+    fontSize: 13, fontWeight: 700, marginBottom: 16 },
+  actionItem: { background: "#f8f9fa", borderRadius: 8, padding: "12px 16px",
+    marginBottom: 10 },
+  actionHeader: { display: "flex", justifyContent: "space-between", alignItems: "center",
+    gap: 10, marginBottom: 4 },
+  actionTitle: { fontWeight: 600, fontSize: 14, color: "#1a1a2e" },
+  urgencyTag: { fontSize: 11, fontWeight: 700, padding: "2px 10px", borderRadius: 12,
+    textTransform: "uppercase", flexShrink: 0 },
+  actionMeta: { fontSize: 12, color: "#666", marginTop: 2 },
+  actionDetails: { margin: "8px 0 0", fontSize: 13, color: "#555", lineHeight: 1.55 },
+  footer: { display: "flex", alignItems: "center", justifyContent: "space-between",
+    paddingTop: 16, borderTop: "1px solid #eee", marginTop: 8 },
+  footerNote: { fontSize: 11, color: "#999", fontStyle: "italic" },
+  refreshBtn: { padding: "6px 16px", borderRadius: 8, border: "1px solid #ce93d8",
+    background: "#ede7f6", color: "#6a1b9a", cursor: "pointer", fontSize: 13, fontWeight: 600 },
 };

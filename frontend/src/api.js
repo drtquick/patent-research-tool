@@ -89,6 +89,55 @@ export const api = {
   deletePortfolioFile: (id, fileId) =>
     authFetch(`/api/portfolios/${id}/files/${fileId}`, { method: "DELETE" }),
 
+  // Assignment chain per US family member
+  getPortfolioAssignments: (id) =>
+    authFetch(`/api/portfolios/${id}/assignments`),
+
+  // Portfolio-wide analytics aggregates
+  getAnalytics: () => authFetch("/api/analytics"),
+
+  // Notification preferences
+  getNotificationSettings: () => authFetch("/api/settings/notifications"),
+  updateNotificationSettings: (patch) =>
+    authFetch("/api/settings/notifications", {
+      method: "PATCH", body: JSON.stringify(patch),
+    }),
+  sendTestNotification: () =>
+    authFetch("/api/notifications/test", { method: "POST" }),
+
+  // Build the absolute URL for downloading an Excel export of a family
+  portfolioExportUrl: (id) => {
+    const BASE = import.meta.env.VITE_API_URL || "http://localhost:5001";
+    return `${BASE}/api/portfolios/${id}/export.xlsx`;
+  },
+
+  // Download the Excel export (uses auth token so we can't just use <a download>).
+  // Returns a Blob ready to trigger a save.
+  downloadPortfolioXlsx: async (id) => {
+    const { auth } = await import("./firebase");
+    const token = await auth.currentUser?.getIdToken();
+    const BASE = import.meta.env.VITE_API_URL || "http://localhost:5001";
+    const res = await fetch(`${BASE}/api/portfolios/${id}/export.xlsx`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({ error: res.statusText }))).error || "Export failed");
+    return res.blob();
+  },
+
+  // Family filing timeline + continuation graph
+  getPortfolioTimeline: (id) =>
+    authFetch(`/api/portfolios/${id}/timeline`),
+
+  // Claims summary: independent claims per US member + optional AI summary
+  getPortfolioClaims: (id, { summary = false } = {}) =>
+    authFetch(`/api/portfolios/${id}/claims${summary ? "?summary=1" : ""}`),
+
+  // Aggregated prior-art citations per US family member.
+  // Pass { aiScan: true } to ALSO run Claude against the latest IDS + 892
+  // PDFs on pending apps. Results are cached in Firestore by doc set hash.
+  getPortfolioPriorArt: (id, { aiScan = false } = {}) =>
+    authFetch(`/api/portfolios/${id}/prior-art${aiScan ? "?ai_scan=1" : ""}`),
+
   // ── Patentee groups (combined multi-family dashboards) ───────────────────
 
   listPatenteeGroups: () => authFetch("/api/patentee-groups"),
@@ -119,25 +168,23 @@ export const api = {
       body: JSON.stringify({ portfolio_ids, name }),
     }),
 
-  // ── Tile overrides (manual edits & manually-added tiles) ────────────────
+  // ── AI Analysis (Claude-powered prosecution assistant) ───────────────────
 
-  listOverrides: (portfolioId) =>
-    authFetch(`/api/portfolios/${portfolioId}/overrides`),
-
-  saveOverride: (portfolioId, tileKey, fields, isManual = false) =>
-    authFetch(`/api/portfolios/${portfolioId}/overrides/${encodeURIComponent(tileKey)}`, {
-      method: "PUT",
-      body: JSON.stringify({ fields, is_manual: isManual }),
-    }),
-
-  deleteOverride: (portfolioId, tileKey) =>
-    authFetch(`/api/portfolios/${portfolioId}/overrides/${encodeURIComponent(tileKey)}`, {
-      method: "DELETE",
-    }),
-
-  addManualTile: (portfolioId, tileData) =>
-    authFetch(`/api/portfolios/${portfolioId}/tiles`, {
+  aiAnalyze: (portfolioId, pubNum) =>
+    authFetch("/api/ai/analyze", {
       method: "POST",
-      body: JSON.stringify(tileData),
+      body: JSON.stringify({ portfolio_id: portfolioId, pub_num: pubNum }),
     }),
+
+  aiAnalyzeOA: (portfolioId, pubNum) =>
+    authFetch("/api/ai/analyze-oa", {
+      method: "POST",
+      body: JSON.stringify({ portfolio_id: portfolioId, pub_num: pubNum }),
+    }),
+
+  aiGetCachedAnalysis: (portfolioId, pubNum) =>
+    authFetch(`/api/ai/analyze/${portfolioId}/${encodeURIComponent(pubNum)}`),
+
+  aiPortfolioSummary: () =>
+    authFetch("/api/ai/portfolio-summary", { method: "POST" }),
 };

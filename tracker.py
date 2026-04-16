@@ -718,15 +718,24 @@ _REJECTION_GROUNDS: dict[str, dict] = {
     },
 }
 
-# Foreign office systems for linking
+# Foreign office systems for linking. All URLs are chosen to default to English:
+# query params / language parameters where supported, or English portal pages
+# where the office offers a native-vs-English toggle.
 _FOREIGN_SYSTEMS: dict[str, tuple[str, str]] = {
-    "EP": ("EPO Register",  "https://register.epo.org/application?number="),
-    "JP": ("J-PlatPat",     "https://www.j-platpat.inpit.go.jp/"),
-    "CN": ("CNIPA CPQUERY", "https://cpquery.cponline.cnipa.gov.cn/"),
-    "KR": ("KIPRIS",        "https://www.kipris.or.kr/"),
+    "EP": ("EPO Register",  "https://register.epo.org/application?lng=en&number="),
+    "JP": ("J-PlatPat",     "https://www.j-platpat.inpit.go.jp/p0000"),  # English portal
+    "CN": ("CNIPA CPQUERY", "https://english.cnipa.gov.cn/col/col3076/index.html"),
+    "KR": ("KIPRIS",        "http://engpat.kipris.or.kr/engpat/searchLogina.do?next=MainSearch"),
     "AU": ("AusPat",        "https://www.ipaustralia.gov.au/tools-resources/search-patent"),
     "CA": ("CIPO",          "https://ised-isde.canada.ca/site/canadian-intellectual-property-office/en/patents"),
     "GB": ("IPO",           "https://www.ipo.gov.uk/p-ipsum.htm"),
+    "DE": ("DPMA Register", "https://register.dpma.de/DPMAregister/pat/einsteiger?lang=en"),
+    "TW": ("TIPO",          "https://twpat7.tipo.gov.tw/twpatc/twpatkm?!!FRURL"),
+    "IL": ("ILPO",          "https://ilpatsearch.justice.gov.il/"),
+    "BR": ("INPI",          "https://busca.inpi.gov.br/pePI/?lang=en"),
+    "IN": ("InPASS",        "https://ipindia.gov.in/patents.htm"),
+    "RU": ("Rospatent",     "https://new.fips.ru/en/iiss/"),
+    "MX": ("IMPI MARCANET", "https://vidoc.impi.gob.mx/?lang=en"),
 }
 
 
@@ -825,6 +834,77 @@ def extract_rejection_summary(m: dict) -> Optional[dict]:
 
 
 # ── USPTO Open Data Portal (ODP) helpers ─────────────────────────────────────
+
+def _format_us_patent_num(pub_num: str) -> str:
+    """
+    Pretty-print a US granted patent publication number as 'US 12,178,560 B2'.
+    Accepts 'US12178560B2', 'US12178560', '12178560B2', '12,178,560'.
+    Returns the input unchanged if it doesn't match a US granted pattern.
+    """
+    s = (pub_num or "").strip()
+    if not s:
+        return ""
+    clean = re.sub(r"[^A-Z0-9]", "", s.upper())
+    # Match optional US, required digits (7-10), optional kind code A/B/C[digit]
+    m = re.match(r"^(US)?(\d{6,10})([A-Z]\d?)?$", clean)
+    if not m:
+        return pub_num
+    cc, num, kind = m.group(1) or "", m.group(2), m.group(3) or ""
+    # Insert thousands separators right-to-left
+    rev = num[::-1]
+    grouped = ",".join(rev[i:i+3] for i in range(0, len(rev), 3))[::-1]
+    parts = []
+    if cc:
+        parts.append(cc)
+    parts.append(grouped)
+    if kind:
+        parts.append(kind)
+    return " ".join(parts)
+
+
+def calc_expiration_date(filing_date: str, country: str,
+                         is_design: bool = False) -> str:
+    """
+    Estimate the patent expiration date. For utility patents this is 20 years
+    from the earliest non-provisional filing date in most jurisdictions; for
+    US design patents it's 15 years from grant. This is an estimate that
+    does not account for patent term adjustment (PTA), patent term extension
+    (PTE), or terminal disclaimers.  Returns ISO 'YYYY-MM-DD' or ''.
+    """
+    if not filing_date:
+        return ""
+    try:
+        from datetime import date as _dt
+        fd = _dt.fromisoformat(filing_date[:10])
+        years = 15 if (is_design and country == "US") else 20
+        # Feb 29 edge case: clamp to Feb 28
+        try:
+            exp = fd.replace(year=fd.year + years)
+        except ValueError:
+            exp = fd.replace(year=fd.year + years, day=28)
+        return exp.isoformat()
+    except Exception:
+        return ""
+
+
+def _format_us_app_num(raw: str) -> str:
+    """
+    Format a US application number as 'XX/XXX,XXX' (the standard USPTO form).
+
+    Accepts any of:
+      '17134990'            → '17/134,990'
+      'US17134990'          → '17/134,990'
+      'US202017134990'      → '17/134,990'     (EPO 12-digit year-prefixed)
+      'US2020/17134990'     → '17/134,990'
+      '17/134,990'          → '17/134,990'     (pass-through)
+
+    Returns the input unchanged if we can't resolve it to an 8-digit serial.
+    """
+    clean = _clean_app_num(raw or "")
+    if len(clean) == 8 and clean.isdigit():
+        return f"{clean[:2]}/{clean[2:5]},{clean[5:]}"
+    return raw or ""
+
 
 def _clean_app_num(s: str) -> str:
     """Strip non-digits so '17/508,065' → '17508065'.
@@ -968,6 +1048,162 @@ def fetch_odp_documents(app_num: str, api_key: str) -> list[dict]:
         return []
 
 
+def fetch_odp_assignments(app_num: str, api_key: str) -> list[dict]:
+    """
+    Fetch the USPTO assignment chain for a US application from the ODP
+    /applications/{id}/assignment endpoint. Returns a list of assignment
+    events sorted oldest-first with shape:
+        {
+            "recorded_date":     "YYYY-MM-DD",
+            "execution_date":    "YYYY-MM-DD",  # earliest assignor exec date
+            "conveyance":        "ASSIGNMENT OF ASSIGNOR'S INTEREST" | "SECURITY AGREEMENT" | ...,
+            "assignors":         [ {name, execution_date}, ... ],
+            "assignees":         [ {name, city, state, country}, ... ],
+            "reel_frame":        "058854/0814",
+            "document_url":      "https://assignmentcenter.uspto.gov/...",
+            "pages":             33
+        }
+    Empty list on error or no assignments.
+    """
+    clean = _clean_app_num(app_num)
+    if not clean:
+        return []
+    try:
+        for attempt in range(3):
+            resp = requests.get(
+                f"https://api.uspto.gov/api/v1/patent/applications/{clean}/assignment",
+                headers={"X-API-Key": api_key, "Accept": "application/json"},
+                timeout=20,
+            )
+            if resp.status_code in (429, 503) and attempt < 2:
+                wait = (2 ** attempt) + random.uniform(0.5, 2.0)
+                _time.sleep(wait)
+                continue
+            if resp.status_code in (404, 403):
+                return []
+            resp.raise_for_status()
+            break
+        else:
+            return []
+        data = resp.json()
+        bag  = (data.get("patentFileWrapperDataBag") or [{}])[0]
+        raw  = bag.get("assignmentBag") or []
+        out: list[dict] = []
+        for a in raw:
+            assignors = []
+            earliest_exec = ""
+            for s in a.get("assignorBag", []) or []:
+                ed = s.get("executionDate", "") or ""
+                if ed and (not earliest_exec or ed < earliest_exec):
+                    earliest_exec = ed
+                assignors.append({
+                    "name":            (s.get("assignorName") or "").strip(),
+                    "execution_date":  ed,
+                })
+            assignees = []
+            for e in a.get("assigneeBag", []) or []:
+                addr = e.get("assigneeAddress") or {}
+                assignees.append({
+                    "name":     (e.get("assigneeNameText") or "").strip(),
+                    "city":     addr.get("cityName", ""),
+                    "state":    addr.get("ictStateCode") or addr.get("geographicRegionCode", ""),
+                    "country":  addr.get("ictCountryCode", ""),
+                })
+            out.append({
+                "recorded_date":  a.get("assignmentRecordedDate", "") or "",
+                "execution_date": earliest_exec,
+                "conveyance":     (a.get("conveyanceText") or "").strip(),
+                "assignors":      assignors,
+                "assignees":      assignees,
+                "reel_frame":     a.get("reelAndFrameNumber", ""),
+                "document_url":   a.get("assignmentDocumentLocationURI", ""),
+                "pages":          a.get("pageTotalQuantity", 0),
+            })
+        # Oldest first — natural flow of the chain
+        out.sort(key=lambda x: x.get("recorded_date") or "")
+        return out
+    except Exception as exc:
+        print(f"  ODP assignments error for {clean}: {str(exc)[:80]}")
+        return []
+
+
+def fetch_odp_continuity(app_num: str, api_key: str) -> list[dict]:
+    """
+    Fetch the dedicated ODP continuity endpoint for a US application.
+
+    USPTO's /applications/{id} endpoint only returns a lightweight continuity
+    summary (often limited to direct parents).  The dedicated /continuity
+    endpoint returns the full parent/child chain including continuations,
+    CIPs, and divisionals that don't appear on the main record.
+
+    Returns a list of related-app dicts with shape:
+        { side: "parent"|"child", app_num, filing, patent, relation }
+    Empty list on any error or unsupported response.
+    """
+    clean = _clean_app_num(app_num)
+    if not clean:
+        return []
+    out: list[dict] = []
+    try:
+        for attempt in range(3):
+            resp = requests.get(
+                f"https://api.uspto.gov/api/v1/patent/applications/{clean}/continuity",
+                headers={"X-API-Key": api_key, "Accept": "application/json"},
+                timeout=20,
+            )
+            if resp.status_code in (429, 503) and attempt < 2:
+                wait = (2 ** attempt) + random.uniform(0.5, 2.0)
+                print(f"  ODP continuity {resp.status_code} — retry in {wait:.1f}s …")
+                _time.sleep(wait)
+                continue
+            if resp.status_code in (403, 404):
+                return []
+            resp.raise_for_status()
+            break
+        else:
+            return []
+        data = resp.json()
+        bag  = data.get("patentFileWrapperDataBag") or [{}]
+        # In parentContinuityBag every entry points AT a parent of the current
+        # app — so the related app is parentApplicationNumberText. In
+        # childContinuityBag it's the opposite: the related app is
+        # childApplicationNumberText. Reading the "wrong" field gives the
+        # current app itself, which silently deduped the children out of
+        # the BFS. Must read the field that matches the side.
+        for entry in bag:
+            for cb in entry.get("parentContinuityBag", []) or []:
+                raw = cb.get("parentApplicationNumberText", "") or ""
+                ca  = _clean_app_num(raw)
+                if not ca:
+                    continue
+                out.append({
+                    "side":     "parent",
+                    "app_num":  ca,
+                    "app_raw":  raw,
+                    "filing":   cb.get("parentApplicationFilingDate", ""),
+                    "patent":   cb.get("parentPatentNumber", ""),
+                    "relation": cb.get("claimParentageTypeCode", "")
+                                or cb.get("claimParentageTypeCodeDescriptionText", ""),
+                })
+            for cb in entry.get("childContinuityBag", []) or []:
+                raw = cb.get("childApplicationNumberText", "") or ""
+                ca  = _clean_app_num(raw)
+                if not ca:
+                    continue
+                out.append({
+                    "side":     "child",
+                    "app_num":  ca,
+                    "app_raw":  raw,
+                    "filing":   cb.get("childApplicationFilingDate", ""),
+                    "patent":   cb.get("childPatentNumber", ""),
+                    "relation": cb.get("claimParentageTypeCode", "")
+                                or cb.get("claimParentageTypeCodeDescriptionText", ""),
+                })
+    except Exception as exc:
+        print(f"  ODP continuity error for {clean}: {str(exc)[:80]}")
+    return out
+
+
 def fetch_us_member_via_odp(member: dict, api_key: str) -> dict | None:
     """
     Fetch US patent family member details from the USPTO Open Data Portal
@@ -1006,8 +1242,11 @@ def fetch_us_member_via_odp(member: dict, api_key: str) -> dict | None:
             if resp.status_code in (404, 403):
                 # 404: not yet indexed in ODP (common for recent filings).
                 # 403: ODP rejects the app number format (e.g. bad digit count).
-                # Either way, return whatever EPO gave us without flagging an error.
-                print(f"  ODP {resp.status_code} — {app_num}; using EPO bibliographic data")
+                # Flag the tile so the renderer can show a clear "Data not
+                # yet available from USPTO ODP" notice instead of a blank tile.
+                print(f"  ODP {resp.status_code} — {app_num}; marking data-not-available")
+                result["data_not_available"] = True
+                result["fetch_error"] = f"ODP {resp.status_code}"
                 return result
             resp.raise_for_status()
             break
@@ -1018,6 +1257,16 @@ def fetch_us_member_via_odp(member: dict, api_key: str) -> dict | None:
         result["filing_date"]  = meta.get("filingDate",  "") or ""
         result["grant_date"]   = meta.get("grantDate",   "") or ""
         result["app_num"]      = _clean_app_num(bag.get("applicationNumberText") or app_num)
+        # Upgrade the stub pub_num to the real publication number when ODP
+        # has one. This matters for pending apps whose initial stub was
+        # just "US{app_num}"; the PDF button and EPO lookups need the real
+        # publication (e.g. "US2023325714A1" or "US12178560B2").
+        patent_number = (meta.get("patentNumber") or "").strip()
+        earliest_pub  = (meta.get("earliestPublicationNumber") or "").strip()
+        if patent_number:
+            result["pub_num"] = f"US{patent_number}B2"
+        elif earliest_pub:
+            result["pub_num"] = earliest_pub
         result["member_title"] = (meta.get("inventionTitle") or "").strip() or result["member_title"]
         result["status"]       = _odp_status_to_standard(
                                      meta.get("applicationStatusDescriptionText", ""))
@@ -1029,6 +1278,37 @@ def fetch_us_member_via_odp(member: dict, api_key: str) -> dict | None:
         ]
         # Fetch prosecution documents (office actions etc.) — non-fatal
         result["oa_documents"] = fetch_odp_documents(result["app_num"], api_key)
+
+        # Continuity: parent/child US apps (continuations, CIPs, divisionals).
+        # Read from the side-specific field so the related app (not the
+        # current one) gets recorded.
+        related: list[dict] = []
+        for cb in bag.get("parentContinuityBag", []) or []:
+            clean = _clean_app_num(cb.get("parentApplicationNumberText", ""))
+            if not clean:
+                continue
+            related.append({
+                "side":     "parent",
+                "app_num":  clean,
+                "filing":   cb.get("parentApplicationFilingDate", ""),
+                "patent":   cb.get("parentPatentNumber", ""),
+                "relation": cb.get("claimParentageTypeCode", "")
+                            or cb.get("claimParentageTypeCodeDescriptionText", ""),
+            })
+        for cb in bag.get("childContinuityBag", []) or []:
+            clean = _clean_app_num(cb.get("childApplicationNumberText", ""))
+            if not clean:
+                continue
+            related.append({
+                "side":     "child",
+                "app_num":  clean,
+                "filing":   cb.get("childApplicationFilingDate", ""),
+                "patent":   cb.get("childPatentNumber", ""),
+                "relation": cb.get("claimParentageTypeCode", "")
+                            or cb.get("claimParentageTypeCodeDescriptionText", ""),
+            })
+        if related:
+            result["related_us_apps"] = related
     except Exception as exc:
         result["fetch_error"] = str(exc)[:80]
 
@@ -1047,58 +1327,116 @@ def fetch_member_details(member: dict, idx: int, total: int,
     """
     pub_num = member.get("pub_num", "")
 
-    # ── Fast / reliable path: USPTO ODP for US patents ──────────────────────
-    if odp_api_key and pub_num.startswith("US") and member.get("app_num"):
-        print(f"  [{idx:>2}/{total}] {pub_num:<22} … (ODP) ", end="", flush=True)
-        odp_result = fetch_us_member_via_odp(member, odp_api_key)
-        if odp_result is not None and not odp_result.get("fetch_error"):
-            print("ok")
-            _time.sleep(0.05)   # tiny courtesy delay
-            return odp_result
-        err = (odp_result or {}).get("fetch_error", "unknown")
-        print(f"ODP-err({err[:40]}), falling back to GP")
+    # ── Fast / reliable path: USPTO ODP for ALL US members ─────────────────
+    # For any US member we try ODP first. If app_num is missing, resolve it
+    # via EPO biblio (document-id-type="original" yields the 8-digit serial
+    # ODP uses). Only fall through to the GP scraper when ODP truly can't be
+    # reached for this member.
+    if odp_api_key and pub_num.startswith("US"):
+        if not member.get("app_num"):
+            _epo_key    = os.environ.get("EPO_CONSUMER_KEY",    "").strip()
+            _epo_secret = os.environ.get("EPO_CONSUMER_SECRET", "").strip()
+            if _epo_key and _epo_secret:
+                _docdb = patent_to_docdb(pub_num)
+                if _docdb:
+                    _tok = epo_get_token(_epo_key, _epo_secret)
+                    if _tok:
+                        _bib = fetch_epo_biblio(_docdb, _tok)
+                        if _bib:
+                            _app = extract_us_app_num_from_biblio(_bib)
+                            if _app:
+                                member = {**member, "app_num": _app}
+        if member.get("app_num"):
+            print(f"  [{idx:>2}/{total}] {pub_num:<22} … (ODP) ", end="", flush=True)
+            odp_result = fetch_us_member_via_odp(member, odp_api_key)
+            if odp_result is not None and not odp_result.get("fetch_error"):
+                # Supplementary EPO biblio pass to capture the structured
+                # references-cited list (ODP doesn't expose this). Non-fatal.
+                try:
+                    _epo_key    = os.environ.get("EPO_CONSUMER_KEY",    "").strip()
+                    _epo_secret = os.environ.get("EPO_CONSUMER_SECRET", "").strip()
+                    if _epo_key and _epo_secret:
+                        _docdb = patent_to_docdb(odp_result.get("pub_num", pub_num))
+                        if _docdb:
+                            _tok = epo_get_token(_epo_key, _epo_secret)
+                            if _tok:
+                                _bib = fetch_epo_biblio(_docdb, _tok)
+                                if _bib:
+                                    odp_result["references_cited"] = parse_epo_references_cited(_bib)
+                except Exception as _exc:
+                    print(f" refs-skip({_exc})", end="")
+                print(f"ok ({len(odp_result.get('references_cited') or [])} refs)")
+                _time.sleep(0.05)   # tiny courtesy delay
+                return odp_result
+            err = (odp_result or {}).get("fetch_error", "unknown")
+            print(f"ODP-err({err[:40]}), falling back to GP")
 
-    # ── Standard path: Google Patents ───────────────────────────────────────
+    # ── Non-US member path: EPO OPS biblio (no Google Patents) ──────────────
+    # Google Patents is NOT a primary source — it scrapes ODP and EPO. We use
+    # EPO OPS biblio directly for every non-US member so the data matches the
+    # authoritative source and we don't depend on GP's fragile HTML or its
+    # rate-limiting. EPO returns title, filing date, publication date,
+    # applicant list, and (via a second call) abstract.
     result = {
         **member,
         "status":        infer_status(pub_num),
         "events":        [],
         "rejections":    [],
         "backward_refs": [],
-        "filing_date":   "",
+        "filing_date":   member.get("date", "") or "",
         "grant_date":    "",
         "member_title":  member.get("title", ""),
         "fetch_error":   None,
     }
-    if not member.get("href"):
-        return result
-
-    print(f"  [{idx:>2}/{total}] {pub_num:<22} … ", end="", flush=True)
+    print(f"  [{idx:>2}/{total}] {pub_num:<22} … (EPO) ", end="", flush=True)
     try:
-        page  = fetch_page(member["href"])
-        metas = get_metas(page)
+        epo_key    = os.environ.get("EPO_CONSUMER_KEY",    "").strip()
+        epo_secret = os.environ.get("EPO_CONSUMER_SECRET", "").strip()
+        if not (epo_key and epo_secret):
+            print("no EPO creds — using parse_epo_family fallback")
+            return result
+        token = epo_get_token(epo_key, epo_secret)
+        if not token:
+            print("EPO auth failed — using parse_epo_family fallback")
+            return result
+        docdb = patent_to_docdb(pub_num)
+        if not docdb:
+            print("docdb parse failed — using parse_epo_family fallback")
+            return result
+        biblio_xml = fetch_epo_biblio(docdb, token)
+        if not biblio_xml:
+            print("no biblio — using parse_epo_family fallback")
+            return result
+        metas = parse_epo_biblio(biblio_xml)
         dates = metas.get("DC.date", [])
-        result["filing_date"]   = dates[0] if dates else ""
-        result["grant_date"]    = dates[1] if len(dates) > 1 else ""
-        result["app_num"]       = _first(metas.get("citation_patent_application_number", [])) or ""
-        result["member_title"]  = (metas.get("DC.title", [""])[0] or member.get("title", "")).strip()
-        result["status"]        = infer_status(pub_num, page)
-        result["events"]        = parse_legal_events(page)
-        result["backward_refs"] = parse_backward_refs(page)
-        result["rejections"]    = (
-            parse_rejections(page) if result["status"] in ("pending", "unknown") else []
-        )
-        print("ok")
+        if dates:
+            result["filing_date"] = dates[0]
+            if len(dates) > 1:
+                result["grant_date"] = dates[1]
+        _title = _first(metas.get("DC.title", [])) or ""
+        if _title:
+            result["member_title"] = _title.strip()
+        # Infer status from the kind code if the EPO biblio doesn't give us
+        # a better signal.
+        result["status"] = infer_status(pub_num)
+        # Cited prior art — from the EPO biblio references-cited block.
+        result["references_cited"] = parse_epo_references_cited(biblio_xml)
+        # Prosecution / legal events from INPADOC so non-US tiles get the
+        # same event timeline US tiles have via ODP.
+        try:
+            legal_events = fetch_epo_legal_events(docdb, token)
+            if legal_events:
+                result["events"] = legal_events
+        except Exception as exc:
+            print(f" legal-skip({exc})", end="")
+        print(f"ok ({len(result['references_cited'])} refs, "
+              f"{len(result.get('events') or [])} events)")
     except requests.HTTPError as e:
-        result["fetch_error"] = f"HTTP {e.response.status_code}"
-        if e.response.status_code == 404:
-            result["status"] = "unknown"
-        print(f"HTTP {e.response.status_code}")
+        print(f"EPO HTTP {e.response.status_code} — tile uses INPADOC fallback only")
     except Exception as e:
-        result["fetch_error"] = str(e)[:60]
-        print("error")
+        print(f"EPO error ({str(e)[:40]}) — tile uses INPADOC fallback only")
 
-    _time.sleep(0.5)
+    _time.sleep(0.1)
     return result
 
 
@@ -1153,7 +1491,7 @@ def _render_oa_documents(oa_docs: list, app_num: str = "") -> str:
         )
 
     return (
-        f'<details class="history oa-details" open>'
+        f'<details class="history oa-details">'
         f'<summary class="oa-summary">'
         f'Prosecution History'
         f'<span class="ev-count">{len(oa_docs)}</span>'
@@ -1378,6 +1716,56 @@ def _fmt_epo_date(d: str) -> str:
     if len(d) == 8 and d.isdigit():
         return f"{d[:4]}-{d[4:6]}-{d[6:]}"
     return d
+
+
+def fetch_epo_legal_events(docdb: str, token: str) -> list[dict]:
+    """
+    Fetch INPADOC legal events for a publication from EPO OPS.
+    GET /rest-services/legal/publication/docdb/{docdb}
+    Returns a chronological list of legal events with country-specific meaning
+    (EPO, JP, DE, GB, CN via KIPO, etc.).
+    Each event: { date, code, description, category, inpadoc_desc }
+    """
+    url = f"https://ops.epo.org/3.2/rest-services/legal/publication/docdb/{docdb}"
+    try:
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/xml"},
+            timeout=20,
+        )
+        if resp.status_code in (404, 403):
+            return []
+        resp.raise_for_status()
+        xml = resp.text
+    except Exception as exc:
+        print(f"  EPO legal events error for {docdb}: {str(exc)[:80]}")
+        return []
+
+    out: list[dict] = []
+    # <ops:legal> or <legal> blocks — format varies by EPO response
+    for block in re.findall(r"<ops:legal\b[^>]*>(.*?)</ops:legal>", xml, re.DOTALL):
+        code  = _first(re.findall(r'<ops:L502EP>\s*([^<]+?)\s*</ops:L502EP>', block)).strip()
+        if not code:
+            code = _first(re.findall(r'code="([^"]+)"', block)).strip()
+        date  = _first(re.findall(r'<ops:L007EP>\s*([^<]+?)\s*</ops:L007EP>', block)).strip()
+        if not date:
+            date = _first(re.findall(r'<date>\s*([^<]+?)\s*</date>', block)).strip()
+        desc  = _first(re.findall(r'<ops:L521EP>\s*([^<]+?)\s*</ops:L521EP>', block)).strip()
+        if not desc:
+            desc = _first(re.findall(r'<ops:L500EP>\s*([^<]+?)\s*</ops:L500EP>', block)).strip()
+        category = _first(re.findall(r'<ops:L511EP>\s*([^<]+?)\s*</ops:L511EP>', block)).strip()
+        inpadoc_desc = _first(re.findall(r'<ops:L503EP>\s*([^<]+?)\s*</ops:L503EP>', block)).strip()
+        if not (code or desc):
+            continue
+        out.append({
+            "date":         _fmt_epo_date(date),
+            "code":         code,
+            "title":        desc or inpadoc_desc or code,
+            "category":     category,
+            "inpadoc_desc": inpadoc_desc,
+            "value":        "",
+        })
+    return sorted(out, key=lambda e: e.get("date") or "")
 
 
 def fetch_epo_family(docdb: str, token: str) -> Optional[str]:
@@ -1611,6 +1999,88 @@ def fetch_epo_abstract(docdb: str, token: str) -> Optional[str]:
     except Exception as exc:
         print(f"  EPO abstract error: {exc}")
         return None
+
+
+def parse_epo_references_cited(biblio_xml: str) -> list[dict]:
+    """
+    Extract cited prior-art references from an EPO OPS biblio XML response.
+    Each reference dict has:
+        { "type": "patent"|"nonpatent",
+          "country": "US",  "number": "10123456", "kind": "B2",
+          "display": "US 10,123,456 B2",
+          "category": "X"|"Y"|"A"|... (relevance),
+          "cited_phase": "search-report"|"application"|"examination"|...,
+          "cited_by": "examiner"|"applicant"|"",
+          "date": "YYYY-MM-DD",
+          "text": "raw text for NPL" }
+    """
+    if not biblio_xml:
+        return []
+    out: list[dict] = []
+    # Find the references-cited block first so we don't scan the whole doc.
+    m_block = re.search(
+        r"<references-cited[^>]*>(.*?)</references-cited>", biblio_xml, re.DOTALL
+    )
+    block = m_block.group(1) if m_block else biblio_xml
+
+    for citation_xml in re.findall(r"<citation\b[^>]*>(.*?)</citation>", block, re.DOTALL):
+        cat   = _first(re.findall(r"<category>\s*([^<]+?)\s*</category>", citation_xml)).strip()
+        phase = ""
+        m_ph  = re.search(r'cited-phase="([^"]+)"', citation_xml)
+        if m_ph:
+            phase = m_ph.group(1)
+        cited_by = ""
+        m_by   = re.search(r'cited-by="([^"]+)"', citation_xml)
+        if m_by:
+            cited_by = m_by.group(1)
+
+        # Patent citation — prefer docdb form for the clean components
+        pat_m = re.search(r"<patcit[^>]*>(.*?)</patcit>", citation_xml, re.DOTALL)
+        if pat_m:
+            pat_xml = pat_m.group(1)
+            docdb = re.search(
+                r'<document-id[^>]*document-id-type="docdb"[^>]*>(.*?)</document-id>',
+                pat_xml, re.DOTALL,
+            )
+            cc = num = kind = date = ""
+            if docdb:
+                inside = docdb.group(1)
+                cc   = _first(re.findall(r"<country>\s*([^<]+?)\s*</country>", inside)).strip()
+                num  = _first(re.findall(r"<doc-number>\s*([^<]+?)\s*</doc-number>", inside)).strip()
+                kind = _first(re.findall(r"<kind>\s*([^<]+?)\s*</kind>", inside)).strip()
+                date = _fmt_epo_date(_first(re.findall(r"<date>\s*([^<]+?)\s*</date>", inside)).strip())
+            else:
+                # Fallback: take the first document-id of any type
+                any_id = re.search(r"<document-id[^>]*>(.*?)</document-id>", pat_xml, re.DOTALL)
+                if any_id:
+                    inside = any_id.group(1)
+                    cc   = _first(re.findall(r"<country>\s*([^<]+?)\s*</country>", inside)).strip()
+                    num  = _first(re.findall(r"<doc-number>\s*([^<]+?)\s*</doc-number>", inside)).strip()
+                    kind = _first(re.findall(r"<kind>\s*([^<]+?)\s*</kind>", inside)).strip()
+                    date = _fmt_epo_date(_first(re.findall(r"<date>\s*([^<]+?)\s*</date>", inside)).strip())
+            # Pretty-print US patents with commas
+            display = f"{cc} {num}{(' ' + kind) if kind else ''}".strip()
+            if cc == "US" and num.isdigit():
+                rev = num[::-1]
+                grouped = ",".join(rev[i:i+3] for i in range(0, len(rev), 3))[::-1]
+                display = f"US {grouped}{(' ' + kind) if kind else ''}".strip()
+            out.append({
+                "type": "patent", "country": cc, "number": num, "kind": kind,
+                "display": display, "category": cat, "cited_phase": phase,
+                "cited_by": cited_by, "date": date, "text": "",
+            })
+            continue
+
+        npl_m = re.search(r"<nplcit[^>]*>(.*?)</nplcit>", citation_xml, re.DOTALL)
+        if npl_m:
+            txt_m = re.search(r"<text>\s*(.*?)\s*</text>", npl_m.group(1), re.DOTALL)
+            text = (txt_m.group(1) if txt_m else "").strip()
+            out.append({
+                "type": "nonpatent", "country": "", "number": "", "kind": "",
+                "display": text[:140], "category": cat, "cited_phase": phase,
+                "cited_by": cited_by, "date": "", "text": text,
+            })
+    return out
 
 
 def parse_epo_biblio(biblio_xml: str, abstract_xml: Optional[str] = None) -> dict:
@@ -2322,30 +2792,115 @@ def _pending_app_deadline(m: dict) -> tuple[str, str]:
     events = m.get("events", [])
     if not events:
         return "", ""
-    last_ev   = events[-1]
-    ev_title  = (last_ev.get("title") or last_ev.get("value") or "").upper()
-    date_str  = last_ev.get("date", "")
 
-    _OA_DEADLINES: dict[str, tuple[str, int]] = {
-        "NON FINAL ACTION MAILED":        ("Response to Non-Final Office Action", 3),
-        "NON-FINAL ACTION MAILED":        ("Response to Non-Final Office Action", 3),
-        "FINAL ACTION MAILED":            ("Response to Final Office Action", 2),
-        "FINAL REJECTION MAILED":         ("Response to Final Rejection", 2),
-        "RESTRICTION REQUIREMENT MAILED": ("Response to Restriction Requirement", 2),
-        "NOTICE OF ALLOWANCE MAILED":     ("Issue fee payment", 3),
-        "NOTICE OF ALLOWANCE":            ("Issue fee payment", 3),
+    # (label, short_months, max_months) — short = without extension, max = with extension
+    # Keys are searched case-insensitively against event title and value fields.
+    _OA_DEADLINES: dict[str, tuple[str, int, int]] = {
+        # Non-final office actions
+        "NON FINAL ACTION MAILED":           ("Response to Non-Final Office Action", 3, 6),
+        "NON-FINAL ACTION MAILED":           ("Response to Non-Final Office Action", 3, 6),
+        "NON-FINAL REJECTION":               ("Response to Non-Final Office Action", 3, 6),
+        "MISCELLANEOUS ACTION - NON-FINAL":  ("Response to Miscellaneous Non-Final Action", 3, 6),
+        "EX PARTE QUAYLE ACTION":            ("Response to Ex Parte Quayle Action", 2, 5),
+        # Final rejections
+        "FINAL ACTION MAILED":               ("Response to Final Office Action", 3, 6),
+        "FINAL REJECTION MAILED":            ("Response to Final Rejection", 3, 6),
+        "MISCELLANEOUS ACTION - FINAL":      ("Response to Miscellaneous Final Action", 3, 6),
+        # Restriction / election
+        "RESTRICTION REQUIREMENT MAILED":    ("Response to Restriction Requirement", 2, 5),
+        "ELECTION / RESTRICTION":            ("Response to Restriction Requirement", 2, 5),
+        # Advisory (post-final)
+        "ADVISORY ACTION MAILED":            ("Advisory Action response / Appeal deadline", 2, 5),
+        # Notice of Allowance: fee + formal drawings due in 3 months (non-extendable)
+        "NOTICE OF ALLOWANCE MAILED":        ("Issue fee payment", 3, 3),
+        "NOTICE OF ALLOWANCE":               ("Issue fee payment", 3, 3),
+        # Missing parts / formalities
+        "NOTICE TO FILE MISSING PARTS":      ("Response to Notice to File Missing Parts", 2, 5),
+        "NOTICE TO FILE CORRECTED":          ("Response to Notice to File Corrected Papers", 2, 5),
+        # Appeal
+        "EXAMINER'S ANSWER":                 ("Reply Brief (optional) / Oral Hearing Request", 2, 2),
+        "DECISION ON APPEAL":                ("Further action (RCE, continuation, or civil action)", 2, 2),
+        # Pre-appeal decision
+        "PRE-APPEAL BRIEF":                  ("Pre-Appeal Brief decision", 0, 0),
     }
-    for key, (label, months) in _OA_DEADLINES.items():
+
+    # Events that supersede an OA deadline when filed after it
+    _RESPONSE_EVENTS = (
+        "RESPONSE AFTER",
+        "RESPONSE TO NON-FINAL",
+        "RESPONSE TO FINAL",
+        "RESPONSE AFTER FINAL",
+        "AMENDMENT AFTER NON-FINAL",
+        "AMENDMENT AFTER FINAL",
+        "AMENDMENT AFTER ALLOWANCE",
+        "AMENDMENT SUBMITTED/ENTERED",
+        "REQUEST FOR CONTINUED EXAMINATION",
+        "RCE",
+        "NOTICE OF APPEAL",
+        "PRE-APPEAL BRIEF REQUEST",
+        "APPEAL BRIEF",
+        "REPLY BRIEF",
+        "AFTER FINAL CONSIDERATION",
+        "AFCP",
+        "ELECTION AS TO SPECIES",
+        "RESPONSE TO ELECTION / RESTRICTION",
+        "RESPONSE TO RESTRICTION",
+        "RESPONSE TO NOTICE",
+        "PAYMENT OF ISSUE FEE",
+        "ISSUE FEE PAYMENT",
+    )
+
+    # Walk events newest-first and find the most recent OA-type event. If a
+    # response-type event dated later than an OA is found first, no deadline
+    # is outstanding — responding extinguished the deadline.
+    latest_oa: dict | None = None
+    latest_resp_date: str = ""
+    for ev in reversed(events):
+        t = (ev.get("title") or ev.get("value") or "").upper()
+        dt = ev.get("date", "") or ""
+        # Priority 1: response-type event invalidates any earlier OA deadline.
+        if any(rk in t for rk in _RESPONSE_EVENTS):
+            if dt > latest_resp_date:
+                latest_resp_date = dt
+            continue
+        # Priority 2: record the first OA-style event we encounter going back.
+        for key in _OA_DEADLINES:
+            if key in t:
+                if latest_oa is None or (dt > (latest_oa.get("date") or "")):
+                    latest_oa = {"title": t, "date": dt, "key": key}
+                break
+
+    # If the latest response came AFTER the latest OA, there is no open deadline
+    if latest_oa and latest_resp_date and latest_resp_date > (latest_oa.get("date") or ""):
+        latest_oa = None
+
+    if latest_oa:
+        ev_title = latest_oa["title"]
+        date_str = latest_oa["date"]
+    else:
+        return "", ""
+
+    for key, (label, short_mo, max_mo) in _OA_DEADLINES.items():
         if key in ev_title:
             if date_str:
                 try:
-                    oa_date   = _dt.fromisoformat(date_str)
-                    due_month = oa_date.month + months
-                    due_year  = oa_date.year + (due_month - 1) // 12
-                    due_month = ((due_month - 1) % 12) + 1
-                    due_date  = oa_date.replace(year=due_year, month=due_month)
-                    due_str   = due_date.strftime("%B %-d, %Y")
-                    return f"{label} due {due_str}", due_date.isoformat()
+                    oa_date = _dt.fromisoformat(date_str)
+                    def _add_mo(d, mo):
+                        m = d.month + mo
+                        y = d.year + (m - 1) // 12
+                        m = ((m - 1) % 12) + 1
+                        return d.replace(year=y, month=m)
+                    short_date = _add_mo(oa_date, short_mo)
+                    max_date   = _add_mo(oa_date, max_mo)
+                    short_str  = short_date.strftime("%B %-d, %Y")
+                    if short_mo == max_mo:
+                        return f"{label} due {short_str}", short_date.isoformat()
+                    max_str = max_date.strftime("%B %-d, %Y")
+                    return (
+                        f"{label} due {short_str} without extension"
+                        f" and {max_str} with extension",
+                        short_date.isoformat(),
+                    )
                 except (ValueError, TypeError, OverflowError):
                     pass
             return label, ""
@@ -2369,11 +2924,46 @@ def _get_next_deadline(m: dict) -> dict | None:
     code   = country_code(m["pub_num"])
     status = m.get("status", "unknown")
 
-    # Pending: office action / prosecution response deadline
+    # Pending: office action / prosecution response deadline.
+    # Priority:
+    #   1. Claude-powered analysis (m["ai_deadline"]) — smartest path, looks
+    #      at the full event + IFW history and covers OA responses, issue
+    #      fees, missing parts, formal drawings, oath, appeal briefs, etc.
+    #   2. Deterministic OA rules (_pending_app_deadline) — fast fallback
+    #      when AI is unavailable or errored.
+    #   3. If neither knows anything, leave the tile without a banner so we
+    #      don't claim "No response due" unverified.
     if status in ("pending", "unknown"):
+        ai = m.get("ai_deadline") or {}
+        if ai and not ai.get("error"):
+            _type  = (ai.get("type") or "other").lower()
+            _label = (ai.get("label") or "").strip()
+            _date  = (ai.get("date")  or "").strip()
+            _reason = (ai.get("reasoning") or "").strip()
+            if ai.get("action_required") is False or _type == "none":
+                return {
+                    "label":     _label or "No response due",
+                    "date":      "",
+                    "type":      "none",
+                    "reasoning": _reason,
+                    "source":    "ai",
+                }
+            if _label:
+                # Map AI type to the render-time banner type
+                rtype = "response" if _type in ("response", "appeal", "missing_parts") else (
+                    "fee" if _type == "fee" else "other"
+                )
+                return {
+                    "label":     _label,
+                    "date":      _date,
+                    "type":      rtype,
+                    "reasoning": _reason,
+                    "source":    "ai",
+                }
+
         label, iso = _pending_app_deadline(m)
         if label:
-            return {"label": label, "date": iso, "type": "response"}
+            return {"label": label, "date": iso, "type": "response", "source": "rules"}
         return None
 
     # Granted US: next unpaid maintenance fee
@@ -2423,6 +3013,19 @@ def _render_card(m: dict) -> str:
     app_num = m.get("app_num", "").strip()
     # Granted patents → show patent publication number; pending/other → show application number
     display = m["pub_num"] if status == "granted" else (app_num if app_num else m["pub_num"])
+    # Pretty-print US granted patents as 'US 12,178,560 B2'
+    if code == "US" and status == "granted":
+        _p = _format_us_patent_num(display)
+        if _p:
+            display = _p
+    # Pretty-print US application numbers as 'XX/XXX,XXX' even when EPO gave us
+    # the 14-char 'US202017134990' form, a 12-digit 'US2020/17134990' form, or
+    # the bare 8-digit serial. Only applies when we're actually displaying an
+    # app number (i.e. non-granted tiles) for a US member.
+    if code == "US" and status != "granted" and display:
+        _pretty = _format_us_app_num(display)
+        if _pretty and _pretty != display:
+            display = _pretty
     # Normalize PCT application number format: "PCT/US2020/066580" not "PC:T/..." variants
     if code == "WO" and display and not display.upper().startswith("WO"):
         display = re.sub(r'\bPC\s*[:\s]*T\s*[:/\s]+', 'PCT/', display, flags=re.IGNORECASE)
@@ -2449,6 +3052,12 @@ def _render_card(m: dict) -> str:
         second_label = "Granted" if status == "granted" else "Published"
         date_items += f'<span>{second_label}: <b>{grant}</b></span>'
 
+    # Expiration date (estimated) — shown inline next to Granted for issued patents
+    if status == "granted" and (filing and filing != "—"):
+        _exp_iso = calc_expiration_date(filing, code)
+        if _exp_iso:
+            date_items += f'<span>Expires: <b>{_exp_iso}</b></span>'
+
     # Next deadline banner — visible for all tile types (OA response, maintenance, annuity)
     next_deadline_html = ""
     next_dl = _get_next_deadline(m)
@@ -2458,7 +3067,9 @@ def _render_card(m: dict) -> str:
         dl_type  = next_dl["type"]
         # Urgency-aware color
         bg, fg, bdr = "#eff6ff", "#1e40af", "#bfdbfe"   # default: blue
-        if dl_date:
+        if dl_type == "none":
+            bg, fg, bdr = "#f3f4f6", "#4b5563", "#d1d5db"   # neutral gray
+        elif dl_date:
             try:
                 from datetime import date as _dt2
                 days_left = (_dt2.fromisoformat(dl_date) - _dt2.today()).days
@@ -2470,17 +3081,29 @@ def _render_card(m: dict) -> str:
                     bg, fg, bdr = "#fff7ed", "#c2410c", "#fed7aa"   # soon: orange
             except Exception:
                 pass
-        icon = "&#128203;" if dl_type == "response" else "&#128197;"
+        icon = ("&#9989;" if dl_type == "none"
+                else ("&#128203;" if dl_type == "response"
+                      else ("&#128182;" if dl_type == "fee" else "&#128197;")))
+        _hdr = "Status" if dl_type == "none" else "Next deadline"
+        _reason = (next_dl.get("reasoning") or "").replace('"', "'")
+        _src    = next_dl.get("source", "")
+        _badge  = (
+            f'<span class="ai-badge" title="{_reason}">AI</span>'
+            if _src == "ai" else ""
+        )
         next_deadline_html = (
             f'<div class="next-deadline" style="'
-            f'background:{bg};color:{fg};border:1px solid {bdr}">'
-            f'{icon} <strong>Next deadline:</strong> {dl_label}'
+            f'background:{bg};color:{fg};border:1px solid {bdr}" '
+            f'title="{_reason}">'
+            f'{icon} <strong>{_hdr}:</strong> {dl_label} {_badge}'
             f'</div>'
         )
 
-    # Maintenance fees (granted patents only)
+    # Maintenance fees — US granted patents only. Foreign jurisdictions use
+    # annual renewal fees (rendered below as the annuity block), not USPTO
+    # maintenance fees, so we never render this section for non-US tiles.
     maint_html = ""
-    if status == "granted" and grant:
+    if status == "granted" and grant and code == "US":
         fees = calc_maintenance_fees(grant)
         if fees:
             _status_styles = {
@@ -2549,7 +3172,7 @@ def _render_card(m: dict) -> str:
                 )
             annuity_html = (
                 f'<div class="ann-expiry">Expires (est.): <b>{ann["expiry"]}</b></div>'
-                f'<details class="history">'
+                f'<details class="history" data-fee-type="annuity">'
                 f'<summary>Annual renewal fees '
                 f'<span class="ev-count">{cur} &nbsp;·&nbsp; ~${ann["total_usd"]:,} remaining</span>'
                 f'</summary>'
@@ -2673,41 +3296,82 @@ def _render_card(m: dict) -> str:
     # Per-tile Files button — sends postMessage to the parent Portfolio.jsx so it can
     # open the DocumentsPanel scoped to this specific tile (pub_num).
     _pub_esc = pub_num_key.replace("'", "\\'")
-    _app_esc = app_num.replace("'", "\\'")
     tile_files_html = (
         f'<button class="tile-files-btn" '
         f"onclick=\"window.parent.postMessage({{type:'open-tile-files',pubNum:'{_pub_esc}'}},'*')\">"
         f'&#128206; Files</button>'
     )
 
-    # Per-tile Edit button — sends postMessage to parent to open edit modal
-    _edit_data = _json.dumps({
-        "pub_num": m["pub_num"], "app_num": app_num,
-        "title": title, "status": status, "country": code,
-        "filing_date": filing, "grant_date": grant,
-        "is_manual": bool(m.get("is_manual")),
-    }).replace("'", "\\'").replace('"', "&quot;")
-    tile_edit_html = (
-        f'<button class="tile-edit-btn" '
-        f"onclick=\"window.parent.postMessage({{type:'edit-tile',"
-        f"tileData:JSON.parse(this.dataset.tile)}},'*')\" "
-        f'data-tile="{_edit_data}">'
-        f'&#9998; Edit</button>'
+    # "Full IFW on ODP" link — shown on every US tile (pending or granted) so
+    # the user can jump to the file wrapper regardless of whether ODP returned
+    # document metadata. Uses the cleaned 8-digit serial.
+    tile_ifw_html = ""
+    if code == "US":
+        _ifw_app = re.sub(r"[^\d]", "", app_num) if app_num else ""
+        if _ifw_app:
+            _ifw_url = (
+                f"https://data.uspto.gov/patent-file-wrapper/details/{_ifw_app}/documents"
+            )
+            tile_ifw_html = (
+                f'<a class="tile-ifw-btn" href="{_ifw_url}" target="_blank" rel="noopener">'
+                f'Full IFW on ODP &#8599;</a>'
+            )
+
+    # Data-not-available notice — for apps that ODP couldn't locate (typically
+    # brand-new continuations that haven't been indexed yet). Shown in place of
+    # the empty prosecution / fees block so the tile reads cleanly.
+    data_unavail_html = ""
+    if m.get("data_not_available"):
+        data_unavail_html = (
+            '<div class="data-unavail">'
+            '&#9888; <strong>Data not yet available</strong> — this application '
+            'has not been indexed by USPTO ODP (common for very recent filings). '
+            'The file wrapper link below will open in ODP once available.'
+            '</div>'
+        )
+
+    # Analyze OA button — only for pending applications with an outstanding office
+    # action awaiting response. Granted patents and pending apps with no open OA
+    # (e.g. most recent event is a response we've already filed, or just a notice
+    # of allowance / issue-fee stage) do not get this button.
+    _has_outstanding_oa = False
+    if m.get("status") == "pending":
+        _dl_label, _ = _pending_app_deadline(m)
+        if _dl_label and _dl_label.lower().startswith("response to"):
+            _has_outstanding_oa = True
+    tile_ai_html = ""
+    if _has_outstanding_oa:
+        tile_ai_html = (
+            f'<button class="tile-ai-btn" '
+            f"onclick=\"window.parent.postMessage({{type:'open-tile-ai',pubNum:'{_pub_esc}'}},'*')\">"
+            f'Analyze OA</button>'
+        )
+
+    # PDF download button — resolves via backend proxy. For granted patents the
+    # backend streams the granted-patent PDF; for pending apps it streams the
+    # published application PDF. Backend uses pub_num's kind code to choose.
+    _clean_pnum = re.sub(r"[^A-Z0-9]", "", pub_num_key.upper())
+    _proxy_base = os.environ.get("PATENT_DOC_PROXY_BASE", "")
+    _pdf_api = f"{_proxy_base}/api/pdf/{_clean_pnum}" if _proxy_base else f"/api/pdf/{_clean_pnum}"
+    _pdf_label = "Patent PDF" if m.get("status") == "granted" else "Publication PDF"
+    # Rendered as a download link (not a window.open call) so Chrome saves the
+    # PDF to the user's Downloads folder instead of opening a viewer tab.
+    tile_pdf_html = (
+        f'<a class="tile-pdf-btn" href="{_pdf_api}" download="{_clean_pnum}.pdf">'
+        f'{_pdf_label}</a>'
     )
 
-    # Manual / edited indicator
-    is_manual = m.get("is_manual", False)
-    is_edited = m.get("has_overrides", False)
-    edit_badge = ""
-    if is_manual:
-        edit_badge = '<span class="tile-manual-badge">&#9998; Manual</span>'
-    elif is_edited:
-        edit_badge = '<span class="tile-edited-badge">&#9998; Edited</span>'
+    # Action bar — AI button only when relevant, PDF always shown
+    action_bar_html = (
+        f'<div class="tile-action-bar">'
+        f'{tile_ai_html}{tile_pdf_html}'
+        f'</div>'
+    ) if (tile_ai_html or tile_pdf_html) else ""
 
     return (
         f'<div class="card" style="border-top:4px solid {border}">'
         f'  <div class="card-head">'
-        f'    <span class="card-pnum">{pnum}{edit_badge}</span>'
+        f'    <span class="card-pnum">{pnum}</span>'
         f'    <div style="display:flex;align-items:center;gap:5px;flex-shrink:0">'
         f'      <span class="card-country-chip">{flag} {cname}</span>'
         f'      {_status_badge(status)}'
@@ -2717,14 +3381,15 @@ def _render_card(m: dict) -> str:
         + translated_html
         + f'  <div class="card-dates">{date_items}</div>'
         + next_deadline_html
+        + action_bar_html
         # When ODP documents are present they already show the full prosecution record —
         # suppress the EPO/GP-derived rejection summary and history to avoid duplication.
-        + maint_html + annuity_html + latest_html + rej_html
+        + data_unavail_html + latest_html + maint_html + annuity_html + rej_html
         + (rej_summary_html if not m.get("oa_documents") else "")
         + oa_docs_html + err_html
         + (history_html if not m.get("oa_documents") else "")
         + notes_html
-        + f'<div class="tile-actions">{tile_files_html}{tile_edit_html}</div>'
+        + f'<div class="tile-btn-row">{tile_files_html}{tile_ifw_html}</div>'
         + '</div>'
     )
 
@@ -2785,26 +3450,132 @@ def generate_dashboard_html(
     other   = len(family_details) - granted - pending
 
     # Status-grouped sections: Issued → Pending (oldest filing first) → Abandoned
+    from datetime import date as _today_dt
+    _today = _today_dt.today()
+
+    def _months_since(iso_date: str) -> int:
+        try:
+            d = _today_dt.fromisoformat((iso_date or "")[:10])
+            return (_today.year - d.year) * 12 + (_today.month - d.month)
+        except Exception:
+            return -1
+
+    def _is_us_provisional(m: dict) -> bool:
+        """Provisional US apps have 60/61/62/63 prefix serial numbers."""
+        app = _clean_app_num(m.get("app_num", "") or "")
+        return bool(re.match(r"^(60|61|62|63)", app))
+
+    def _is_expired_granted(m: dict) -> bool:
+        """Granted patent whose estimated expiration is in the past."""
+        if m.get("status") != "granted":
+            return False
+        _fd = m.get("filing_date") or m.get("date") or ""
+        _exp = calc_expiration_date(_fd, country_code(m["pub_num"]))
+        return bool(_exp) and _exp < _today.isoformat()
+
+    def _is_stale_provisional(m: dict) -> bool:
+        """US provisional whose 12-month anniversary has passed — converts to lapsed."""
+        return (
+            country_code(m["pub_num"]) == "US"
+            and _is_us_provisional(m)
+            and _months_since(m.get("filing_date") or m.get("date") or "") >= 12
+        )
+
+    def _is_nat_phase_pct(m: dict) -> bool:
+        """PCT application past the 30-month national-stage deadline."""
+        return (
+            country_code(m["pub_num"]) == "WO"
+            and m.get("status") in ("pending", "unknown")
+            and _months_since(m.get("filing_date") or m.get("date") or "") >= 30
+        )
+
+    def _lapsed(m: dict) -> bool:
+        return (
+            m.get("status") in ("abandoned", "expired", "rejected", "lapsed")
+            or _is_expired_granted(m)
+            or _is_stale_provisional(m)
+            or _is_nat_phase_pct(m)
+        )
+
     granted_members   = sorted(
-        [m for m in family_details if m.get("status") == "granted"],
+        [m for m in family_details if m.get("status") == "granted" and not _is_expired_granted(m)],
         key=lambda m: m.get("grant_date") or m.get("filing_date") or m.get("date") or "",
     )
     pending_members   = sorted(
-        [m for m in family_details if m.get("status") in ("pending", "unknown")],
+        [m for m in family_details
+         if m.get("status") in ("pending", "unknown")
+         and not _is_stale_provisional(m)
+         and not _is_nat_phase_pct(m)],
         key=lambda m: (
             0 if country_code(m["pub_num"]) == "US" else 1,   # US apps first
             m.get("filing_date") or m.get("date") or "",       # then oldest filing
         ),
     )
     abandoned_members = sorted(
-        [m for m in family_details if m.get("status") in ("abandoned", "expired", "rejected")],
+        [m for m in family_details if _lapsed(m)],
         key=lambda m: m.get("filing_date") or m.get("date") or "",
     )
-    country_html = ""
+    # ── Printable overview (family list + upcoming deadlines) ────────────
+    # These blocks live in the dashboard HTML but are hidden on screen via
+    # CSS (.print-only). PrintBar in the React app toggles individual blocks
+    # on/off at print time based on the user's checkbox selections.
+    _all_for_print = granted_members + pending_members + abandoned_members
+    _family_rows = ""
+    for _m in _all_for_print:
+        _cc = country_code(_m["pub_num"])
+        _flag = COUNTRY_FLAGS.get(_cc, "")
+        _st = _m.get("status", "unknown")
+        _pub = _m["pub_num"]
+        if _cc == "US" and _st == "granted":
+            _pub = _format_us_patent_num(_pub) or _pub
+        _fd = _m.get("filing_date") or _m.get("date") or ""
+        _gd = _m.get("grant_date", "") or ""
+        _family_rows += (
+            f'<tr><td>{_flag} {_cc}</td>'
+            f'<td>{_pub}</td>'
+            f'<td>{_m.get("app_num","") or ""}</td>'
+            f'<td>{_st}</td>'
+            f'<td>{_fd}</td>'
+            f'<td>{_gd}</td></tr>'
+        )
+    _deadline_rows = ""
+    for _m in _all_for_print:
+        _dl = _get_next_deadline(_m)
+        if not _dl:
+            continue
+        _deadline_rows += (
+            f'<tr><td>{country_code(_m["pub_num"])}</td>'
+            f'<td>{_m["pub_num"]}</td>'
+            f'<td>{_dl.get("label","")}</td>'
+            f'<td>{_dl.get("date","")}</td></tr>'
+        )
+    print_overview_html = (
+        f'<div class="print-only print-overview" id="print-overview">'
+        f'<div id="print-family-list">'
+        f'<h3>Patent Family &mdash; {len(_all_for_print)} members</h3>'
+        f'<table><thead><tr>'
+        f'<th>Country</th><th>Publication</th><th>Application</th>'
+        f'<th>Status</th><th>Filed</th><th>Granted</th>'
+        f'</tr></thead><tbody>{_family_rows}</tbody></table>'
+        f'</div>'
+        f'<div id="print-deadlines-list" style="margin-top:1rem">'
+        f'<h3>Upcoming Deadlines</h3>'
+        + (
+            f'<table><thead><tr>'
+            f'<th>Country</th><th>Publication</th><th>Deadline</th><th>Due</th>'
+            f'</tr></thead><tbody>{_deadline_rows}</tbody></table>'
+            if _deadline_rows else
+            '<p style="color:#666">No upcoming deadlines found in family data.</p>'
+        )
+        + '</div>'
+        '</div>'
+    )
+
+    country_html = print_overview_html
     for group_label, members, icon in [
         ("Issued Patents",       granted_members,   "✅"),
         ("Pending Applications", pending_members,   "🔄"),
-        ("Abandoned / Lapsed",   abandoned_members, "❌"),
+        ("Abandoned & Lapsed",   abandoned_members, "❌"),
     ]:
         if not members:
             continue
@@ -2865,6 +3636,51 @@ def generate_dashboard_html(
     ) if relations else ""
 
     assignee_str = "; ".join(assignees) if assignees else "N/A"
+
+    # ── Application number + priority chain for the hero block ─────────────
+    # Primary member = the one whose pub_num matches the number we searched.
+    # That member's ODP response carries parent continuity data — we use it to
+    # build a compact priority-chain list (earliest parent → direct parent).
+    _norm_num = normalize(number)
+    _primary_member = next(
+        (m for m in family_details if normalize(m.get("pub_num", "")) == _norm_num),
+        None
+    )
+    if _primary_member is None:
+        _primary_member = next(
+            (m for m in family_details if country_code(m.get("pub_num", "")) == "US"),
+            None
+        )
+    _primary_app_display = ""
+    _priority_chain_html = ""
+    if _primary_member:
+        _pa = _primary_member.get("app_num", "")
+        if _pa:
+            _primary_app_display = _format_us_app_num(_pa) if country_code(_primary_member["pub_num"]) == "US" else _pa
+        _parents = [
+            r for r in (_primary_member.get("related_us_apps") or [])
+            if r.get("side") == "parent" and r.get("app_num")
+        ]
+        # Sort oldest → newest by filing, so the chain reads earliest-priority-first
+        _parents = sorted(_parents, key=lambda r: r.get("filing", "") or "")
+        if _parents:
+            _chain_items = []
+            for _p in _parents:
+                _app_fmt = _format_us_app_num(_p["app_num"])
+                _rel     = (_p.get("relation") or "").replace("_", " ").title()
+                _fdate   = _p.get("filing", "")
+                _txt     = _app_fmt
+                if _fdate:
+                    _txt += f' <span style="color:#64748b">({_fdate})</span>'
+                if _rel:
+                    _txt = f'<span style="color:#64748b">{_rel}:</span> ' + _txt
+                _chain_items.append(f'<li>{_txt}</li>')
+            _priority_chain_html = (
+                '<div class="priority-chain">'
+                '<div class="priority-label">Priority chain</div>'
+                '<ol>' + "".join(_chain_items) + '</ol>'
+                '</div>'
+            )
 
     # Alternative patent viewer URLs for the hero section (GP removed — often blocked).
     _hero_norm = number.replace(" ", "").replace(",", "")
@@ -2976,6 +3792,19 @@ def generate_dashboard_html(
       font-size: .78rem; color: #16a34a; font-style: italic;
       margin: .15rem .75rem .35rem; line-height: 1.4;
     }}
+    .priority-chain {{
+      margin-top: .9rem; padding: .65rem .9rem; background: rgba(255,255,255,.08);
+      border: 1px solid rgba(255,255,255,.18); border-radius: 8px;
+      color: #e2e8f0; font-size: .82rem;
+    }}
+    .priority-chain .priority-label {{
+      font-weight: 700; text-transform: uppercase; letter-spacing: .06em;
+      font-size: .68rem; color: #94a3b8; margin-bottom: .3rem;
+    }}
+    .priority-chain ol {{
+      margin: 0; padding-left: 1.2rem; line-height: 1.6;
+    }}
+    .priority-chain li {{ margin: 0; }}
     .hero-translated {{
       font-size: .95rem; color: #86efac; font-style: italic;
       margin-top: .35rem; margin-bottom: .1rem;
@@ -3015,35 +3844,49 @@ def generate_dashboard_html(
            text-decoration:none; border:1px solid; line-height:1.6; }}
     .vl-esn {{ background:#e8f5e9; color:#2e7d32; border-color:#c8e6c9; }}
     .vl-usp {{ background:#fff3e0; color:#e65100; border-color:#ffe0b2; }}
+    .tile-action-bar {{
+      display:flex; gap:6px; flex-wrap:wrap; margin-top:.2rem; margin-bottom:.4rem;
+      padding:6px 0;
+    }}
+    .tile-btn-row {{
+      display:flex; gap:6px; flex-wrap:wrap; margin-top:.6rem;
+    }}
     .tile-files-btn {{
-      margin-top:.6rem; padding:5px 12px; border-radius:6px; cursor:pointer;
+      padding:5px 12px; border-radius:6px; cursor:pointer;
       background:#f0f4f8; border:1px solid #d0d7de; font-size:.75rem;
       color:#1a1a2e; font-weight:600; display:inline-flex; align-items:center; gap:4px;
     }}
     .tile-files-btn:hover {{ background:#e2e8f0; }}
-    .tile-actions {{ display:flex; gap:6px; flex-wrap:wrap; margin-top:.6rem; }}
-    .tile-edit-btn {{
+    .tile-ifw-btn {{
+      padding:5px 10px; border-radius:6px; background:#fff7ed;
+      border:1px solid #fed7aa; color:#c2410c; font-size:.72rem;
+      font-weight:600; text-decoration:none; display:inline-flex;
+      align-items:center; line-height:1.2;
+    }}
+    .tile-ifw-btn:hover {{ background:#ffedd5; }}
+    .ai-badge {{
+      display:inline-block; margin-left:6px; padding:1px 6px;
+      background:#8b5cf6; color:#fff; border-radius:10px;
+      font-size:.62rem; font-weight:700; letter-spacing:.04em;
+      vertical-align:middle; cursor:help;
+    }}
+    .data-unavail {{
+      margin: .55rem 0 .35rem; padding: .6rem .8rem;
+      background: #fffbeb; border: 1px solid #fde68a; border-radius: 6px;
+      font-size: .78rem; color: #78350f; line-height: 1.45;
+    }}
+    .tile-ai-btn {{
       padding:5px 12px; border-radius:6px; cursor:pointer;
-      background:#fff7ed; border:1px solid #fed7aa; font-size:.75rem;
-      color:#c2410c; font-weight:600; display:inline-flex; align-items:center; gap:4px;
+      background:#ede7f6; border:1px solid #ce93d8; font-size:.75rem;
+      color:#6a1b9a; font-weight:600; display:inline-flex; align-items:center; gap:4px;
     }}
-    .tile-edit-btn:hover {{ background:#ffedd5; }}
-    .tile-manual-badge {{
-      display:inline-block; background:#dbeafe; color:#1e40af; border-radius:4px;
-      padding:1px 6px; font-size:.6rem; font-weight:700; margin-left:6px;
-      vertical-align:middle;
+    .tile-ai-btn:hover {{ background:#e1d5f0; }}
+    .tile-pdf-btn {{
+      padding:5px 12px; border-radius:6px; cursor:pointer;
+      background:#fff3e0; border:1px solid #ffb74d; font-size:.75rem;
+      color:#e65100; font-weight:600; display:inline-flex; align-items:center; gap:4px;
     }}
-    .tile-edited-badge {{
-      display:inline-block; background:#fef3c7; color:#92400e; border-radius:4px;
-      padding:1px 6px; font-size:.6rem; font-weight:700; margin-left:6px;
-      vertical-align:middle;
-    }}
-    .add-tile-btn {{
-      padding:8px 18px; border-radius:8px; cursor:pointer;
-      background:#1e40af; border:none; font-size:.82rem;
-      color:#fff; font-weight:600; display:inline-flex; align-items:center; gap:5px;
-    }}
-    .add-tile-btn:hover {{ background:#1e3a8a; }}
+    .tile-pdf-btn:hover {{ background:#ffe0b2; }}
     .status-badge {{
       font-size: .7rem; font-weight: 700; border-radius: 20px;
       padding: .2rem .65rem; white-space: nowrap; flex-shrink: 0;
@@ -3303,14 +4146,23 @@ def generate_dashboard_html(
       footer {{ margin-top: 1.5rem; }}
     }}
 
+    /* Print-only overview blocks — hidden on screen, shown only when printing */
+    .print-only {{ display: none; }}
     @media print {{
       .no-print {{ display: none !important; }}
       .print-hide {{ display: none !important; }}
+      .print-only {{ display: block !important; }}
       body {{ background: #fff; padding: .5rem; }}
       .card {{ break-inside: avoid; }}
       .history {{ display: block; }}
       details {{ display: block; }}
       details > summary {{ display: none; }}
+      .print-overview {{ margin-bottom: 1rem; page-break-after: auto; }}
+      .print-overview table {{ width: 100%; border-collapse: collapse; font-size: 11px; }}
+      .print-overview th, .print-overview td {{
+        border: 1px solid #ccc; padding: 4px 8px; text-align: left;
+      }}
+      .print-overview h3 {{ margin: .5rem 0 .3rem; font-size: 13px; }}
     }}
 
     .claim-block {{ margin-bottom: .9rem; padding-bottom: .9rem; border-bottom: 1px solid #f3f4f6; }}
@@ -3424,12 +4276,14 @@ def generate_dashboard_html(
     {f'<div class="hero-translated">&#127760; {translated_title}</div>' if translated_title and translated_title.lower() != (title or "").lower() else ""}
     <div class="hero-sub">
       <span class="hero-chip">&#128196; {number}</span>
+      {f'<span class="hero-chip">&#128203; App No. {_primary_app_display}</span>' if _primary_app_display else ''}
       <span class="hero-chip">&#128197; Filed {filing_date}</span>
       <span class="hero-chip">&#9989; Granted {grant_date}</span>
       {'<span class="hero-chip">&#127970; ' + assignee_str + '</span>' if assignees else ''}
       <span class="hero-chip"><a href="{_hero_esp}" target="_blank" style="color:#93c5fd">Espacenet &#8599;</a></span>
       {f'<span class="hero-chip"><a href="{_hero_odp}" target="_blank" style="color:#93c5fd">USPTO ODP &#8599;</a></span>' if _hero_odp else ''}
     </div>
+    {_priority_chain_html}
   </div>
 
   <div class="stats-bar">
@@ -3457,12 +4311,6 @@ def generate_dashboard_html(
       <div class="stat-label">Prior Art Citations</div>
       <div class="stat-value">{len(relations)}</div>
     </div>
-  </div>
-
-  <div style="margin-bottom:1.25rem;text-align:right">
-    <button class="add-tile-btn" onclick="window.parent.postMessage({{type:'add-tile'}},'*')">
-      &#10133; Add Family Member
-    </button>
   </div>
 
   {abstract_section_html}
