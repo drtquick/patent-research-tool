@@ -3375,8 +3375,7 @@ def _render_card(m: dict) -> str:
     # backend streams the granted-patent PDF; for pending apps it streams the
     # published application PDF. Backend uses pub_num's kind code to choose.
     _clean_pnum = re.sub(r"[^A-Z0-9]", "", pub_num_key.upper())
-    _proxy_base = os.environ.get("PATENT_DOC_PROXY_BASE", "")
-    _pdf_api = f"{_proxy_base}/api/pdf/{_clean_pnum}" if _proxy_base else f"/api/pdf/{_clean_pnum}"
+    _pdf_api = f"{_PATENT_DOC_PROXY}/api/pdf/{_clean_pnum}"
     _pdf_label = "Patent PDF" if m.get("status") == "granted" else "Publication PDF"
     # Rendered as a download link (not a window.open call) so Chrome saves the
     # PDF to the user's Downloads folder instead of opening a viewer tab.
