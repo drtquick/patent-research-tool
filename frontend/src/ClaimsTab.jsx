@@ -31,10 +31,12 @@ export default function ClaimsTab({ portfolioId }) {
   if (error)   return <div style={s.error}>{error}</div>;
   if (!data)   return null;
 
-  const members = (data.members || []).filter((m) => m.claims && m.claims.length > 0);
+  const allMembers = data.members || [];
+  const members = allMembers.filter((m) => m.claims && m.claims.length > 0);
+  const emptyMembers = allMembers.filter((m) => !m.claims || m.claims.length === 0);
 
-  if (members.length === 0) {
-    return <div style={s.empty}>No claims could be extracted. Make sure Anthropic credits are available and that the family includes active US members.</div>;
+  if (allMembers.length === 0) {
+    return <div style={s.empty}>No active US family members found. Claims extraction requires at least one pending or granted US member.</div>;
   }
 
   // Build a dense row set: for every member, up to the longest claim list length
@@ -105,6 +107,33 @@ export default function ClaimsTab({ portfolioId }) {
           </tbody>
         </table>
       </div>
+
+      {emptyMembers.length > 0 && (
+        <div style={s.emptySection}>
+          <div style={s.emptySectionTitle}>
+            Claims not yet extracted ({emptyMembers.length} member{emptyMembers.length === 1 ? "" : "s"})
+          </div>
+          <div style={s.emptySectionHint}>
+            These members had no claims data available. This may be due to API rate limits or because claim documents
+            have not yet been published. Reload the tab to retry.
+          </div>
+          <div style={s.emptyList}>
+            {emptyMembers.map((m) => (
+              <span key={m.pub_num || m.app_num} style={s.emptyChip}>
+                {m.display_number || m.app_num}
+                <span style={{ ...s.pill, ...statusStyle(m.status), marginLeft: 4 }}>{m.status}</span>
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {members.length === 0 && emptyMembers.length > 0 && (
+        <div style={s.retryBox}>
+          Claims extraction is running. If you just opened this tab, the first load may take 1-2 minutes
+          for families with many continuations. Reload the page to check for updated results.
+        </div>
+      )}
     </div>
   );
 }
@@ -157,4 +186,16 @@ const s = {
   claimNum:  { fontSize: 11, fontWeight: 700, color: "#1a73e8",
                textTransform: "uppercase", letterSpacing: ".06em", marginBottom: 4 },
   claimText: { fontSize: 12, color: "#1a1a2e", whiteSpace: "pre-wrap", lineHeight: 1.5 },
+
+  emptySection: { marginTop: 14, padding: "14px 16px", background: "#fff8e1",
+                  borderRadius: 10, border: "1px solid #ffe0b2" },
+  emptySectionTitle: { fontSize: 13, fontWeight: 700, color: "#e65100", marginBottom: 4 },
+  emptySectionHint: { fontSize: 12, color: "#666", marginBottom: 8 },
+  emptyList: { display: "flex", flexWrap: "wrap", gap: 8 },
+  emptyChip: { display: "inline-flex", alignItems: "center", padding: "4px 10px",
+               background: "#fff", borderRadius: 6, border: "1px solid #e0e0e0",
+               fontSize: 12, fontWeight: 600, color: "#333" },
+  retryBox: { marginTop: 14, padding: "16px 20px", background: "#e3f2fd",
+              borderRadius: 10, border: "1px solid #90caf9",
+              fontSize: 13, color: "#1565c0", textAlign: "center" },
 };

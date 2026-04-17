@@ -2024,7 +2024,7 @@ def parse_epo_references_cited(biblio_xml: str) -> list[dict]:
     block = m_block.group(1) if m_block else biblio_xml
 
     for citation_xml in re.findall(r"<citation\b[^>]*>(.*?)</citation>", block, re.DOTALL):
-        cat   = _first(re.findall(r"<category>\s*([^<]+?)\s*</category>", citation_xml)).strip()
+        cat   = (_first(re.findall(r"<category>\s*([^<]+?)\s*</category>", citation_xml)) or "").strip()
         phase = ""
         m_ph  = re.search(r'cited-phase="([^"]+)"', citation_xml)
         if m_ph:

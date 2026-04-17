@@ -1777,7 +1777,9 @@ def _get_claims_for_member(member: dict, request_uid: str | None = None) -> list
     )
     print(f"  claims {app_num or pub_num} ({doc_source}): {len(claims)} independent", flush=True)
 
-    if cache_ref is not None:
+    # Only cache non-empty results — empty claims from rate-limit errors
+    # would otherwise poison the cache and prevent future successful extraction.
+    if cache_ref is not None and claims:
         try:
             cache_ref.document(cache_id).set({
                 "app_num":    app_num,
@@ -2025,14 +2027,38 @@ def get_portfolio_claims(portfolio_id):
         data = snap.to_dict() or {}
         family = data.get("family", []) or []
 
+        # One-time cleanup: purge poisoned cache entries (claims: []) that were
+        # saved before the "don't cache empty results" fix.
+        try:
+            _cache_col = (
+                db.collection("users").document(request.uid)
+                  .collection("ai_claims_cache")
+            )
+            for _cdoc in _cache_col.stream():
+                _cd = _cdoc.to_dict() or {}
+                if not _cd.get("claims"):
+                    _cdoc.reference.delete()
+                    print(f"  claims: purged empty cache {_cdoc.id}", flush=True)
+        except Exception:
+            pass
+
+        import time as _time
+
         out_members: list[dict] = []
+        _need_delay = False  # throttle Claude calls to avoid 429 rate limits
         for m in family:
             pub = (m.get("pub_num") or "").upper()
             if not pub.startswith("US") and m.get("country") != "US":
                 continue
             if m.get("status") in ("abandoned", "expired", "rejected", "lapsed"):
                 continue
+            # Space out Claude API calls so we don't hit the per-minute token limit.
+            # _get_claims_for_member returns from cache when possible (no delay needed);
+            # we only throttle after a cache-miss triggers an actual Claude call.
+            if _need_delay:
+                _time.sleep(8)
             claims = _get_claims_for_member(m, request_uid=request.uid)
+            _need_delay = True  # next iteration will wait
             display = m.get("pub_num", "")
             if m.get("status") == "granted":
                 display = tracker._format_us_patent_num(display) or display
