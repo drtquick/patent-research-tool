@@ -3040,6 +3040,27 @@ def _render_card(m: dict) -> str:
         )
         _vl.append(f'<a href="{_odp_url}" class="vl vl-usp" target="_blank" title="USPTO Open Data Portal">ODP</a>')
     pnum = f'{display}<span class="vl-row">{"".join(_vl)}</span>'
+
+    # For pending US apps, show the publication number under the app number
+    # with a clickable PDF download link.
+    tile_pub_line = ""
+    if code == "US" and status != "granted" and m.get("pub_num", "").upper().startswith("US"):
+        _raw_pub = m["pub_num"].upper()
+        _pub_clean = re.sub(r"[^A-Z0-9]", "", _raw_pub)
+        # Format US 2026/0059078 A1 from US20260059078A1
+        _pub_m = re.match(r"^US(\d{4})(\d{7})([A-Z]\d?)$", _pub_clean)
+        if _pub_m:
+            _pub_display = f"US {_pub_m.group(1)}/{_pub_m.group(2)} {_pub_m.group(3)}"
+        else:
+            _pub_display = _raw_pub
+        _pub_pdf_url = f"{_PATENT_DOC_PROXY}/api/pdf/{_pub_clean}"
+        tile_pub_line = (
+            f'<div class="tile-pub-num">'
+            f'Pub: <a href="{_pub_pdf_url}" target="_blank" rel="noopener" '
+            f'title="Download publication PDF">{_pub_display}</a>'
+            f'</div>'
+        )
+
     title = (m.get("member_title") or m.get("title") or "").strip()
     filing = m.get("filing_date") or m.get("date") or "—"
     grant  = m.get("grant_date", "")
@@ -3051,6 +3072,42 @@ def _render_card(m: dict) -> str:
     if grant:
         second_label = "Granted" if status == "granted" else "Published"
         date_items += f'<span>{second_label}: <b>{grant}</b></span>'
+
+    # Priority chain for pending US tiles — compact abbreviations under the dates
+    tile_priority_html = ""
+    if code == "US" and status != "granted":
+        _parents = [
+            r for r in (m.get("related_us_apps") or [])
+            if r.get("side") == "parent" and r.get("app_num")
+        ]
+        _parents = sorted(_parents, key=lambda r: r.get("filing", "") or "")
+        if _parents:
+            _REL_ABBR = {
+                "continuation":              "CON",
+                "continuation_in_part":      "CIP",
+                "continuation in part":      "CIP",
+                "divisional":                "DIV",
+                "provisional":               "PRO",
+                "us_provisional_application":"PRO",
+                "us provisional application":"PRO",
+                "reissue":                   "REI",
+                "":                          "",
+            }
+            _chain_bits = []
+            for _p in _parents:
+                _rel_raw = (_p.get("relation") or "").lower().strip()
+                _abbr = _REL_ABBR.get(_rel_raw, _rel_raw[:3].upper() if _rel_raw else "")
+                _papp = _format_us_app_num(_p["app_num"])
+                _pdate = _p.get("filing", "")
+                _piece = f"{_abbr} of {_papp}" if _abbr else _papp
+                if _pdate:
+                    _piece += f' ({_pdate})'
+                _chain_bits.append(_piece)
+            tile_priority_html = (
+                '<div class="tile-priority">'
+                + " &rarr; ".join(_chain_bits)
+                + '</div>'
+            )
 
     # Expiration date (estimated) — shown inline next to Granted for issued patents
     if status == "granted" and (filing and filing != "—"):
@@ -3400,9 +3457,11 @@ def _render_card(m: dict) -> str:
         f'      {_status_badge(status)}'
         f'    </div>'
         f'  </div>'
+        + tile_pub_line
         + (f'  <div class="card-title">{title}</div>' if title else '')
         + translated_html
         + f'  <div class="card-dates">{date_items}</div>'
+        + tile_priority_html
         + next_deadline_html
         + action_bar_html
         # When ODP documents are present they already show the full prosecution record —
@@ -3862,6 +3921,16 @@ def generate_dashboard_html(
       display: flex; justify-content: space-between; align-items: flex-start;
     }}
     .card-pnum {{ font-size: 1rem; font-weight: 700; }}
+    .tile-pub-num {{
+      font-size:.78rem; color:#555; margin:-2px 0 2px 0;
+    }}
+    .tile-pub-num a {{
+      color:#1a73e8; text-decoration:none; font-weight:600;
+    }}
+    .tile-pub-num a:hover {{ text-decoration:underline; }}
+    .tile-priority {{
+      font-size:.72rem; color:#64748b; margin:2px 0 4px 0; line-height:1.4;
+    }}
     .vl-row {{ display:inline-flex; gap:3px; margin-left:6px; flex-wrap:wrap; vertical-align:middle; }}
     .vl {{ font-size:.58rem; font-weight:700; padding:1px 5px; border-radius:3px;
            text-decoration:none; border:1px solid; line-height:1.6; }}
