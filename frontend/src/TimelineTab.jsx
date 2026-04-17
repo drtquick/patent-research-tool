@@ -4,17 +4,15 @@ import { api } from "./api";
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:5001";
 
 /**
- * Family filing timeline + continuation diagram.  Each node is a US
- * application or patent placed horizontally so the CENTER of the tile
- * aligns with its filing date on the time axis.  Continuation edges
- * (CON / CIP / DIV / PRO) are drawn as curved arrows.  Node color
- * reflects status; provisional apps get a dashed border.
+ * Family filing timeline + continuation diagram.
  *
- * Publication numbers link to the publication PDF; patent numbers link
- * to the patent PDF (both via the backend proxy).
+ * Granted patents are split into two tiles: a filing tile (centered on filing
+ * date) and a grant tile (centered on issue date), connected by an "ISSUED"
+ * arrow.  Pending apps get a single filing tile.
  *
- * Print button renders the full SVG in landscape orientation, fitted
- * to the page width.
+ * Tile centers align with their respective dates on the time axis (first-to-file).
+ * Publication numbers link to pub PDFs; patent numbers link to patent PDFs.
+ * Print button opens landscape page fitted to full timeline width.
  */
 export default function TimelineTab({ portfolioId }) {
   const [loading, setLoading] = useState(true);
@@ -42,20 +40,23 @@ export default function TimelineTab({ portfolioId }) {
     if (nodes.length === 0)
       return { nodes: [], edges: [], width: 800, height: 200, tMin: 0, tMax: 0 };
 
+    // Use node_id as the unique identifier (app_num for filing, app_num+"_grant" for grants)
+    const idOf = (n) => n.node_id || n.app_num;
+
     // Compute generation depth via BFS (Kahn topological)
     const incoming = new Map();
     const outgoing = new Map();
-    nodes.forEach((n) => { incoming.set(n.app_num, 0); outgoing.set(n.app_num, []); });
+    nodes.forEach((n) => { incoming.set(idOf(n), 0); outgoing.set(idOf(n), []); });
     edges.forEach((e) => {
       if (incoming.has(e.from_app) && incoming.has(e.to_app)) {
-        incoming.set(e.to_app, incoming.get(e.to_app) + 1);
-        outgoing.get(e.from_app).push(e.to_app);
+        incoming.set(e.to_app, (incoming.get(e.to_app) || 0) + 1);
+        (outgoing.get(e.from_app) || []).push(e.to_app);
       }
     });
     const level = new Map();
     const queue = [];
     nodes.forEach((n) => {
-      if (incoming.get(n.app_num) === 0) { level.set(n.app_num, 0); queue.push(n.app_num); }
+      if ((incoming.get(idOf(n)) || 0) === 0) { level.set(idOf(n), 0); queue.push(idOf(n)); }
     });
     while (queue.length) {
       const a = queue.shift();
@@ -66,44 +67,38 @@ export default function TimelineTab({ portfolioId }) {
       });
     }
 
-    // Time domain
+    // Time domain — use timeline_date (filing_date for filings, grant_date for grants)
     const parseDate = (s) => s ? new Date(s + "T00:00:00").getTime() : null;
-    const times = nodes.map((n) => parseDate(n.filing_date)).filter(Boolean);
+    const times = nodes.map((n) => parseDate(n.timeline_date || n.filing_date)).filter(Boolean);
     const tMin = times.length ? Math.min(...times) : 0;
     const tMax = times.length ? Math.max(...times) : tMin + 365 * 86400000;
 
-    // Sizing constants
+    // Sizing
     const NODE_W = 190, NODE_H = 82;
     const PAD_L = 110, PAD_R = 110;
     const H_PER_LEVEL = NODE_H + 50;
     const PAD_TOP = 40;
-
-    // Calculate minimum width needed so tiles don't overlap at true-date positions.
-    // We iterate: start with a base width, place tiles, check overlaps, expand if needed.
-    let W = Math.max(1200, nodes.length * (NODE_W + 30) + PAD_L + PAD_R);
+    const W = Math.max(1200, nodes.length * (NODE_W + 20) + PAD_L + PAD_R);
     const domain = tMax - tMin || 1;
 
-    // Center-of-tile = date position on axis, so left edge = center - NODE_W/2
     const centerX = (n) => {
-      const t = parseDate(n.filing_date);
+      const t = parseDate(n.timeline_date || n.filing_date);
       if (!t) return PAD_L + (W - PAD_L - PAD_R) / 2;
       return PAD_L + ((t - tMin) / domain) * (W - PAD_L - PAD_R);
     };
 
-    // Place all nodes
     const sorted = [...nodes].sort((a, b) =>
-      (level.get(a.app_num) ?? 0) - (level.get(b.app_num) ?? 0) ||
-      (parseDate(a.filing_date) || 0) - (parseDate(b.filing_date) || 0)
+      (level.get(idOf(a)) ?? 0) - (level.get(idOf(b)) ?? 0) ||
+      (parseDate(a.timeline_date || a.filing_date) || 0) - (parseDate(b.timeline_date || b.filing_date) || 0)
     );
 
-    let placed = sorted.map((n) => {
+    const placed = sorted.map((n) => {
       const cx = centerX(n);
-      const lvl = level.get(n.app_num) ?? 0;
-      return { ...n, cx, x: cx - NODE_W / 2, y: PAD_TOP + lvl * H_PER_LEVEL, level: lvl };
+      const lvl = level.get(idOf(n)) ?? 0;
+      return { ...n, id: idOf(n), cx, x: cx - NODE_W / 2, y: PAD_TOP + lvl * H_PER_LEVEL, level: lvl };
     });
 
-    // Nudge overlapping nodes within same level (minimal displacement from true date).
-    // Push right only when tiles overlap, preserving left-to-right filing order.
+    // Nudge overlapping nodes within same level
     const maxLevel = Math.max(0, ...placed.map((p) => p.level));
     for (let lvl = 0; lvl <= maxLevel; lvl++) {
       const grp = placed.filter((p) => p.level === lvl).sort((a, b) => a.cx - b.cx);
@@ -134,29 +129,24 @@ export default function TimelineTab({ portfolioId }) {
 <html><head><title>Patent Family Timeline</title>
 <style>
   @page { size: landscape; margin: 0.4in; }
-  @media print {
-    body { margin: 0; }
-    svg { width: 100% !important; height: auto !important; }
-  }
+  @media print { body { margin: 0; } svg { width: 100% !important; height: auto !important; } }
   body { margin: 0; display: flex; align-items: center; justify-content: center;
          min-height: 100vh; background: #fff; }
   svg { width: 100%; height: auto; max-height: 100vh; }
 </style></head><body>${svgData}</body></html>`);
     win.document.close();
-    // Give the browser a moment to render, then trigger print
     setTimeout(() => { win.print(); }, 400);
   }
 
   if (loading) return <div style={s.loading}>Loading family timeline...</div>;
   if (error)   return <div style={s.error}>{error}</div>;
-  if (!data || !layout || layout.nodes.length === 0) {
+  if (!data || !layout || layout.nodes.length === 0)
     return <div style={s.empty}>No US family members to plot.</div>;
-  }
 
   const { nodes, edges, width, height, NODE_W, NODE_H, PAD_L, PAD_R } = layout;
-  const nodeById = new Map(nodes.map((n) => [n.app_num, n]));
+  const nodeById = new Map(nodes.map((n) => [n.id, n]));
 
-  // Year tick marks on the time axis
+  // Year tick marks
   const years = [];
   if (layout.tMin && layout.tMax) {
     const domain = layout.tMax - layout.tMin || 1;
@@ -176,9 +166,9 @@ export default function TimelineTab({ portfolioId }) {
         <div style={s.legend}>
           <LegendChip color="#2e7d32" label="Granted" />
           <LegendChip color="#1565c0" label="Pending" />
-          <LegendChip color="#9e9e9e" label="Abandoned / Unknown" />
-          <LegendChip color="#fff" border="#8b5cf6" label="Provisional (dashed)" />
-          <span style={s.legendMeta}>CON=continuation, CIP=CIP, DIV=divisional, PRO=provisional</span>
+          <LegendChip color="#f5f5f5" border="#bdbdbd" label="Filing (pre-grant)" />
+          <LegendChip color="#fff" border="#8b5cf6" label="Provisional" />
+          <span style={s.legendMeta}>CON / CIP / DIV / PRO / ISSUED</span>
         </div>
         <button onClick={handlePrint} style={s.printBtn} title="Print timeline in landscape orientation">
           🖨 Print
@@ -188,23 +178,12 @@ export default function TimelineTab({ portfolioId }) {
         <svg ref={svgRef} width={width} height={height}
              style={{ background: "#fff", border: "1px solid #e0e0e0", borderRadius: 10 }}
              xmlns="http://www.w3.org/2000/svg">
-          {/* Defs for link styling */}
           <defs>
-            <marker id="arrowCON" markerWidth="8" markerHeight="6" refX="4" refY="3" orient="auto">
-              <polygon points="0,0 8,3 0,6" fill="#1565c0" />
-            </marker>
-            <marker id="arrowCIP" markerWidth="8" markerHeight="6" refX="4" refY="3" orient="auto">
-              <polygon points="0,0 8,3 0,6" fill="#6a1b9a" />
-            </marker>
-            <marker id="arrowDIV" markerWidth="8" markerHeight="6" refX="4" refY="3" orient="auto">
-              <polygon points="0,0 8,3 0,6" fill="#00695c" />
-            </marker>
-            <marker id="arrowPRO" markerWidth="8" markerHeight="6" refX="4" refY="3" orient="auto">
-              <polygon points="0,0 8,3 0,6" fill="#ef6c00" />
-            </marker>
-            <marker id="arrowDEF" markerWidth="8" markerHeight="6" refX="4" refY="3" orient="auto">
-              <polygon points="0,0 8,3 0,6" fill="#555" />
-            </marker>
+            {["CON","CIP","DIV","PRO","ISSUED","DEF"].map((r) => (
+              <marker key={r} id={`arrow${r}`} markerWidth="8" markerHeight="6" refX="4" refY="3" orient="auto">
+                <polygon points="0,0 8,3 0,6" fill={relationColor(r)} />
+              </marker>
+            ))}
           </defs>
 
           {/* Year axis */}
@@ -215,34 +194,60 @@ export default function TimelineTab({ portfolioId }) {
             </g>
           ))}
 
-          {/* Edges (drawn before nodes so they appear behind) */}
+          {/* Edges */}
           {edges.map((e, i) => {
             const a = nodeById.get(e.from_app);
             const b = nodeById.get(e.to_app);
             if (!a || !b) return null;
-            const x1 = a.cx;
-            const y1 = a.y + NODE_H;
-            const x2 = b.cx;
-            const y2 = b.y;
-            const midY = (y1 + y2) / 2;
-            const d = `M${x1},${y1} C${x1},${midY} ${x2},${midY} ${x2},${y2}`;
+            const isIssued = e.relation === "ISSUED";
+            const sameLevel = a.level === b.level;
+
+            let d;
+            if (sameLevel) {
+              // Horizontal edge (ISSUED arrows between filing and grant on same level)
+              const x1 = a.x + NODE_W;
+              const y1m = a.y + NODE_H / 2;
+              const x2 = b.x;
+              const y2m = b.y + NODE_H / 2;
+              const cpOff = Math.abs(x2 - x1) * 0.3;
+              d = `M${x1},${y1m} C${x1 + cpOff},${y1m} ${x2 - cpOff},${y2m} ${x2},${y2m}`;
+            } else {
+              // Vertical edge (continuity)
+              const x1 = a.cx;
+              const y1 = a.y + NODE_H;
+              const x2 = b.cx;
+              const y2 = b.y;
+              const midY = (y1 + y2) / 2;
+              d = `M${x1},${y1} C${x1},${midY} ${x2},${midY} ${x2},${y2}`;
+            }
+
             const color = relationColor(e.relation);
-            const markerId = `arrow${({"CON":"CON","CIP":"CIP","DIV":"DIV","PRO":"PRO"})[e.relation] || "DEF"}`;
+            const markerId = `arrow${({"CON":"CON","CIP":"CIP","DIV":"DIV","PRO":"PRO","ISSUED":"ISSUED"})[e.relation] || "DEF"}`;
             return (
               <g key={i}>
-                <path d={d} stroke={color} strokeWidth="1.8" fill="none" opacity="0.7"
+                <path d={d} stroke={color} strokeWidth={isIssued ? "2" : "1.8"} fill="none"
+                      opacity={isIssued ? 0.5 : 0.7}
+                      strokeDasharray={isIssued ? "6 3" : "none"}
                       markerEnd={`url(#${markerId})`} />
-                <text x={(x1 + x2) / 2 + (x1 === x2 ? 0 : 0)} y={midY - 5}
-                      fontSize="10" fill={color} textAnchor="middle" fontWeight="700">
-                  {e.relation || ""}
-                </text>
+                {!sameLevel && (
+                  <text x={(a.cx + b.cx) / 2} y={(a.y + NODE_H + b.y) / 2 - 5}
+                        fontSize="10" fill={color} textAnchor="middle" fontWeight="700">
+                    {e.relation || ""}
+                  </text>
+                )}
+                {isIssued && sameLevel && (
+                  <text x={(a.x + NODE_W + b.x) / 2} y={a.y + NODE_H / 2 - 6}
+                        fontSize="9" fill={color} textAnchor="middle" fontWeight="600">
+                    ISSUED
+                  </text>
+                )}
               </g>
             );
           })}
 
           {/* Nodes */}
           {nodes.map((n) => (
-            <NodeCard key={n.app_num} node={n} w={NODE_W} h={NODE_H} />
+            <NodeCard key={n.id} node={n} w={NODE_W} h={NODE_H} />
           ))}
         </svg>
       </div>
@@ -253,32 +258,24 @@ export default function TimelineTab({ portfolioId }) {
 
 // ── Node tile ────────────────────────────────────────────────────────
 function NodeCard({ node, w, h }) {
-  const c = statusColor(node.status, node.is_provisional);
+  const isGrant = node.node_type === "grant";
+  const isFilingOfGranted = node.node_type === "filing" && node.status === "granted";
+  const c = nodeColor(node);
   const dash = node.is_provisional ? "4 3" : "none";
   const x = node.x, y = node.y;
 
-  // Build PDF URL for the publication number
   const pubClean = (node.pub_num || "").replace(/[^A-Z0-9]/gi, "").toUpperCase();
   const pdfUrl = pubClean ? `${API_BASE}/api/pdf/${pubClean}` : "";
-
-  // For granted patents, the display is the formatted patent number.
-  // For pending, display is the app number and we show pub_num separately.
-  const isGranted = node.status === "granted";
-  const isPending = node.status === "pending" || (node.status === "unknown" && !node.grant_date);
-
-  // Format pub number for display: US20260059078A1 -> US 2026/0059078 A1
   const fmtPub = formatUsPub(node.pub_num || "");
 
   return (
     <g>
-      {/* Drop shadow */}
       <rect x={x + 1} y={y + 2} width={w} height={h} rx={8} fill="rgba(0,0,0,0.06)" />
-      {/* Card background */}
       <rect x={x} y={y} width={w} height={h} rx={8}
             fill={c.bg} stroke={c.border} strokeWidth="2" strokeDasharray={dash} />
 
-      {/* Line 1: App/patent number */}
-      {isGranted && pdfUrl ? (
+      {/* Line 1: Primary identifier */}
+      {isGrant && pdfUrl ? (
         <a href={pdfUrl} target="_blank" rel="noopener">
           <text x={x + w / 2} y={y + 18} fontSize="13" fontWeight="700" fill={c.fg}
                 textAnchor="middle" textDecoration="underline" style={{ cursor: "pointer" }}>
@@ -291,43 +288,54 @@ function NodeCard({ node, w, h }) {
         </text>
       )}
 
-      {/* Line 2: Publication number (pending apps) or app number (granted) */}
-      {isPending && fmtPub && pdfUrl ? (
+      {/* Line 2: Secondary info */}
+      {isGrant ? (
+        // Grant tile: show app number
+        <text x={x + w / 2} y={y + 32} fontSize="10" fill="#666" textAnchor="middle">
+          App: {formatApp(node.app_num)}
+        </text>
+      ) : fmtPub && !isFilingOfGranted && pdfUrl ? (
+        // Pending filing tile: show pub number as PDF link
         <a href={pdfUrl} target="_blank" rel="noopener">
           <text x={x + w / 2} y={y + 32} fontSize="10" fill="#1a73e8" textAnchor="middle"
                 textDecoration="underline" style={{ cursor: "pointer" }}>
             {fmtPub}
           </text>
         </a>
-      ) : isPending && fmtPub ? (
-        <text x={x + w / 2} y={y + 32} fontSize="10" fill="#666" textAnchor="middle">{fmtPub}</text>
-      ) : isGranted && node.app_num ? (
+      ) : isFilingOfGranted && fmtPub ? (
+        // Filing tile of a granted patent: show pub number (links handled on grant tile)
         <text x={x + w / 2} y={y + 32} fontSize="10" fill="#666" textAnchor="middle">
-          App: {formatApp(node.app_num)}
+          {fmtPub}
         </text>
+      ) : fmtPub ? (
+        <text x={x + w / 2} y={y + 32} fontSize="10" fill="#666" textAnchor="middle">{fmtPub}</text>
       ) : null}
 
-      {/* Line 3: Filed date */}
+      {/* Line 3: Date */}
       <text x={x + w / 2} y={y + 48} fontSize="10" fill="#555" textAnchor="middle">
-        Filed {node.filing_date || "\u2014"}
+        {isGrant ? `Issued ${node.grant_date || "\u2014"}` : `Filed ${node.filing_date || "\u2014"}`}
       </text>
 
-      {/* Line 4: Grant date or status hint */}
-      {node.grant_date ? (
-        <text x={x + w / 2} y={y + 62} fontSize="10" fill="#555" textAnchor="middle">
-          Granted {node.grant_date}
+      {/* Line 4: Status / context */}
+      {isGrant ? (
+        <text x={x + w / 2} y={y + 62} fontSize="9" fill="#2e7d32" textAnchor="middle" fontWeight="600">
+          granted
         </text>
-      ) : !node.in_portfolio ? (
+      ) : isFilingOfGranted ? (
+        <text x={x + w / 2} y={y + 62} fontSize="9" fill="#666" textAnchor="middle">
+          application filing
+        </text>
+      ) : !node.in_portfolio && !node.grant_date ? (
         <text x={x + w / 2} y={y + 62} fontSize="9" fill="#bbb" textAnchor="middle" fontStyle="italic">
           from continuity
         </text>
       ) : (
         <text x={x + w / 2} y={y + 62} fontSize="9" fill="#888" textAnchor="middle">
-          {node.status === "pending" ? "pending" : node.status || ""}
+          {node.status || ""}
         </text>
       )}
 
-      {/* Thin date marker line from center to axis area */}
+      {/* Date marker tick */}
       <line x1={node.cx} y1={y + h} x2={node.cx} y2={y + h + 6}
             stroke={c.border} strokeWidth="1" opacity="0.4" />
     </g>
@@ -336,6 +344,19 @@ function NodeCard({ node, w, h }) {
 
 
 // ── Helpers ──────────────────────────────────────────────────────────
+function nodeColor(node) {
+  if (node.is_provisional) return { bg: "#fff", border: "#8b5cf6", fg: "#5b21b6" };
+  if (node.node_type === "grant") return { bg: "#e8f5e9", border: "#2e7d32", fg: "#1b5e20" };
+  if (node.node_type === "filing" && node.status === "granted")
+    return { bg: "#f5f5f5", border: "#bdbdbd", fg: "#424242" };
+  const map = {
+    pending:   { bg: "#e3f2fd", border: "#1565c0", fg: "#0d47a1" },
+    abandoned: { bg: "#fafafa", border: "#9e9e9e", fg: "#616161" },
+    unknown:   { bg: "#fafafa", border: "#9e9e9e", fg: "#616161" },
+  };
+  return map[node.status] || map.unknown;
+}
+
 function formatUsPub(pub) {
   const clean = (pub || "").replace(/[^A-Z0-9]/gi, "").toUpperCase();
   const m = clean.match(/^US(\d{4})(\d{7})([A-Z]\d?)$/);
@@ -359,19 +380,8 @@ function LegendChip({ color, border, label }) {
   );
 }
 
-function statusColor(status, provisional) {
-  if (provisional) return { bg: "#fff", border: "#8b5cf6", fg: "#5b21b6" };
-  const map = {
-    granted:   { bg: "#e8f5e9", border: "#2e7d32", fg: "#1b5e20" },
-    pending:   { bg: "#e3f2fd", border: "#1565c0", fg: "#0d47a1" },
-    abandoned: { bg: "#fafafa", border: "#9e9e9e", fg: "#616161" },
-    unknown:   { bg: "#fafafa", border: "#9e9e9e", fg: "#616161" },
-  };
-  return map[status] || map.unknown;
-}
-
 function relationColor(relation) {
-  const map = { CON: "#1565c0", CIP: "#6a1b9a", DIV: "#00695c", PRO: "#ef6c00" };
+  const map = { CON: "#1565c0", CIP: "#6a1b9a", DIV: "#00695c", PRO: "#ef6c00", ISSUED: "#43a047" };
   return map[relation] || "#555";
 }
 

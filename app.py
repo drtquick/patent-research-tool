@@ -1995,9 +1995,49 @@ def get_portfolio_timeline(portfolio_id):
                             "relation":  (r.get("relation") or "").upper(),
                         })
 
+        # ── Split granted patents into filing + grant nodes ──────────────
+        # For each granted patent, emit a filing-phase node (positioned by
+        # filing_date) and a grant-phase node (positioned by grant_date),
+        # with an "ISSUED" edge between them.  Continuity edges point at
+        # the filing node; the grant node is purely a visual marker.
+        final_nodes: list[dict] = []
+        grant_edges: list[dict] = []
+        for n in nodes.values():
+            if n.get("status") == "granted" and n.get("grant_date"):
+                # Filing node — show as app number, status "pending" visually
+                filing = {**n,
+                    "node_id":    n["app_num"],
+                    "node_type":  "filing",
+                    "display":    tracker._format_us_app_num(n["app_num"]) or n["app_num"],
+                    "timeline_date": n.get("filing_date") or "",
+                }
+                # Grant node — show as patent number, positioned by grant_date
+                grant = {**n,
+                    "node_id":    n["app_num"] + "_grant",
+                    "node_type":  "grant",
+                    "display":    tracker._format_us_patent_num(n.get("pub_num", "")) or n.get("pub_num", ""),
+                    "timeline_date": n.get("grant_date") or "",
+                }
+                final_nodes.append(filing)
+                final_nodes.append(grant)
+                grant_edges.append({
+                    "from_app": n["app_num"],
+                    "to_app":   n["app_num"] + "_grant",
+                    "relation": "ISSUED",
+                })
+            else:
+                final_nodes.append({**n,
+                    "node_id":   n["app_num"],
+                    "node_type": "filing",
+                    "timeline_date": n.get("filing_date") or "",
+                })
+
+        # Remap edges: continuity edges target the filing node_id (unchanged)
+        all_edges = edges + grant_edges
+
         return jsonify({
-            "nodes": list(nodes.values()),
-            "edges": edges,
+            "nodes": final_nodes,
+            "edges": all_edges,
         })
     except Exception as exc:
         traceback.print_exc()

@@ -190,8 +190,9 @@ def parse_claims(html: str) -> list[dict]:
     return claims
 
 
-def _first(lst: list) -> Optional[str]:
-    return lst[0] if lst else None
+def _first(lst: list) -> str:
+    """Return the first element or empty string (never None)."""
+    return lst[0] if lst else ""
 
 
 # ── Display ──────────────────────────────────────────────────────────────────
